@@ -45,6 +45,37 @@ pub enum FunctionParseResult {
 }
 
 // ============================================================================
+// PARAMETER TYPE TRANSFORMATION
+// ============================================================================
+
+/// L-06: Transform parameter type for valid Rust
+/// 
+/// Bare slice types [T] are unsized and cannot be function parameters.
+/// They must be transformed to &[T] (borrowed slice).
+/// 
+/// Examples:
+/// - `[Tx]` → `&[Tx]`
+/// - `[u8]` → `&[u8]`
+/// - `Vec<T>` → `Vec<T>` (unchanged, already sized)
+/// - `&[T]` → `&[T]` (already borrowed, unchanged)
+fn transform_param_type(type_str: &str) -> String {
+    let trimmed = type_str.trim();
+    
+    // If it's already a reference, leave it alone
+    if trimmed.starts_with('&') {
+        return trimmed.to_string();
+    }
+    
+    // If it's a bare slice type [T], convert to &[T]
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        return format!("&{}", trimmed);
+    }
+    
+    // Otherwise return as-is
+    trimmed.to_string()
+}
+
+// ============================================================================
 // FUNCTION REGISTRY - Tracks function signatures for call-site coercion
 // ============================================================================
 
@@ -59,7 +90,13 @@ impl FunctionRegistry {
     }
     
     pub fn register(&mut self, sig: FunctionSignature) {
-        self.functions.insert(sig.name.clone(), sig);
+        // L-10: Transform parameter types before storing in registry
+        // This ensures call-site coercion works correctly with transformed types
+        let mut transformed_sig = sig.clone();
+        for param in &mut transformed_sig.parameters {
+            param.param_type = transform_param_type(&param.param_type);
+        }
+        self.functions.insert(transformed_sig.name.clone(), transformed_sig);
     }
     
     pub fn get(&self, name: &str) -> Option<&FunctionSignature> {
@@ -325,6 +362,27 @@ fn split_call_args(s: &str) -> Vec<String> {
 fn coerce_argument(arg: &str, param_type: &str) -> String {
     let arg = arg.trim();
     
+    // L-10: Handle &[T] parameters - add & to array arguments
+    // When param is &[T] and arg is a plain identifier (array variable), add &
+    if param_type.starts_with("&[") {
+        // Check if arg is already a reference
+        if !arg.starts_with('&') {
+            // Check if it's a simple identifier (array variable)
+            // Not a complex expression like function call or method
+            if is_simple_identifier(arg) {
+                return format!("&{}", arg);
+            }
+        }
+        return arg.to_string();
+    }
+    
+    // L-11: Handle slice indexing - add .clone() when needed
+    // When arg is slice[index] and param expects owned value (not &T), add .clone()
+    if is_slice_index_access(arg) && !param_type.starts_with('&') {
+        // Add .clone() for slice index access passed by value
+        return format!("{}.clone()", arg);
+    }
+    
     if param_type == "&String" {
         if arg.starts_with('"') && arg.ends_with('"') {
             return format!("&String::from({})", arg);
@@ -343,6 +401,50 @@ fn coerce_argument(arg: &str, param_type: &str) -> String {
     }
     
     arg.to_string()
+}
+
+/// Check if a string is a simple identifier (variable name)
+/// Not a function call, method call, or complex expression
+fn is_simple_identifier(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    
+    // Must start with letter or underscore
+    let first_char = trimmed.chars().next().unwrap();
+    if !first_char.is_alphabetic() && first_char != '_' {
+        return false;
+    }
+    
+    // Must be alphanumeric or underscore only
+    // No parens, brackets, dots, etc.
+    trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Check if a string is a slice/array index access pattern: `var[index]`
+fn is_slice_index_access(s: &str) -> bool {
+    let trimmed = s.trim();
+    
+    // Must contain [ and end with ]
+    if !trimmed.contains('[') || !trimmed.ends_with(']') {
+        return false;
+    }
+    
+    // Find the bracket position
+    if let Some(bracket_pos) = trimmed.find('[') {
+        // Part before [ must be a simple identifier
+        let var_part = &trimmed[..bracket_pos];
+        if is_simple_identifier(var_part) {
+            // Check that brackets are balanced and at the end
+            let bracket_part = &trimmed[bracket_pos..];
+            let open_count = bracket_part.chars().filter(|&c| c == '[').count();
+            let close_count = bracket_part.chars().filter(|&c| c == ']').count();
+            return open_count == close_count;
+        }
+    }
+    
+    false
 }
 
 // ============================================================================
@@ -464,6 +566,56 @@ fn find_matching_paren(s: &str, start: usize) -> Option<usize> {
     None
 }
 
+/// Strip effects clause from return type
+/// 
+/// L-05 FIX: Effect annotations must NOT appear in Rust output.
+/// 
+/// RustS+ allows: `fn f(x T) effects(write x) U { ... }`
+/// Rust output must be: `fn f(x: T) -> U { ... }`
+/// 
+/// This function strips `effects(...)` from the type string.
+/// 
+/// Examples:
+/// - `effects(write x) Wallet` → `Wallet`
+/// - `effects(io) ()` → `()`
+/// - `effects(read a, write b) Result<T, E>` → `Result<T, E>`
+/// - `String` → `String` (no effects, unchanged)
+pub fn strip_effects_clause(type_str: &str) -> String {
+    let trimmed = type_str.trim();
+    
+    // Check if starts with "effects("
+    if !trimmed.starts_with("effects(") {
+        return trimmed.to_string();
+    }
+    
+    // Find the matching closing paren for effects(...)
+    // Need to handle nested parens like effects(write x) Result<T, (A, B)>
+    let mut paren_depth = 0;
+    let mut effects_end = 0;
+    
+    for (i, c) in trimmed.char_indices() {
+        match c {
+            '(' => paren_depth += 1,
+            ')' => {
+                paren_depth -= 1;
+                if paren_depth == 0 {
+                    effects_end = i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    if effects_end == 0 {
+        // Malformed effects clause - return as-is (will be caught by sanity check)
+        return trimmed.to_string();
+    }
+    
+    // Return everything after the effects(...) clause, trimmed
+    trimmed[effects_end..].trim().to_string()
+}
+
 fn parse_rustsplus_function(after_fn: &str, is_pub: bool) -> Result<FunctionSignature, String> {
     let mut rest = after_fn.trim();
     
@@ -508,14 +660,30 @@ fn parse_rustsplus_function(after_fn: &str, is_pub: bool) -> Result<FunctionSign
         }
         
         let type_end = type_rest.find(|c: char| c == '{' || c == '=').unwrap_or(type_rest.len());
-        let ret_type = type_rest[..type_end].trim().to_string();
+        let raw_ret_type = type_rest[..type_end].trim().to_string();
+        
+        // L-05 CRITICAL FIX: Strip effects clause from return type
+        // RustS+: `fn f(x T) effects(write x) U` 
+        // Rust:   `fn f(x: T) -> U`
+        // The effects(...) clause must NOT appear in Rust output!
+        let ret_type = strip_effects_clause(&raw_ret_type);
+        
+        // If after stripping effects the return type is empty or "()", it's a unit function
+        // e.g., `fn log(msg String) effects(io) {` has no return type after stripping
+        // In Rust, `fn foo()` is same as `fn foo() -> ()`, so we omit explicit "()"
+        let final_return_type = if ret_type.is_empty() || ret_type == "()" {
+            None
+        } else {
+            Some(ret_type)
+        };
+        
         let after_type = type_rest[type_end..].trim();
         
         if after_type.starts_with('=') {
             let expr = after_type[1..].trim().trim_end_matches(';').to_string();
-            (Some(ret_type), true, Some(expr))
+            (final_return_type, true, Some(expr))
         } else {
-            (Some(ret_type), false, None)
+            (final_return_type, false, None)
         }
     };
     
@@ -614,7 +782,12 @@ pub fn signature_to_rust(sig: &FunctionSignature) -> String {
     
     result.push('(');
     let params: Vec<String> = sig.parameters.iter()
-        .map(|p| format!("{}: {}", p.name, p.param_type))
+        .map(|p| {
+            // L-06: Transform bare slice type [T] to &[T] for parameters
+            // Bare [T] is unsized and cannot be a function parameter in Rust
+            let transformed_type = transform_param_type(&p.param_type);
+            format!("{}: {}", p.name, transformed_type)
+        })
         .collect();
     result.push_str(&params.join(", "));
     result.push(')');
@@ -751,5 +924,95 @@ mod tests {
         assert!(should_be_tail_return("a + b", &ctx, true));
         assert!(!should_be_tail_return("println!(\"hi\")", &ctx, true));
         assert!(!should_be_tail_return("a + b;", &ctx, true));
+    }
+    
+    //=========================================================================
+    // L-05: EFFECT ANNOTATION STRIPPING TESTS
+    // Effect annotations must NOT appear in Rust output
+    //=========================================================================
+    
+    #[test]
+    fn test_strip_effects_clause_basic() {
+        // effects(write x) Wallet → Wallet
+        assert_eq!(strip_effects_clause("effects(write x) Wallet"), "Wallet");
+    }
+    
+    #[test]
+    fn test_strip_effects_clause_io() {
+        // effects(io) () → ()
+        assert_eq!(strip_effects_clause("effects(io) ()"), "()");
+    }
+    
+    #[test]
+    fn test_strip_effects_clause_multiple() {
+        // effects(read a, write b) Result<T, E> → Result<T, E>
+        assert_eq!(strip_effects_clause("effects(read a, write b) Result<T, E>"), "Result<T, E>");
+    }
+    
+    #[test]
+    fn test_strip_effects_clause_no_effects() {
+        // String → String (unchanged)
+        assert_eq!(strip_effects_clause("String"), "String");
+    }
+    
+    #[test]
+    fn test_strip_effects_clause_nested_parens() {
+        // effects(write x) Option<(A, B)> → Option<(A, B)>
+        assert_eq!(strip_effects_clause("effects(write x) Option<(A, B)>"), "Option<(A, B)>");
+    }
+    
+    #[test]
+    fn test_l05_function_with_effects_stripped() {
+        // CRITICAL: fn f(x T) effects(write x) U { } must become fn f(x: T) -> U { }
+        let line = "fn apply_tx(w Wallet, tx Tx) effects(write w) Wallet {";
+        match parse_function_line(line) {
+            FunctionParseResult::RustSPlusSignature(sig) => {
+                let rust = signature_to_rust(&sig);
+                // MUST have return type Wallet
+                assert!(rust.contains("-> Wallet"), 
+                    "L-05: Return type must be 'Wallet', got: {}", rust);
+                // MUST NOT have effects clause
+                assert!(!rust.contains("effects("), 
+                    "L-05: effects clause must NOT appear in Rust output: {}", rust);
+            }
+            _ => panic!("Expected RustSPlusSignature"),
+        }
+    }
+    
+    #[test]
+    fn test_l05_function_with_io_effect() {
+        let line = "fn log(msg String) effects(io) {";
+        match parse_function_line(line) {
+            FunctionParseResult::RustSPlusSignature(sig) => {
+                let rust = signature_to_rust(&sig);
+                // Should have no return type (unit)
+                assert!(!rust.contains("->"), 
+                    "L-05: No return type for unit function, got: {}", rust);
+                // MUST NOT have effects clause  
+                assert!(!rust.contains("effects("),
+                    "L-05: effects clause must NOT appear in Rust output: {}", rust);
+            }
+            _ => panic!("Expected RustSPlusSignature"),
+        }
+    }
+    
+    #[test]
+    fn test_l05_single_line_with_effects() {
+        let line = "fn increment(x i32) effects(pure) i32 = x + 1";
+        match parse_function_line(line) {
+            FunctionParseResult::RustSPlusSignature(sig) => {
+                let rust = signature_to_rust(&sig);
+                // Return type must be i32
+                assert!(rust.contains("-> i32"),
+                    "L-05: Return type must be 'i32', got: {}", rust);
+                // MUST NOT have effects clause
+                assert!(!rust.contains("effects("),
+                    "L-05: effects clause must NOT appear: {}", rust);
+                // Body must still work
+                assert!(rust.contains("x + 1"),
+                    "L-05: Expression body must be preserved: {}", rust);
+            }
+            _ => panic!("Expected RustSPlusSignature"),
+        }
     }
 }

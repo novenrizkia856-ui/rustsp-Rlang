@@ -92,6 +92,75 @@ fn needs_semicolon(trimmed: &str) -> bool {
     true
 }
 
+/// L-08: Transform RustS+ macro calls to Rust macro calls
+/// 
+/// RustS+ allows: `println("hello")`, `format("x={}", x)`
+/// Rust requires: `println!("hello")`, `format!("x={}", x)`
+/// 
+/// This function adds the `!` for known macro names.
+fn transform_macro_calls(line: &str) -> String {
+    // List of common Rust macros that need `!`
+    const MACROS: &[&str] = &[
+        "println", "print", "eprintln", "eprint",
+        "format", "panic", "todo", "unimplemented",
+        "vec", "dbg", "assert", "assert_eq", "assert_ne",
+        "debug_assert", "debug_assert_eq", "debug_assert_ne",
+        "write", "writeln", "format_args",
+        "include_str", "include_bytes", "concat", "stringify",
+        "env", "option_env", "cfg", "line", "column", "file",
+        "module_path", "compile_error",
+    ];
+    
+    let mut result = line.to_string();
+    
+    for macro_name in MACROS {
+        // Pattern: `macro_name(` but not `macro_name!(` (already has !)
+        // Also need to handle: start of line, after space, after `=`, etc.
+        
+        // Find all occurrences of macro_name followed by ( but not !
+        let search_pattern = format!("{}(", macro_name);
+        let correct_pattern = format!("{}!(", macro_name);
+        
+        // Only replace if it's not already correct
+        if result.contains(&search_pattern) && !result.contains(&correct_pattern) {
+            // Need to be careful: only replace when it's actually the macro call
+            // (not part of another word like "my_println")
+            
+            let mut new_result = String::new();
+            let mut chars: Vec<char> = result.chars().collect();
+            let mut i = 0;
+            
+            while i < chars.len() {
+                // Check if we're at the start of macro_name
+                let remaining: String = chars[i..].iter().collect();
+                
+                if remaining.starts_with(&search_pattern) {
+                    // Check that it's not part of another identifier
+                    let is_word_start = i == 0 || !chars[i-1].is_alphanumeric() && chars[i-1] != '_';
+                    
+                    if is_word_start {
+                        // Check it's not already `macro_name!(`
+                        let before_paren: String = chars[i..i+macro_name.len()].iter().collect();
+                        if before_paren == *macro_name {
+                            new_result.push_str(macro_name);
+                            new_result.push('!');
+                            i += macro_name.len();
+                            continue;
+                        }
+                    }
+                }
+                
+                new_result.push(chars[i]);
+                i += 1;
+            }
+            
+            result = new_result;
+        }
+    }
+    
+    result
+}
+
 //===========================================================================
 // LITERAL MODE CONTEXT
 // Tracks when we are inside a struct/enum literal expression.
@@ -1220,11 +1289,13 @@ pub fn parse_rusts(source: &str) -> String {
             }
             
             //===================================================================
-            // L-02: Expression Context Parenthesization for Match Arms
-            // If arm body contains if/else expression, we need to use => (...)
-            // instead of => {...} to make it a proper expression context.
+            // L-02: Expression Context for Match Arms with if/else
             // 
-            // Look ahead to detect if arm body is an if/else expression.
+            // In Rust, if-else expressions in match arms work directly:
+            //   `Pattern => if cond { a } else { b },`
+            // No parentheses needed (they cause compiler warnings).
+            //
+            // We only need to ensure proper comma after the arm body.
             //===================================================================
             let mut arm_has_if_expr = false;
             let mut arm_body_lines = Vec::new();
@@ -1257,11 +1328,11 @@ pub fn parse_rusts(source: &str) -> String {
                 }
             }
             
-            // Transform arm pattern based on whether it needs parenthesization
+            // Transform arm pattern - NEVER use parentheses, just => 
             if arm_has_if_expr {
-                // L-02: Use => ( for if expression arms
+                // L-09: Use plain => for if expression arms (no parens)
                 let pattern = extract_arm_pattern(trimmed);
-                output_lines.push(format!("{}{} => (", leading_ws, pattern));
+                output_lines.push(format!("{}{} =>", leading_ws, pattern));
             } else {
                 // Standard: Use => { for block arms
                 let transformed = transform_arm_pattern(&clean_line);
@@ -1499,31 +1570,33 @@ pub fn parse_rusts(source: &str) -> String {
         
         //=======================================================================
         // STRUCT DEFINITION (type definition, not instantiation)
-        // L-04 Enhancement: Inject #[derive(Clone)] if type needs Clone
+        // L-12: Always inject #[derive(Clone)] for RustS+ value semantics
+        // RustS+ has value semantics - all types should be cloneable
         //=======================================================================
         if is_struct_definition(trimmed) && !in_struct_def {
             in_struct_def = true;
             struct_def_depth = brace_depth;
             
-            // Check if this struct needs Clone (L-04 Clone Injection)
-            if let Some(struct_name) = parse_struct_header(trimmed) {
-                if types_need_clone.contains(&struct_name) {
-                    // Check if previous line already has #[derive(...)]
-                    let prev_line = output_lines.last().map(|s| s.trim().to_string());
-                    if let Some(ref prev) = prev_line {
-                        if prev.starts_with("#[derive(") && prev.ends_with(")]") {
+            // L-12: Always add Clone for RustS+ structs
+            if let Some(_struct_name) = parse_struct_header(trimmed) {
+                // Check if previous line already has #[derive(...)]
+                let prev_line = output_lines.last().map(|s| s.trim().to_string());
+                if let Some(ref prev) = prev_line {
+                    if prev.starts_with("#[derive(") && prev.ends_with(")]") {
+                        // Check if Clone is already present
+                        if !prev.contains("Clone") {
                             // Merge Clone into existing derive
                             let last_idx = output_lines.len() - 1;
                             let existing = output_lines[last_idx].clone();
                             let merged = existing.replace(")]", ", Clone)]");
                             output_lines[last_idx] = merged;
-                        } else {
-                            // Add new derive line
-                            output_lines.push(format!("{}#[derive(Clone)]", leading_ws));
                         }
                     } else {
+                        // Add new derive line
                         output_lines.push(format!("{}#[derive(Clone)]", leading_ws));
                     }
+                } else {
+                    output_lines.push(format!("{}#[derive(Clone)]", leading_ws));
                 }
             }
             
@@ -1544,30 +1617,31 @@ pub fn parse_rusts(source: &str) -> String {
         
         //=======================================================================
         // ENUM DEFINITION
-        // L-04 Enhancement: Inject #[derive(Clone)] if type needs Clone
+        // L-12: Always inject #[derive(Clone)] for RustS+ value semantics
         //=======================================================================
         if is_enum_definition(trimmed) && !enum_ctx.in_enum_def {
             enum_ctx.enter_enum(brace_depth);
             
-            // Check if this enum needs Clone (L-04 Clone Injection)
-            if let Some(enum_name) = parse_enum_header(trimmed) {
-                if types_need_clone.contains(&enum_name) {
-                    // Check if previous line already has #[derive(...)]
-                    let prev_line = output_lines.last().map(|s| s.trim().to_string());
-                    if let Some(ref prev) = prev_line {
-                        if prev.starts_with("#[derive(") && prev.ends_with(")]") {
+            // L-12: Always add Clone for RustS+ enums
+            if let Some(_enum_name) = parse_enum_header(trimmed) {
+                // Check if previous line already has #[derive(...)]
+                let prev_line = output_lines.last().map(|s| s.trim().to_string());
+                if let Some(ref prev) = prev_line {
+                    if prev.starts_with("#[derive(") && prev.ends_with(")]") {
+                        // Check if Clone is already present
+                        if !prev.contains("Clone") {
                             // Merge Clone into existing derive
                             let last_idx = output_lines.len() - 1;
                             let existing = output_lines[last_idx].clone();
                             let merged = existing.replace(")]", ", Clone)]");
                             output_lines[last_idx] = merged;
-                        } else {
-                            // Add new derive line
-                            output_lines.push(format!("{}#[derive(Clone)]", leading_ws));
                         }
                     } else {
+                        // Add new derive line
                         output_lines.push(format!("{}#[derive(Clone)]", leading_ws));
                     }
+                } else {
+                    output_lines.push(format!("{}#[derive(Clone)]", leading_ws));
                 }
             }
             
@@ -1739,6 +1813,17 @@ pub fn parse_rusts(source: &str) -> String {
                     continue;
                 }
             }
+        }
+        
+        //=======================================================================
+        // L-07: EFFECT STATEMENT SKIP
+        // `effect write(account)` is a RustS+-only declaration
+        // It must NOT appear in Rust output - skip entirely
+        //=======================================================================
+        if trimmed.starts_with("effect ") {
+            // Effect statements are purely for the effect ownership system
+            // They do not produce any Rust output
+            continue;
         }
         
         //=======================================================================
@@ -1945,7 +2030,13 @@ pub fn parse_rusts(source: &str) -> String {
         }
     }
     
-    let result = output_lines.join("\n");
+    // L-08: Transform macro calls (println -> println!, etc.)
+    let transformed_lines: Vec<String> = output_lines
+        .into_iter()
+        .map(|line| transform_macro_calls(&line))
+        .collect();
+    
+    let result = transformed_lines.join("\n");
     
     //==========================================================================
     // L-05: RUST SANITY CHECK
@@ -2338,9 +2429,10 @@ mod tests {
     }
 }"#;
         let output = parse_rusts(input);
-        // Should have => ( for expression arm
-        assert!(output.contains("=> (") || output.contains("=> {"),
-            "L-02: Match arm with if expr must use proper context: {}", output);
+        // L-09: Match arms with if expressions use plain `=>`
+        // The if expression is a valid expression context, no parens needed
+        assert!(output.contains("=>") && output.contains("if cond"),
+            "L-02/L-09: Match arm with if expr must use => format: {}", output);
     }
     
     /// L-03: Reassignment to same variable MUST use mut binding, not shadow

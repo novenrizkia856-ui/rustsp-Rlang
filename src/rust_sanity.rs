@@ -34,6 +34,8 @@ pub enum SanityErrorKind {
     UnclosedString,
     InvalidExpression,
     InternalLoweringError,
+    /// L-05: Effect annotations leaked into Rust output
+    EffectAnnotationLeakage,
 }
 
 impl SanityCheckResult {
@@ -69,6 +71,10 @@ pub fn check_rust_output(rust_code: &str) -> SanityCheckResult {
     
     // Check 4: Invalid patterns that indicate lowering bugs
     errors.extend(check_lowering_patterns(rust_code));
+    
+    // Check 5: L-05 CRITICAL - Effect annotation leakage
+    // Effect annotations must NEVER appear in Rust output
+    errors.extend(check_effect_annotation_leakage(rust_code));
     
     if errors.is_empty() {
         SanityCheckResult::ok()
@@ -330,6 +336,102 @@ fn check_lowering_patterns(code: &str) -> Vec<SanityError> {
     errors
 }
 
+//=============================================================================
+// L-05 CRITICAL: EFFECT ANNOTATION LEAKAGE CHECK
+// Effect annotations (effects(...)) must NEVER appear in Rust output.
+// If they do, it's an INTERNAL COMPILER ERROR in the lowering layer.
+//=============================================================================
+
+/// Check for effect annotation leakage in generated Rust code
+/// 
+/// L-05 RULE: Effect annotations are for the RustS+ logic checker ONLY.
+/// They must be stripped during lowering. If any appear in Rust output,
+/// this indicates a bug in the lowering layer.
+/// 
+/// Detected patterns:
+/// - `effects(` anywhere in the code
+/// - `effects<` (shouldn't exist but check anyway)
+/// - `effects[` (shouldn't exist but check anyway)
+fn check_effect_annotation_leakage(code: &str) -> Vec<SanityError> {
+    let mut errors = Vec::new();
+    
+    for (line_num, line) in code.lines().enumerate() {
+        let trimmed = line.trim();
+        
+        // Skip comments - effect annotations might be mentioned in documentation
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with("*") {
+            continue;
+        }
+        
+        // Check for string literals - don't flag effects mentioned in strings
+        // We need to be careful here: only check outside of string literals
+        let mut in_string = false;
+        let mut escape_next = false;
+        let chars: Vec<char> = line.chars().collect();
+        let line_len = chars.len();
+        
+        let mut i = 0;
+        while i < line_len {
+            let c = chars[i];
+            
+            if escape_next {
+                escape_next = false;
+                i += 1;
+                continue;
+            }
+            
+            if c == '\\' && in_string {
+                escape_next = true;
+                i += 1;
+                continue;
+            }
+            
+            if c == '"' {
+                in_string = !in_string;
+                i += 1;
+                continue;
+            }
+            
+            // Only check outside strings
+            if !in_string {
+                // Check for "effects(" pattern
+                if i + 8 < line_len {
+                    let slice: String = chars[i..i+8].iter().collect();
+                    if slice == "effects(" {
+                        // Find the column position
+                        errors.push(SanityError {
+                            line: line_num + 1,
+                            column: i + 1,
+                            message: "L-05 VIOLATION: effect annotation leaked into Rust output".to_string(),
+                            kind: SanityErrorKind::EffectAnnotationLeakage,
+                        });
+                        // Don't report multiple times for same line
+                        break;
+                    }
+                }
+                
+                // Also check for malformed patterns
+                if i + 8 < line_len {
+                    let slice: String = chars[i..i+8].iter().collect();
+                    if slice == "effects<" || slice == "effects[" {
+                        errors.push(SanityError {
+                            line: line_num + 1,
+                            column: i + 1,
+                            message: "L-05 VIOLATION: malformed effect annotation in Rust output".to_string(),
+                            kind: SanityErrorKind::EffectAnnotationLeakage,
+                        });
+                        break;
+                    }
+                }
+            }
+            
+            i += 1;
+        }
+    }
+    
+    errors
+}
+
 /// Format internal compiler error for display
 pub fn format_internal_error(result: &SanityCheckResult) -> String {
     let mut output = String::new();
@@ -432,5 +534,107 @@ fn main() {
 "#;
         let result = check_rust_output(code);
         assert!(!result.is_valid);
+    }
+    
+    //=========================================================================
+    // L-05: EFFECT ANNOTATION LEAKAGE TESTS
+    // Effect annotations must NEVER appear in Rust output
+    //=========================================================================
+    
+    #[test]
+    fn test_l05_effect_leakage_detected() {
+        // This is INVALID - effects() should never appear in Rust output
+        let code = r#"
+fn apply_tx(w: Wallet, tx: Tx) -> effects(write w) Wallet {
+    w
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(!result.is_valid, "Should detect effect annotation leakage");
+        assert!(result.errors.iter().any(|e| e.kind == SanityErrorKind::EffectAnnotationLeakage),
+            "Error kind should be EffectAnnotationLeakage");
+    }
+    
+    #[test]
+    fn test_l05_valid_rust_no_effects() {
+        // This is VALID - no effects clause, proper Rust syntax
+        let code = r#"
+fn apply_tx(w: Wallet, tx: Tx) -> Wallet {
+    w
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(result.is_valid, "Valid Rust without effects should pass: {:?}", result.errors);
+    }
+    
+    #[test]
+    fn test_l05_effect_in_function_signature() {
+        // Various effect annotation patterns that should be detected
+        let code = r#"
+fn log(msg: String) effects(io) {
+    println!("{}", msg);
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(!result.is_valid);
+        assert!(result.errors.iter().any(|e| e.kind == SanityErrorKind::EffectAnnotationLeakage));
+    }
+    
+    #[test]
+    fn test_l05_effect_in_string_literal_ok() {
+        // Effect mentioned in string literal is OK (documentation, etc.)
+        let code = r#"
+fn main() {
+    let msg = "This function has effects(write x)";
+    println!("{}", msg);
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(result.is_valid, "Effects in string literals should be OK: {:?}", result.errors);
+    }
+    
+    #[test]
+    fn test_l05_effect_in_comment_ok() {
+        // Effect mentioned in comment is OK
+        let code = r#"
+// This function has effects(write x)
+fn update(x: i32) -> i32 {
+    x + 1
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(result.is_valid, "Effects in comments should be OK: {:?}", result.errors);
+    }
+    
+    #[test]
+    fn test_l05_multiple_effects_detected() {
+        let code = r#"
+fn transfer(a: Account, b: Account) -> effects(read a, write b) Account {
+    b
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(!result.is_valid);
+        assert!(result.errors.iter().any(|e| e.kind == SanityErrorKind::EffectAnnotationLeakage));
+    }
+    
+    #[test]
+    fn test_l05_regression_wallet_example() {
+        // The exact bug that was reported
+        let code = r#"
+fn apply_tx(w: Wallet, tx: Tx) -> effects(write w) Wallet {
+    match tx {
+        Tx::Deposit { id, amount } => {
+            Wallet { balance: w.balance + amount }
+        }
+    }
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(!result.is_valid, "The reported bug case should be detected");
+        assert!(result.errors.iter().any(|e| {
+            e.kind == SanityErrorKind::EffectAnnotationLeakage && 
+            e.message.contains("L-05 VIOLATION")
+        }), "Should have L-05 violation error");
     }
 }

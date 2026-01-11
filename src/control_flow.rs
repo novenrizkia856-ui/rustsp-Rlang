@@ -391,8 +391,9 @@ pub fn transform_arm_close_with_parens(line: &str, uses_parens: bool) -> String 
     
     if trimmed == "}" {
         if uses_parens {
-            // L-02: Close parenthesized arm body
-            format!("{}),", leading_ws)
+            // L-09: For if-expression arms, just add comma (no closing paren)
+            // The arm body is already a valid expression
+            format!("{},", leading_ws)
         } else {
             format!("{}}},", leading_ws)
         }
