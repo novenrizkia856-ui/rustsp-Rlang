@@ -10,10 +10,13 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio, exit};
 
-use rustsplus::parse_rusts;
-use rustsplus::error_msg::map_rust_error;
-use rustsplus::anti_fail_logic::{check_logic, format_logic_errors, ansi};
-use rustsplus::rust_sanity::{check_rust_output, format_internal_error};
+// NOTE: Change this import to match your crate name in Cargo.toml
+// If your crate is named "rustsp", use: use rustsp::...
+// If your crate is named "rusts_plus", use: use rusts_plus::...
+use rustsp::parse_rusts;
+use rustsp::error_msg::map_rust_error;
+use rustsp::anti_fail_logic::{check_logic, format_logic_errors, ansi};
+use rustsp::rust_sanity::{check_rust_output, format_internal_error};
 
 //=============================================================================
 // L-05: RUST SANITY GATE (Enhanced)
@@ -130,19 +133,30 @@ fn rust_sanity_check(rust_code: &str) -> Option<String> {
 
 fn print_usage() {
     eprintln!("{}RustS+ Compiler{}", ansi::BOLD_CYAN, ansi::RESET);
-    eprintln!("Usage: rustsp <input.rss> -o <output_binary>");
+    eprintln!("Usage: rustsp <input.rss> [options]");
     eprintln!("");
     eprintln!("Options:");
-    eprintln!("  -o <output>      Specify output binary name");
+    eprintln!("  -o <file>        Specify output file (binary or .rs with --emit-rs)");
     eprintln!("  --emit-rs        Only emit .rs file without compiling");
     eprintln!("  --raw-errors     Show raw Rust errors (no mapping)");
     eprintln!("  --skip-logic     Skip anti-fail logic check (DANGEROUS)");
+    eprintln!("  --quiet          Suppress success messages (for tooling)");
     eprintln!("  -h, --help       Show this help message");
+    eprintln!("  -V, --version    Show version");
+    eprintln!("");
+    eprintln!("Examples:");
+    eprintln!("  rustsp main.rss -o myprogram        Compile to binary");
+    eprintln!("  rustsp main.rss --emit-rs           Print Rust to stdout");
+    eprintln!("  rustsp main.rss --emit-rs -o out.rs Write Rust to file");
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    
+    if args.len() == 2 && (args[1] == "--version" || args[1] == "-V") {
+        println!("RustS+ Compiler v0.3.0");
+        exit(0);
+    }
+
     if args.len() < 2 {
         print_usage();
         exit(1);
@@ -158,6 +172,7 @@ fn main() {
     let mut emit_rs_only = false;
     let mut raw_errors = false;
     let mut skip_logic = false;
+    let mut quiet = false;
     
     let mut i = 1;
     while i < args.len() {
@@ -186,8 +201,17 @@ fn main() {
                     ansi::BOLD_YELLOW, ansi::RESET);
                 i += 1;
             }
+            "--quiet" | "-q" => {
+                quiet = true;
+                i += 1;
+            }
             arg => {
-                if arg.ends_with(".rss") {
+                if arg.starts_with("-") {
+                    eprintln!("{}error{}: Unknown option '{}'",
+                        ansi::BOLD_RED, ansi::RESET, arg);
+                    exit(1);
+                }
+                if arg.ends_with(".rss") || arg.ends_with(".rs") {
                     input_file = Some(arg.to_string());
                 } else if input_file.is_none() {
                     input_file = Some(arg.to_string());
@@ -282,6 +306,36 @@ fn main() {
         exit(1);
     }
     
+    //=========================================================================
+    // EMIT RS MODE: Write Rust code to file or stdout
+    //=========================================================================
+    
+    if emit_rs_only {
+        match output_file {
+            Some(ref out_path) => {
+                // Write to specified file
+                if let Err(e) = fs::write(out_path, &rust_code) {
+                    eprintln!("{}error{}: writing '{}': {}",
+                        ansi::BOLD_RED, ansi::RESET, out_path, e);
+                    exit(1);
+                }
+                if !quiet {
+                    eprintln!("{}✓ Rust code written to{}: {}",
+                        ansi::BOLD_GREEN, ansi::RESET, out_path);
+                }
+            }
+            None => {
+                // Print to stdout
+                println!("{}", rust_code);
+            }
+        }
+        exit(0);
+    }
+    
+    //=========================================================================
+    // BINARY COMPILATION MODE
+    //=========================================================================
+    
     let input_stem = Path::new(&input_path)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -294,12 +348,6 @@ fn main() {
         eprintln!("{}error{}: writing temporary Rust file: {}",
             ansi::BOLD_RED, ansi::RESET, e);
         exit(1);
-    }
-    
-    if emit_rs_only {
-        println!("{}", rust_code);
-        println!("\n// Rust code written to: {}", temp_rs_path_str);
-        exit(0);
     }
     
     let output_binary = output_file.unwrap_or_else(|| {
@@ -322,8 +370,10 @@ fn main() {
     match rustc_output {
         Ok(output) => {
             if output.status.success() {
-                println!("{}✓ Successfully compiled{}: {}",
-                    ansi::BOLD_GREEN, ansi::RESET, output_binary);
+                if !quiet {
+                    println!("{}✓ Successfully compiled{}: {}",
+                        ansi::BOLD_GREEN, ansi::RESET, output_binary);
+                }
                 let _ = fs::remove_file(&temp_rs_path_str);
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);

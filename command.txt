@@ -1,0 +1,7 @@
+cargo rustsp --version
+cargo rustsp build
+cargo rustsp build --release
+cargo rustsp run
+cargo rustsp run -- args
+cargo rustsp test
+cargo rustsp clean
