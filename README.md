@@ -1,7 +1,8 @@
 # RustS+ (rustsp-Rlang)
 
 **RustS+** adalah bahasa sistem generasi baru yang dibangun di atas Rust, dengan tujuan utama:
-> *mencegah bug logika dengan tingkat keseriusan yang sama seperti Rust mencegah bug memori.*
+
+> *Mencegah bug logika dengan tingkat keseriusan yang sama seperti Rust mencegah bug memori.*
 
 RustS+ bukan bahasa yang menggantikan Rust.  
 RustS+ adalah **cara baru menulis Rust** — lebih sederhana, lebih jujur, dan lebih aman secara semantik.
@@ -10,16 +11,16 @@ RustS+ adalah **cara baru menulis Rust** — lebih sederhana, lebih jujur, dan l
 
 ## 🧠 Filosofi
 
-Rust:
-- Mencegah *segmentation fault*
-- Mencegah *use-after-free*
-- Mencegah *data race*
+**Rust** mencegah:
+- segmentation fault  
+- use-after-free  
+- data race  
 
-RustS+:
-- Mencegah *logic race*
-- Mencegah *ambiguous mutation*
-- Mencegah *shadowing yang tidak disadari*
-- Mencegah *state change tanpa niat eksplisit*
+**RustS+** mencegah:
+- logic race  
+- ambiguous mutation  
+- shadowing yang tidak disadari  
+- perubahan state tanpa niat eksplisit  
 
 Jika Rust melindungi **memori**,  
 RustS+ melindungi **makna program**.
@@ -56,23 +57,23 @@ Ini menciptakan dua lapisan keamanan:
 
 ## ✨ Contoh
 
-Rust:
+### Rust
+
 ```rust
 let mut a = 10;
 a = a + 1;
-RustS+:
-
+RustS+
 rusts
 Salin kode
 a = 10
 a = a + 1
-RustS+:
+RustS+ akan:
 
-Menentukan mut otomatis
+menentukan mut secara otomatis
 
-Mencegah shadowing ambigu
+mencegah shadowing ambigu
 
-Memastikan niat programmer eksplisit
+memastikan niat programmer eksplisit
 
 📦 Struct & Enum
 rusts
@@ -93,7 +94,7 @@ node = Node {
     id = 1
     balance = 100
 }
-Control Flow as Expression
+🔀 Control Flow as Expression
 rusts
 Salin kode
 status = if balance > 1000 {
@@ -115,7 +116,7 @@ match status {
 }
 Semua if dan match adalah ekspresi.
 
-Anti-Fail Logic
+🧠 Anti-Fail Logic
 RustS+ memperkenalkan Effect Ownership:
 
 Fungsi default-nya pure
@@ -135,7 +136,7 @@ Salin kode
 cargo rustsp build
 cargo rustsp run
 cargo build --rustsp
-Project bisa mencampur:
+Satu project bisa mencampur:
 
 .rs (Rust)
 
