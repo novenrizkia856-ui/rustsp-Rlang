@@ -62,11 +62,16 @@ Ini menciptakan dua lapisan keamanan:
 ```rust
 let mut a = 10;
 a = a + 1;
-RustS+
+```
+
+### Rustsp
+```RustS+
 rusts
 Salin kode
 a = 10
 a = a + 1
+```
+
 RustS+ akan:
 
 menentukan mut secara otomatis
@@ -76,8 +81,7 @@ mencegah shadowing ambigu
 memastikan niat programmer eksplisit
 
 📦 Struct & Enum
-rusts
-Salin kode
+```rustsp
 struct Node {
     id u32
     balance i64
@@ -93,19 +97,20 @@ Salin kode
 node = Node {
     id = 1
     balance = 100
-}
-🔀 Control Flow as Expression
-rusts
-Salin kode
+}```
+
+
+ 🔀 Control Flow as Expression
+```rusts
 status = if balance > 1000 {
     "rich"
 } else if balance >= 0 {
     "normal"
 } else {
     "debt"
-}
-rusts
-Salin kode
+}```
+
+```rusts
 match status {
     "rich" {
         println("rich")
@@ -113,7 +118,8 @@ match status {
     _ {
         println("other")
     }
-}
+}```
+
 Semua if dan match adalah ekspresi.
 
 🧠 Anti-Fail Logic
@@ -132,7 +138,6 @@ RustS+ melarang dua sumber efek tanpa kontrak eksplisit.
 RustS+ dirancang untuk hidup di dalam ekosistem Cargo:
 
 bash
-Salin kode
 cargo rustsp build
 cargo rustsp run
 cargo build --rustsp
