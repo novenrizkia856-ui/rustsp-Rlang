@@ -13,6 +13,9 @@ enum Tx {
     Query(u32)
 }
 
+// --------------------
+// PURE FUNCTION
+// --------------------
 fn classify(balance i64) String {
     if balance >= 1000 {
         "gold"
@@ -23,6 +26,9 @@ fn classify(balance i64) String {
     }
 }
 
+// --------------------
+// EFFECTFUL TRANSFORM
+// --------------------
 fn apply_tx(w Wallet, tx Tx) effects(write w) Wallet {
     match tx {
         Tx::Deposit { id, amount } {
@@ -51,6 +57,9 @@ fn apply_tx(w Wallet, tx Tx) effects(write w) Wallet {
     }
 }
 
+// --------------------
+// EFFECT PROPAGATION
+// --------------------
 fn process_all(w Wallet, txs [Tx]) effects(write w) Wallet {
     mut acc = w
     mut i = 0
@@ -63,25 +72,33 @@ fn process_all(w Wallet, txs [Tx]) effects(write w) Wallet {
     acc
 }
 
+// --------------------
+// IO EFFECT
+// --------------------
 fn log_status(label String, value i64) effects(io) () {
     println("{} = {}", label, value)
 }
 
-fn main() effects(io, write account) () {
+// --------------------
+// MAIN
+// --------------------
+fn main() effects(io) () {
 
     mut account = Wallet {
         id = 7
         balance = 100
     }
 
-    // ---- Build txs WITHOUT enum literals inline ----
-    t1 = Tx::Deposit { id = 7, amount = 500 }
-    t2 = Tx::Withdraw { id = 7, amount = 200 }
-    t3 = Tx::Deposit { id = 7, amount = 900 }
+    effect write(account)
 
-    txs = [ t1, t2, t3 ]
+    txs = [
+        Tx::Deposit { id = 7, amount = 500 },
+        Tx::Withdraw { id = 7, amount = 200 },
+        Tx::Deposit { id = 7, amount = 900 }
+    ]
 
-    account = process_all(account, txs)
+    // THIS is the correct way to update outer state
+    outer account = process_all(account, txs)
 
     tier = classify(account.balance)
 

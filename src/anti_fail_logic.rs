@@ -62,6 +62,316 @@ pub mod ansi {
 }
 
 //=============================================================================
+// EXPRESSION CONTEXT TRACKING (NEW - Fixes Enum Constructor Bug)
+//=============================================================================
+
+/// Expression context for tracking what kind of syntactic context we're in.
+/// This is used to distinguish enum constructors from assignments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpressionContext {
+    /// Top-level code (statements)
+    TopLevel,
+    /// Inside array literal `[...]`
+    ArrayLiteral,
+    /// Inside struct literal `{ field = value, ... }`
+    StructLiteral,
+    /// Inside function arguments `(arg1, arg2, ...)`
+    FnArgs,
+    /// Inside match arm
+    MatchArm,
+    /// Inside tuple literal `(a, b, c)`
+    TupleLiteral,
+}
+
+/// Stack of expression contexts for nested expressions
+#[derive(Debug, Clone)]
+pub struct ExpressionContextStack {
+    stack: Vec<ExpressionContext>,
+    /// Track bracket depth `[` for array literals
+    bracket_depth: usize,
+    /// Track open brackets positions (line numbers for debugging)
+    bracket_positions: Vec<usize>,
+}
+
+impl ExpressionContextStack {
+    pub fn new() -> Self {
+        ExpressionContextStack {
+            stack: vec![ExpressionContext::TopLevel],
+            bracket_depth: 0,
+            bracket_positions: Vec::new(),
+        }
+    }
+    
+    pub fn push(&mut self, ctx: ExpressionContext) {
+        self.stack.push(ctx);
+    }
+    
+    pub fn pop(&mut self) -> Option<ExpressionContext> {
+        if self.stack.len() > 1 {
+            self.stack.pop()
+        } else {
+            None // Never pop the top-level context
+        }
+    }
+    
+    pub fn current(&self) -> ExpressionContext {
+        *self.stack.last().unwrap_or(&ExpressionContext::TopLevel)
+    }
+    
+    /// Check if we're inside any expression context where enum constructors
+    /// should NOT be treated as assignments
+    pub fn is_in_expression_context(&self) -> bool {
+        matches!(
+            self.current(),
+            ExpressionContext::ArrayLiteral |
+            ExpressionContext::StructLiteral |
+            ExpressionContext::FnArgs |
+            ExpressionContext::MatchArm |
+            ExpressionContext::TupleLiteral
+        )
+    }
+    
+    /// Check if we're inside an array literal
+    pub fn is_in_array(&self) -> bool {
+        self.bracket_depth > 0 || 
+        self.stack.iter().any(|c| *c == ExpressionContext::ArrayLiteral)
+    }
+    
+    /// Enter array literal context
+    pub fn enter_array(&mut self, line: usize) {
+        self.bracket_depth += 1;
+        self.bracket_positions.push(line);
+        self.push(ExpressionContext::ArrayLiteral);
+    }
+    
+    /// Exit array literal context
+    pub fn exit_array(&mut self) {
+        if self.bracket_depth > 0 {
+            self.bracket_depth -= 1;
+            self.bracket_positions.pop();
+            // Pop ArrayLiteral context if it's on top
+            if self.current() == ExpressionContext::ArrayLiteral {
+                self.pop();
+            }
+        }
+    }
+    
+    /// Update bracket depth from a line
+    pub fn update_from_line(&mut self, line: &str, line_num: usize) {
+        let mut in_string = false;
+        let mut prev = ' ';
+        
+        for c in line.chars() {
+            if c == '"' && prev != '\\' {
+                in_string = !in_string;
+            }
+            
+            if !in_string {
+                match c {
+                    '[' => self.enter_array(line_num),
+                    ']' => self.exit_array(),
+                    _ => {}
+                }
+            }
+            prev = c;
+        }
+    }
+}
+
+impl Default for ExpressionContextStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+//=============================================================================
+// ENUM CONSTRUCTOR DETECTION (NEW - Core Fix)
+//=============================================================================
+
+/// Check if a line contains an enum constructor pattern.
+/// 
+/// Enum constructors look like:
+/// - `Enum::Variant { ... }`
+/// - `Enum::Variant(...)`
+/// - `Enum::Variant`
+/// 
+/// These are NEVER assignment targets, even if they contain `=` inside.
+pub fn is_enum_constructor(line: &str) -> bool {
+    let trimmed = line.trim();
+    
+    // Quick rejection: must contain `::`
+    if !trimmed.contains("::") {
+        return false;
+    }
+    
+    // Find the `::` position
+    if let Some(colon_pos) = trimmed.find("::") {
+        // Get the part before `::`
+        let before_colon = &trimmed[..colon_pos];
+        
+        // The part before `::` should be a valid type name (starts with uppercase)
+        let type_name = before_colon.trim();
+        if type_name.is_empty() {
+            return false;
+        }
+        
+        // Check if type_name looks like a type (starts with uppercase letter)
+        let first_char = type_name.chars().next().unwrap_or('_');
+        if !first_char.is_uppercase() {
+            return false;
+        }
+        
+        // Verify the type name is a valid identifier (alphanumeric + underscore)
+        // But allow things like `x = Tx::Variant` by checking the last word
+        let words: Vec<&str> = type_name.split_whitespace().collect();
+        if let Some(last_word) = words.last() {
+            let first_char_last = last_word.chars().next().unwrap_or('_');
+            if first_char_last.is_uppercase() && 
+               last_word.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                // Check if after `::` there's a variant name
+                let after_colon = &trimmed[colon_pos + 2..];
+                let variant_part = after_colon.trim();
+                
+                // Variant should start with uppercase
+                let variant_first = variant_part.chars().next().unwrap_or('_');
+                if variant_first.is_uppercase() {
+                    return true;
+                }
+            }
+        }
+    }
+    
+    false
+}
+
+/// Check if a line is purely an enum constructor expression (not an assignment TO an enum).
+/// This detects patterns like:
+/// - `Tx::Deposit { id = 7, amount = 100 }`
+/// - `Some(value)`
+/// - `None`
+/// 
+/// But NOT:
+/// - `x = Tx::Deposit { ... }` (this IS an assignment of x)
+pub fn is_pure_enum_constructor_expr(line: &str) -> bool {
+    let trimmed = line.trim().trim_end_matches(',');
+    
+    // Must start with an uppercase letter (type name) followed by ::
+    let first_char = trimmed.chars().next().unwrap_or('_');
+    if !first_char.is_uppercase() {
+        return false;
+    }
+    
+    // Must contain ::
+    if !trimmed.contains("::") {
+        return false;
+    }
+    
+    // Get the part before ::
+    if let Some(colon_pos) = trimmed.find("::") {
+        let type_name = &trimmed[..colon_pos];
+        
+        // Type name must be a valid identifier starting with uppercase
+        if type_name.chars().all(|c| c.is_alphanumeric() || c == '_') &&
+           type_name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Extract the actual variable name from an assignment line.
+/// Returns empty string if the line is NOT a variable assignment.
+/// 
+/// This is the CRITICAL fix for the enum constructor bug:
+/// - `x = 10` → returns "x"
+/// - `Tx::Deposit { id = 7 }` → returns "" (NOT an assignment)
+/// - `x = Tx::Deposit { ... }` → returns "x"
+pub fn extract_assignment_target(line: &str) -> String {
+    let trimmed = line.trim();
+    
+    // Skip if starts with control flow
+    if trimmed.starts_with("if ") || trimmed.starts_with("while ") ||
+       trimmed.starts_with("for ") || trimmed.starts_with("match ") ||
+       trimmed.starts_with("return ") || trimmed.starts_with("else") {
+        return String::new();
+    }
+    
+    // CRITICAL: If line is a pure enum constructor (starts with Type::Variant),
+    // it's NOT an assignment
+    if is_pure_enum_constructor_expr(trimmed) {
+        return String::new();
+    }
+    
+    // Look for `=` that's NOT part of `==`, `!=`, `<=`, `>=`, `=>`
+    let mut in_string = false;
+    let mut prev_char = ' ';
+    let mut eq_pos: Option<usize> = None;
+    
+    for (i, c) in trimmed.char_indices() {
+        if c == '"' && prev_char != '\\' {
+            in_string = !in_string;
+        }
+        
+        if !in_string && c == '=' {
+            // Check if it's a comparison or arrow
+            let next_char = trimmed.chars().nth(i + 1).unwrap_or(' ');
+            if prev_char != '=' && prev_char != '!' && prev_char != '<' && prev_char != '>' &&
+               next_char != '=' && next_char != '>' {
+                eq_pos = Some(i);
+                break;
+            }
+        }
+        prev_char = c;
+    }
+    
+    let eq_pos = match eq_pos {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    
+    // Get left side of =
+    let left_side = trimmed[..eq_pos].trim();
+    
+    // If left side contains `::`, it's NOT an assignment target
+    // (it's a struct field init like `Tx::Variant { field = value }`)
+    if left_side.contains("::") {
+        return String::new();
+    }
+    
+    // Handle `mut x` case
+    let var_part = if left_side.starts_with("mut ") {
+        &left_side[4..]
+    } else if left_side.starts_with("outer ") {
+        &left_side[6..]
+    } else {
+        left_side
+    };
+    
+    // Extract just the identifier (stop at space, colon, bracket)
+    let var_name: String = var_part.trim()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    
+    // Final validation: if the var_name looks like a Type (starts with uppercase)
+    // AND the line contains `::` anywhere, it's likely an enum constructor context
+    if !var_name.is_empty() {
+        let first_char = var_name.chars().next().unwrap_or('_');
+        if first_char.is_uppercase() && trimmed.contains("::") {
+            // Double check: is this line like `x = Type::Variant`?
+            // or is it `Type::Variant { field = value }`?
+            // The key is: if var_name IS the type name, it's NOT an assignment
+            if trimmed.starts_with(&var_name) && trimmed[var_name.len()..].trim_start().starts_with("::") {
+                return String::new();
+            }
+        }
+    }
+    
+    var_name
+}
+
+//=============================================================================
 // EFFECT TYPES - Core Effect Definitions
 //=============================================================================
 
@@ -501,7 +811,9 @@ impl EffectOwnershipTracker {
     }
     
     fn exit_block(&mut self) {
-        self.scope_stack.pop();
+        if self.scope_stack.len() > 1 {
+            self.scope_stack.pop();
+        }
     }
     
     fn record_effect(&mut self, effect: Effect, line: usize) {
@@ -520,78 +832,62 @@ impl EffectOwnershipTracker {
     fn is_in_closure(&self) -> bool {
         self.scope_stack.iter().any(|s| s.is_closure)
     }
+    
+    #[allow(dead_code)]
+    fn current_depth(&self) -> usize {
+        self.scope_stack.last().map(|s| s.depth).unwrap_or(0)
+    }
 }
 
 //=============================================================================
-// EFFECT ANALYZER - The core effect tracking engine
+// EFFECT ANALYZER
 //=============================================================================
 
-/// Analyzes a function body for effects
+/// Analyzes effects within a function body
 #[derive(Debug)]
 pub struct EffectAnalyzer {
-    /// Current function being analyzed
+    /// Current function name
     current_function: Option<String>,
-    /// Detected effects in current function
+    /// Current function parameters
+    parameters: Vec<(String, String)>,
+    /// Detected effects
     detected_effects: BTreeSet<Effect>,
-    /// Function parameters (for write detection)
-    parameters: HashMap<String, String>,  // name -> type
-    /// Functions called
-    called_functions: Vec<(String, usize)>,  // (name, line)
+    /// Declared effects (from signature)
+    declared_effects: EffectSignature,
+    /// Function calls detected
+    function_calls: Vec<(String, usize)>,  // (name, line)
     /// Effect ownership tracker
     ownership_tracker: EffectOwnershipTracker,
-    /// I/O patterns
-    io_patterns: Vec<&'static str>,
-    /// Allocation patterns  
-    alloc_patterns: Vec<&'static str>,
-    /// Panic patterns
-    panic_patterns: Vec<&'static str>,
 }
 
 impl EffectAnalyzer {
     pub fn new() -> Self {
         EffectAnalyzer {
             current_function: None,
+            parameters: Vec::new(),
             detected_effects: BTreeSet::new(),
-            parameters: HashMap::new(),
-            called_functions: Vec::new(),
+            declared_effects: EffectSignature::new(),
+            function_calls: Vec::new(),
             ownership_tracker: EffectOwnershipTracker::new(),
-            io_patterns: vec![
-                "println!", "print!", "eprintln!", "eprint!",
-                "std::io::", "File::", "read_to_string", "write_all",
-                "stdin()", "stdout()", "stderr()",
-                "read_line", "BufReader", "BufWriter",
-                "OpenOptions", "create(", "open(",
-            ],
-            alloc_patterns: vec![
-                "Vec::new", "vec!", "String::new", "String::from",
-                "Box::new", "Rc::new", "Arc::new",
-                "HashMap::new", "HashSet::new",
-                "BTreeMap::new", "BTreeSet::new",
-                ".to_vec()", ".to_string()", ".to_owned()",
-                ".clone()",
-            ],
-            panic_patterns: vec![
-                "panic!", "unreachable!", "unimplemented!", "todo!",
-                ".unwrap()", ".expect(", "assert!", "assert_eq!", "assert_ne!",
-            ],
         }
     }
     
     pub fn enter_function(&mut self, name: &str, params: &[(String, String)], declared: &EffectSignature) {
         self.current_function = Some(name.to_string());
+        self.parameters = params.to_vec();
         self.detected_effects.clear();
-        self.parameters = params.iter().cloned().collect();
-        self.called_functions.clear();
+        self.declared_effects = declared.clone();
+        self.function_calls.clear();
         self.ownership_tracker.enter_function(name, declared);
     }
     
     pub fn exit_function(&mut self) -> (BTreeSet<Effect>, Vec<(String, usize)>) {
+        self.ownership_tracker.exit_function();
         self.current_function = None;
-        let effects = std::mem::take(&mut self.detected_effects);
-        let calls = std::mem::take(&mut self.called_functions);
-        self.parameters.clear();
-        let _usages = self.ownership_tracker.exit_function();
-        (effects, calls)
+        (
+            std::mem::take(&mut self.detected_effects),
+            std::mem::take(&mut self.function_calls)
+        )
     }
     
     pub fn enter_block(&mut self, depth: usize, line: usize) {
@@ -606,97 +902,86 @@ impl EffectAnalyzer {
         self.ownership_tracker.exit_block();
     }
     
-    /// Analyze a line for effects
     pub fn analyze_line(&mut self, line: &str, line_num: usize) {
-        let trimmed = line.trim();
-        
-        // Skip comments
-        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
-            return;
+        // Detect I/O effects
+        if self.detect_io_effect(line) {
+            self.detected_effects.insert(Effect::Io);
+            self.ownership_tracker.record_effect(Effect::Io, line_num);
         }
         
-        // I/O detection
-        if let Some(io_op) = self.detect_io(trimmed) {
-            let effect = Effect::Io;
-            self.detected_effects.insert(effect.clone());
-            self.ownership_tracker.record_effect(effect, line_num);
+        // Detect allocation effects
+        if self.detect_alloc_effect(line) {
+            self.detected_effects.insert(Effect::Alloc);
+            self.ownership_tracker.record_effect(Effect::Alloc, line_num);
         }
         
-        // Allocation detection
-        if let Some(_alloc_op) = self.detect_alloc(trimmed) {
-            let effect = Effect::Alloc;
-            self.detected_effects.insert(effect.clone());
-            self.ownership_tracker.record_effect(effect, line_num);
+        // Detect panic effects
+        if self.detect_panic_effect(line) {
+            self.detected_effects.insert(Effect::Panic);
+            self.ownership_tracker.record_effect(Effect::Panic, line_num);
         }
         
-        // Panic detection
-        if let Some(_panic_op) = self.detect_panic(trimmed) {
-            let effect = Effect::Panic;
-            self.detected_effects.insert(effect.clone());
-            self.ownership_tracker.record_effect(effect, line_num);
-        }
-        
-        // Parameter mutation detection
-        if let Some(param) = self.detect_param_mutation(trimmed) {
+        // Detect parameter mutations (write effects)
+        if let Some(param) = self.detect_param_mutation(line) {
             let effect = Effect::Write(param.clone());
             self.detected_effects.insert(effect.clone());
             self.ownership_tracker.record_effect(effect, line_num);
         }
         
-        // Parameter read detection (field access without mutation)
-        if let Some(param) = self.detect_param_read(trimmed) {
-            let effect = Effect::Read(param.clone());
+        // Detect parameter reads
+        if let Some(param) = self.detect_param_read(line) {
+            let effect = Effect::Read(param);
             self.detected_effects.insert(effect.clone());
             self.ownership_tracker.record_effect(effect, line_num);
         }
         
-        // Function call detection
-        for func_name in self.detect_function_calls(trimmed) {
-            self.called_functions.push((func_name, line_num));
+        // Detect function calls
+        for call in self.detect_function_calls(line) {
+            self.function_calls.push((call, line_num));
         }
+    }
+    
+    fn detect_io_effect(&self, line: &str) -> bool {
+        let io_patterns = [
+            "println!", "print!", "eprintln!", "eprint!",
+            "std::io", "File::", "stdin()", "stdout()", "stderr()",
+            ".read(", ".write(", ".flush(",
+            "fs::read", "fs::write", "fs::create", "fs::open",
+        ];
         
-        // Closure detection
-        if self.detect_closure_start(trimmed) {
-            // Closures are tracked for effect leak detection
-        }
+        io_patterns.iter().any(|p| line.contains(p))
     }
     
-    fn detect_io(&self, line: &str) -> Option<&'static str> {
-        for pattern in &self.io_patterns {
-            if line.contains(pattern) {
-                return Some(pattern);
-            }
-        }
-        None
+    fn detect_alloc_effect(&self, line: &str) -> bool {
+        let alloc_patterns = [
+            "Vec::new", "Vec::with_capacity",
+            "String::new", "String::from", ".to_string()", ".to_owned()",
+            "Box::new", "Rc::new", "Arc::new",
+            "HashMap::new", "HashSet::new", "BTreeMap::new", "BTreeSet::new",
+            "vec!", ".clone()", ".collect()",
+        ];
+        
+        alloc_patterns.iter().any(|p| line.contains(p))
     }
     
-    fn detect_alloc(&self, line: &str) -> Option<&'static str> {
-        for pattern in &self.alloc_patterns {
-            if line.contains(pattern) {
-                return Some(pattern);
-            }
-        }
-        None
-    }
-    
-    fn detect_panic(&self, line: &str) -> Option<&'static str> {
-        for pattern in &self.panic_patterns {
-            if line.contains(pattern) {
-                return Some(pattern);
-            }
-        }
-        None
+    fn detect_panic_effect(&self, line: &str) -> bool {
+        let panic_patterns = [
+            "panic!", ".unwrap()", ".expect(",
+            "assert!", "assert_eq!", "assert_ne!",
+            "unreachable!", "unimplemented!", "todo!",
+        ];
+        
+        panic_patterns.iter().any(|p| line.contains(p))
     }
     
     fn detect_param_mutation(&self, line: &str) -> Option<String> {
         // Check for parameter field mutation: `param.field = value`
         for (param, _ty) in &self.parameters {
-            // Pattern: `param.something = `
-            let field_pattern = format!("{}.", param);
-            if line.contains(&field_pattern) && line.contains('=') {
-                // Make sure it's assignment, not comparison
-                let after_param = line.split(&field_pattern).nth(1)?;
-                // Check for = but not == or !=
+            // Pattern: `param.field = `
+            let field_assign_pattern = format!("{}.", param);
+            if line.contains(&field_assign_pattern) {
+                // Find if there's an assignment to a field
+                let after_param = line.split(&field_assign_pattern).nth(1)?;
                 if after_param.contains('=') && 
                    !after_param.contains("==") && 
                    !after_param.contains("!=") &&
@@ -810,6 +1095,12 @@ impl EffectAnalyzer {
     }
 }
 
+impl Default for EffectAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 //=============================================================================
 // EFFECT DEPENDENCY GRAPH
 //=============================================================================
@@ -897,6 +1188,9 @@ pub struct AntiFailLogicChecker {
     brace_depth: usize,
     control_flow_stack: Vec<ControlFlowExpr>,
     
+    // Expression context tracking (NEW - for fixing enum constructor bug)
+    expression_context: ExpressionContextStack,
+    
     // Error collection
     errors: Vec<RsplError>,
     file_name: String,
@@ -928,6 +1222,7 @@ impl AntiFailLogicChecker {
             scopes: vec![Scope::new(0, false, 0)],
             brace_depth: 0,
             control_flow_stack: Vec::new(),
+            expression_context: ExpressionContextStack::new(),
             errors: Vec::new(),
             file_name: file_name.to_string(),
             source_lines: Vec::new(),
@@ -951,30 +1246,31 @@ impl AntiFailLogicChecker {
     }
     
     /// Enable or disable strict effect mode
-    pub fn set_strict_effect_mode(&mut self, enabled: bool) {
-        self.strict_effect_mode = enabled;
+    pub fn set_strict_effect_mode(&mut self, strict: bool) {
+        self.strict_effect_mode = strict;
     }
     
-    /// Run anti-fail logic check on source code
+    /// Main entry point - runs all checks
     pub fn check(&mut self, source: &str) -> Result<(), Vec<RsplError>> {
         self.source_lines = source.lines().map(String::from).collect();
         
-        // PASS 1: Collect all function signatures with effects
+        // PASS 1: Collect function signatures with effects
         self.collect_function_signatures(source);
         
-        // PASS 2: Analyze function bodies for effects
+        // PASS 2: Analyze function bodies
         for (line_num, line) in source.lines().enumerate() {
-            let line_num = line_num + 1;
-            self.analyze_line(line, line_num);
+            self.analyze_line(line, line_num + 1);
         }
         
-        // Check for unclosed expressions
-        self.check_unclosed_expressions();
+        // Close any open control flows
+        self.close_pending_control_flows();
         
         // PASS 3: Build effect dependency graph
-        self.build_effect_graph();
+        if self.effect_checking_enabled {
+            self.build_effect_graph();
+        }
         
-        // PASS 4: Effect contract validation
+        // PASS 4: Validate effect contracts
         if self.effect_checking_enabled {
             self.validate_effect_contracts();
             self.validate_effect_propagation();
@@ -984,119 +1280,64 @@ impl AntiFailLogicChecker {
         if self.errors.is_empty() {
             Ok(())
         } else {
-            Err(self.errors.clone())
+            Err(std::mem::take(&mut self.errors))
         }
     }
     
     //=========================================================================
-    // PASS 1: FUNCTION SIGNATURE COLLECTION
+    // PASS 1: COLLECT FUNCTION SIGNATURES
     //=========================================================================
     
     fn collect_function_signatures(&mut self, source: &str) {
-        let mut current_func: Option<FunctionInfo> = None;
-        let mut brace_count = 0;
-        let mut func_brace_start = 0;
-        
         for (line_num, line) in source.lines().enumerate() {
-            let line_num = line_num + 1;
-            let trimmed = line.trim();
-            
-            // Count braces
-            let opens = trimmed.matches('{').count();
-            let closes = trimmed.matches('}').count();
-            
-            if self.is_function_definition(trimmed) {
-                if let Some(func_info) = self.parse_function_with_effects(trimmed, line_num) {
-                    current_func = Some(func_info);
-                    func_brace_start = brace_count + opens;
-                }
-            }
-            
-            brace_count += opens;
-            brace_count = brace_count.saturating_sub(closes);
-            
-            // Collect function body
-            if let Some(ref mut func) = current_func {
-                func.body_lines.push((line_num, line.to_string()));
-                
-                // Check if function ended
-                if brace_count < func_brace_start {
-                    func.end_line = line_num;
-                    self.function_table.insert(func.name.clone(), func.clone());
-                    self.effect_graph.add_function(&func.name);
-                    current_func = None;
+            if self.is_function_start(line.trim()) {
+                if let Some(func_info) = self.parse_function_with_effects(line, line_num + 1) {
+                    self.effect_graph.add_function(&func_info.name);
+                    self.function_table.insert(func_info.name.clone(), func_info);
                 }
             }
         }
-        
-        // Handle unclosed function
-        if let Some(func) = current_func {
-            self.function_table.insert(func.name.clone(), func);
-        }
-    }
-    
-    fn is_function_definition(&self, line: &str) -> bool {
-        (line.starts_with("fn ") || line.starts_with("pub fn ") ||
-         line.starts_with("async fn ") || line.starts_with("pub async fn ")) 
-        && line.contains('(')
     }
     
     fn parse_function_with_effects(&self, line: &str, line_num: usize) -> Option<FunctionInfo> {
-        // Extract function name
-        let is_public = line.starts_with("pub ");
-        let after_fn = if line.starts_with("pub async fn ") {
-            &line[13..]
-        } else if line.starts_with("async fn ") {
-            &line[9..]
-        } else if line.starts_with("pub fn ") {
-            &line[7..]
-        } else if line.starts_with("fn ") {
-            &line[3..]
+        let trimmed = line.trim();
+        
+        // Find function name
+        let fn_start = if trimmed.starts_with("pub ") {
+            trimmed.find("fn ")? + 3
+        } else if trimmed.starts_with("async ") {
+            trimmed.find("fn ")? + 3
         } else {
-            return None;
+            trimmed.find("fn ")? + 3
         };
         
-        let name_end = after_fn.find(|c: char| c == '(' || c == '<' || c == ' ')?;
-        let name = after_fn[..name_end].trim().to_string();
+        let after_fn = &trimmed[fn_start..];
+        let name_end = after_fn.find('(')?;
+        let fn_name = after_fn[..name_end].trim();
         
-        let mut func_info = FunctionInfo::new(&name, line_num);
-        func_info.is_public = is_public;
+        let mut func_info = FunctionInfo::new(fn_name, line_num);
+        func_info.is_public = trimmed.starts_with("pub ");
         
-        // Extract parameters with types
-        if let Some(params_start) = line.find('(') {
-            if let Some(params_end) = line.find(')') {
-                let params_str = &line[params_start + 1..params_end];
-                for param in params_str.split(',') {
-                    let param = param.trim();
-                    if param.is_empty() {
-                        continue;
-                    }
-                    
-                    // Parse: name Type or name: Type
-                    if param.contains(':') {
-                        let parts: Vec<&str> = param.splitn(2, ':').collect();
-                        if parts.len() == 2 {
-                            let param_name = parts[0].trim().to_string();
-                            let param_type = parts[1].trim().to_string();
-                            func_info.parameters.push((param_name, param_type));
-                        }
-                    } else if let Some(space_pos) = param.find(' ') {
-                        let param_name = param[..space_pos].trim().to_string();
-                        let param_type = param[space_pos + 1..].trim().to_string();
-                        func_info.parameters.push((param_name, param_type));
-                    }
-                }
+        // Extract parameters
+        let params_start = trimmed.find('(')? + 1;
+        let params_end = trimmed.find(')')?;
+        let params_str = &trimmed[params_start..params_end];
+        
+        for param in params_str.split(',') {
+            let param = param.trim();
+            if param.is_empty() {
+                continue;
             }
-        }
-        
-        // Extract return type
-        if let Some(arrow_pos) = line.find("->") {
-            let after_arrow = &line[arrow_pos + 2..];
-            let ret_end = after_arrow.find(|c: char| c == '{' || c == 'e')
-                .unwrap_or(after_arrow.len());
-            let ret_type = after_arrow[..ret_end].trim();
-            if !ret_type.is_empty() && ret_type != "{" {
-                func_info.return_type = Some(ret_type.to_string());
+            
+            let parts: Vec<&str> = param.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                let name = parts[0].trim().to_string();
+                let ty = parts[1].trim().to_string();
+                func_info.parameters.push((name, ty));
+            } else if parts.len() == 1 {
+                // Type annotation on separate line or just type
+                let name = parts[0].trim().to_string();
+                func_info.parameters.push((name.clone(), name));
             }
         }
         
@@ -1142,6 +1383,9 @@ impl AntiFailLogicChecker {
             return;
         }
         
+        // Update expression context from brackets (IMPORTANT for enum constructor fix)
+        self.expression_context.update_from_line(trimmed, line_num);
+        
         let opens = self.count_open_braces(trimmed);
         let closes = self.count_close_braces(trimmed);
         
@@ -1167,7 +1411,8 @@ impl AntiFailLogicChecker {
         // Logic-03: Check for illegal statements
         self.check_illegal_statement(trimmed, line_num);
         
-        // Logic-02 & Logic-04: Check assignments
+        // Logic-02 & Logic-04 & Logic-06: Check assignments
+        // NOW WITH EXPRESSION CONTEXT AWARENESS
         self.check_assignment(trimmed, line_num);
         
         // Logic-05: Check unclear intent
@@ -1354,13 +1599,17 @@ impl AntiFailLogicChecker {
             func_info.name,
             effect.display(),
             func_info.declared_effects.display(),
-            func_info.detected_effects.display()
+            effect.display()
         ))
         .help(format!(
-            "add effect declaration to function signature:\n\n\
-             fn {}(...) effects({}) {{ ... }}",
+            "add `effects({})` to the function signature:\n\n    fn {}(...) effects({}) {{ ... }}",
+            effect.display(),
             func_info.name,
-            effect.display()
+            if func_info.declared_effects.effects.is_empty() {
+                effect.display()
+            } else {
+                format!("{}, {}", func_info.declared_effects.display(), effect.display())
+            }
         ));
         
         self.errors.push(error);
@@ -1370,7 +1619,7 @@ impl AntiFailLogicChecker {
         let error = RsplError::new(
             ErrorCode::RSPL301,
             format!(
-                "function `{}` calls `{}` which has effect `{}`, but does not propagate it",
+                "function `{}` calls `{}` which has effect `{}` but does not propagate it",
                 func_info.name,
                 called,
                 effect.display()
@@ -1379,21 +1628,24 @@ impl AntiFailLogicChecker {
         .at(self.make_location(func_info.line_number, &func_info.name))
         .note(format!(
             "{} VIOLATION: Missing Effect Propagation\n\n\
-             in RustS+, effects must propagate upward through call chains.\n\
-             `{}` calls `{}` which declares `{}`.\n\
-             the caller must also declare this effect.\n\n\
-             Effects are like capabilities - if you use a capability,\n\
-             you must have permission for it.",
+             function `{}` calls `{}` which performs `{}`.\n\
+             effects must propagate upward - the caller must declare callee's effects.\n\n\
+             This ensures no hidden effects can leak through the call chain.",
             LogicViolation::MissingEffectPropagation.code(),
             func_info.name,
             called,
             effect.display()
         ))
         .help(format!(
-            "add effect to function signature:\n\n\
-             fn {}(...) effects({}) {{ ... }}",
+            "add `{}` to the effects of `{}`:\n\n    fn {}(...) effects({}) {{ ... }}",
+            effect.display(),
             func_info.name,
-            effect.display()
+            func_info.name,
+            if func_info.declared_effects.effects.is_empty() {
+                effect.display()
+            } else {
+                format!("{}, {}", func_info.declared_effects.display(), effect.display())
+            }
         ));
         
         self.errors.push(error);
@@ -1411,153 +1663,154 @@ impl AntiFailLogicChecker {
         .at(self.make_location(func_info.line_number, &func_info.name))
         .note(format!(
             "{} VIOLATION: Pure Calling Effectful\n\n\
-             function `{}` has no effects declared (PURE),\n\
-             but it calls `{}` which HAS effects.\n\n\
-             PURE functions cannot perform ANY effects.\n\
-             this ensures referential transparency.",
+             function `{}` is declared as pure (no effects),\n\
+             but it calls `{}` which has effects.\n\n\
+             pure functions cannot call effectful functions without\n\
+             declaring that they propagate those effects.",
             LogicViolation::PureCallingEffectful.code(),
             func_info.name,
             called
         ))
         .help(format!(
             "either:\n\
-             1. Add effects to `{}`:\n\
-                fn {}(...) effects(...) {{ ... }}\n\
-             2. Or remove the call to `{}`",
-            func_info.name, func_info.name, called
+             1. Add the appropriate effects to `{}`\n\
+             2. Or refactor to avoid calling effectful functions",
+            func_info.name
         ));
         
         self.errors.push(error);
     }
     
     //=========================================================================
-    // LOGIC CHECKS (Original L01-L06)
+    // LOGIC CHECKS
     //=========================================================================
     
     fn check_control_flow_start(&mut self, trimmed: &str, line_num: usize) -> bool {
-        if let Some(cf_expr) = self.detect_control_flow_expr(trimmed, line_num) {
-            self.control_flow_stack.push(cf_expr.clone());
-            
-            if cf_expr.is_value_context {
-                self.enter_scope(true, line_num);
+        // Check for control flow as expression (if/match assigned to variable)
+        if trimmed.starts_with("if ") && !trimmed.contains("if let") {
+            // Check if it's an assignment
+            if let Some(assigned_to) = self.detect_assignment_to_control_flow(trimmed) {
+                self.control_flow_stack.push(ControlFlowExpr {
+                    start_line: line_num,
+                    is_value_context: true,
+                    has_else: false,
+                    kind: ControlFlowKind::If,
+                    assigned_to: Some(assigned_to),
+                    start_depth: self.brace_depth,
+                });
+                return true;
             }
-            return true;
         }
         
+        if trimmed.starts_with("match ") {
+            if let Some(assigned_to) = self.detect_assignment_to_control_flow(trimmed) {
+                self.control_flow_stack.push(ControlFlowExpr {
+                    start_line: line_num,
+                    is_value_context: true,
+                    has_else: true, // match always has arms
+                    kind: ControlFlowKind::Match,
+                    assigned_to: Some(assigned_to),
+                    start_depth: self.brace_depth,
+                });
+                return true;
+            }
+        }
+        
+        // Detect else keyword
         if trimmed.starts_with("else") || trimmed.contains("} else") {
             if let Some(cf) = self.control_flow_stack.last_mut() {
-                if cf.kind == ControlFlowKind::If {
-                    cf.has_else = true;
-                }
+                cf.has_else = true;
             }
-            return true;
-        }
-        
-        if (trimmed.starts_with("if ") || trimmed.starts_with("while ") ||
-            trimmed.starts_with("for ") || trimmed.starts_with("loop ") ||
-            trimmed.starts_with("match ")) && trimmed.contains('{') {
-            return true;
         }
         
         false
     }
     
-    fn detect_control_flow_expr(&self, trimmed: &str, line_num: usize) -> Option<ControlFlowExpr> {
-        if trimmed.contains("= if ") && trimmed.contains('{') {
-            let assigned_to = self.extract_assignment_target(trimmed);
-            return Some(ControlFlowExpr {
-                start_line: line_num,
-                is_value_context: true,
-                has_else: false,
-                kind: ControlFlowKind::If,
-                assigned_to,
-                start_depth: self.brace_depth,
-            });
+    fn detect_assignment_to_control_flow(&self, line: &str) -> Option<String> {
+        // Pattern: `var = if ...` or `var = match ...`
+        if let Some(eq_pos) = line.find('=') {
+            let before_eq = line[..eq_pos].trim();
+            let after_eq = line[eq_pos + 1..].trim();
+            
+            // Make sure it's not ==
+            if !line.contains("==") && (after_eq.starts_with("if ") || after_eq.starts_with("match ")) {
+                // Extract variable name
+                let var_name = before_eq.trim_start_matches("mut ").trim();
+                if !var_name.is_empty() && var_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    return Some(var_name.to_string());
+                }
+            }
         }
-        
-        if trimmed.contains("= match ") && trimmed.contains('{') {
-            let assigned_to = self.extract_assignment_target(trimmed);
-            return Some(ControlFlowExpr {
-                start_line: line_num,
-                is_value_context: true,
-                has_else: false,
-                kind: ControlFlowKind::Match,
-                assigned_to,
-                start_depth: self.brace_depth,
-            });
-        }
-        
         None
     }
     
-    fn check_unclosed_expressions(&mut self) {
-        let unclosed: Vec<_> = self.control_flow_stack.drain(..).collect();
-        
-        for cf in unclosed {
-            if cf.is_value_context && cf.kind == ControlFlowKind::If && !cf.has_else {
-                self.emit_logic01_error(cf.start_line, cf.assigned_to.as_deref());
+    fn close_pending_control_flows(&mut self) {
+        // Check any pending control flows that weren't closed
+        while let Some(cf) = self.control_flow_stack.pop() {
+            if cf.is_value_context && !cf.has_else && cf.kind == ControlFlowKind::If {
+                self.emit_logic01_error(&cf);
             }
         }
     }
     
-    fn emit_logic01_error(&mut self, line_num: usize, assigned_to: Option<&str>) {
-        let source_line = self.get_source_line(line_num);
-        let var_info = assigned_to
-            .map(|v| format!(" (assigning to `{}`)", v))
-            .unwrap_or_default();
-        
+    fn emit_logic01_error(&mut self, cf: &ControlFlowExpr) {
         let error = RsplError::new(
             ErrorCode::RSPL060,
-            format!("`if` expression used as value but missing `else` branch{}", var_info)
+            format!(
+                "`if` expression used as value but missing `else` branch"
+            )
         )
-        .at(self.make_location(line_num, &source_line))
+        .at(self.make_location(cf.start_line, "if"))
         .note(format!(
-            "{} VIOLATION: Expression Completeness\n\n\
-             in RustS+, when `if` is used as expression (assigned to variable),\n\
-             MUST produce value in ALL branches.",
-            LogicViolation::IncompleteExpression.code()
+            "{} VIOLATION: Incomplete Expression\n\n\
+             `if` used as value expression MUST have an `else` branch.\n\
+             Without `else`, what value should `{}` have when condition is false?\n\n\
+             In RustS+, expressions must always produce a value.",
+            LogicViolation::IncompleteExpression.code(),
+            cf.assigned_to.as_deref().unwrap_or("_")
         ))
-        .help("add `else` branch to provide value for all cases");
+        .help(format!(
+            "add an `else` branch:\n\n    {} = if condition {{\n        value_if_true\n    }} else {{\n        value_if_false\n    }}",
+            cf.assigned_to.as_deref().unwrap_or("x")
+        ));
         
         self.errors.push(error);
     }
     
     fn check_illegal_statement(&mut self, trimmed: &str, line_num: usize) {
-        let in_expr_context = self.scopes.last()
-            .map(|s| s.is_expression_context)
-            .unwrap_or(false);
-        
-        if !in_expr_context {
-            return;
-        }
-        
-        if trimmed.starts_with("let ") {
-            self.emit_logic03_error(line_num, trimmed);
+        // Check if we're in an expression context but have a statement
+        if let Some(scope) = self.scopes.last() {
+            if scope.is_expression_context {
+                // Statements not allowed: return, break, continue as standalone
+                if (trimmed.starts_with("return ") || trimmed == "return") &&
+                   !trimmed.ends_with('}') {
+                    let error = RsplError::new(
+                        ErrorCode::RSPL041,
+                        "statement used in expression context"
+                    )
+                    .at(self.make_location(line_num, trimmed))
+                    .note(format!(
+                        "{} VIOLATION: Illegal Statement in Expression\n\n\
+                         `return` is a statement, not an expression.\n\
+                         in expression context, every line must produce a value.",
+                        LogicViolation::IllegalStatementInExpression.code()
+                    ))
+                    .help("remove `return` - the last expression is automatically returned");
+                    
+                    self.errors.push(error);
+                }
+            }
         }
     }
     
-    fn emit_logic03_error(&mut self, line_num: usize, source: &str) {
-        let error = RsplError::new(
-            ErrorCode::RSPL041,
-            "`let` statement not allowed in expression context"
-        )
-        .at(self.make_location(line_num, source))
-        .note(format!(
-            "{} VIOLATION: Illegal Statement in Expression\n\n\
-             in RustS+, expression blocks (if/match used as value) cannot contain statements.",
-            LogicViolation::IllegalStatementInExpression.code()
-        ))
-        .help("use RustS+ assignment syntax or move declaration outside expression");
-        
-        self.errors.push(error);
-    }
-    
+    /// Check assignments with EXPRESSION CONTEXT AWARENESS
+    /// This is the CORE FIX for the enum constructor bug.
     fn check_assignment(&mut self, trimmed: &str, line_num: usize) {
         if !self.in_function {
             return;
         }
         
-        // Skip non-assignments
+        // Skip non-assignments (no =)
         if !trimmed.contains('=') || trimmed.contains("==") || trimmed.contains("!=") {
             return;
         }
@@ -1578,8 +1831,37 @@ impl AntiFailLogicChecker {
             return;
         }
         
-        // Extract variable name
-        let var_name = self.extract_var_name(trimmed);
+        // ═══════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX: Skip enum constructors
+        // ═══════════════════════════════════════════════════════════════════════
+        // 
+        // If we're in an array literal context `[...]`, enum constructors like
+        // `Tx::Deposit { id = 7, amount = 100 }` should NOT be treated as
+        // variable assignments.
+        //
+        // The key insight: `Tx::Variant { ... }` is NEVER an assignment target.
+        // It's always an expression that creates a value.
+        // ═══════════════════════════════════════════════════════════════════════
+        
+        // Check if this line is a pure enum constructor (NOT an assignment)
+        if is_pure_enum_constructor_expr(trimmed) {
+            // This is `Tx::Variant { ... }`, NOT `x = something`
+            // Do NOT treat as assignment
+            return;
+        }
+        
+        // Also check if we're inside array literal context
+        if self.expression_context.is_in_array() {
+            // Inside array, `Tx::Variant { field = value }` is NOT reassignment of Tx
+            if is_enum_constructor(trimmed) {
+                return;
+            }
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // Use the improved extract_assignment_target which handles enum constructors
+        // ═══════════════════════════════════════════════════════════════════════
+        let var_name = extract_assignment_target(trimmed);
         if var_name.is_empty() {
             return;
         }
@@ -1751,79 +2033,39 @@ impl AntiFailLogicChecker {
     }
     
     fn enter_scope(&mut self, is_expression_context: bool, line_num: usize) {
-        self.scopes.push(Scope::new(
-            self.brace_depth + 1,
-            is_expression_context,
-            line_num,
-        ));
-    }
-    
-    fn exit_scope(&mut self) {
-        if self.scopes.len() > 1 {
-            self.scopes.pop();
-        }
+        let new_depth = self.scopes.len();
+        self.scopes.push(Scope::new(new_depth, is_expression_context, line_num));
     }
     
     fn handle_close_brace(&mut self) {
+        // Check if closing a control flow expression
+        for i in (0..self.control_flow_stack.len()).rev() {
+            if self.control_flow_stack[i].start_depth == self.brace_depth {
+                let cf = self.control_flow_stack.remove(i);
+                
+                // Logic-01: If expression used as value must have else
+                if cf.is_value_context && !cf.has_else && cf.kind == ControlFlowKind::If {
+                    self.emit_logic01_error(&cf);
+                }
+                break;
+            }
+        }
+        
         if self.brace_depth > 0 {
             self.brace_depth -= 1;
         }
         
-        // Check control flow completion
-        if let Some(cf) = self.control_flow_stack.last().cloned() {
-            if self.brace_depth <= cf.start_depth {
-                self.control_flow_stack.pop();
-                
-                if cf.is_value_context && cf.kind == ControlFlowKind::If && !cf.has_else {
-                    self.emit_logic01_error(cf.start_line, cf.assigned_to.as_deref());
-                }
-                
-                if cf.is_value_context {
-                    self.exit_scope();
-                }
-            }
+        if self.scopes.len() > 1 {
+            self.scopes.pop();
         }
         
-        // Check scope exit
-        if let Some(scope) = self.scopes.last() {
-            if self.brace_depth < scope.depth {
-                self.exit_scope();
-                self.effect_analyzer.exit_block();
-            }
-        }
+        self.effect_analyzer.exit_block();
     }
     
-    fn extract_assignment_target(&self, line: &str) -> Option<String> {
-        let trimmed = line.trim();
-        if let Some(eq_pos) = trimmed.find('=') {
-            let before_eq = trimmed[..eq_pos].trim();
-            let var_name: String = before_eq
-                .chars()
-                .skip_while(|c| *c == ' ' || *c == '\t')
-                .skip_while(|c| *c == 'm' || *c == 'u' || *c == 't' || *c == ' ')
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            
-            if !var_name.is_empty() {
-                return Some(var_name);
-            }
-        }
-        None
-    }
-    
+    /// Legacy extract_var_name - NOW DEPRECATED, use extract_assignment_target instead
+    #[allow(dead_code)]
     fn extract_var_name(&self, line: &str) -> String {
-        let trimmed = line.trim();
-        let start = if trimmed.starts_with("mut ") {
-            4
-        } else {
-            0
-        };
-        
-        let after_mut = &trimmed[start..];
-        let var_end = after_mut.find(|c: char| !c.is_alphanumeric() && c != '_')
-            .unwrap_or(after_mut.len());
-        
-        after_mut[..var_end].to_string()
+        extract_assignment_target(line)
     }
     
     fn get_source_line(&self, line_num: usize) -> String {
@@ -1898,78 +2140,16 @@ pub fn analyze_functions(source: &str, file_name: &str) -> HashMap<String, Funct
 
 /// Format logic errors for display
 pub fn format_logic_errors(errors: &[RsplError]) -> String {
-    use ansi::*;
-    
     let mut output = String::new();
-    
-    output.push_str(&format!(
-        "\n{}╔═══════════════════════════════════════════════════════════════════╗{}\n",
-        BOLD_RED, RESET
-    ));
-    output.push_str(&format!(
-        "{}║   RustS+ Anti-Fail Logic Error (Stage 1 Contract Violation)       ║{}\n",
-        BOLD_RED, RESET
-    ));
-    output.push_str(&format!(
-        "{}╚═══════════════════════════════════════════════════════════════════╝{}\n\n",
-        BOLD_RED, RESET
-    ));
-    
-    // Group errors by category
-    let mut effect_errors = Vec::new();
-    let mut logic_errors = Vec::new();
-    
     for error in errors {
-        if matches!(error.code, 
-            ErrorCode::RSPL300 | ErrorCode::RSPL301 | ErrorCode::RSPL302 |
-            ErrorCode::RSPL303 | ErrorCode::RSPL304 | ErrorCode::RSPL305 |
-            ErrorCode::RSPL306 | ErrorCode::RSPL307 | ErrorCode::RSPL308 |
-            ErrorCode::RSPL309 | ErrorCode::RSPL310 | ErrorCode::RSPL311 |
-            ErrorCode::RSPL312 | ErrorCode::RSPL313 | ErrorCode::RSPL314) {
-            effect_errors.push(error);
-        } else {
-            logic_errors.push(error);
-        }
+        output.push_str(&format_error(error));
+        output.push('\n');
     }
-    
-    // Display effect errors first
-    if !effect_errors.is_empty() {
-        output.push_str(&format!("{}─── Effect Errors ───{}\n\n", BOLD_MAGENTA, RESET));
-        for error in effect_errors {
-            output.push_str(&format_single_error(error));
-            output.push('\n');
-        }
-    }
-    
-    // Display logic errors
-    if !logic_errors.is_empty() {
-        output.push_str(&format!("{}─── Logic Errors ───{}\n\n", BOLD_YELLOW, RESET));
-        for error in logic_errors {
-            output.push_str(&format_single_error(error));
-            output.push('\n');
-        }
-    }
-    
-    output.push_str(&format!(
-        "\n{}error{}: aborting due to {} error{}\n",
-        BOLD_RED, RESET,
-        errors.len(),
-        if errors.len() == 1 { "" } else { "s" }
-    ));
-    
-    output.push_str(&format!(
-        "\n{}note{}: RustS+ detects logic and effect errors BEFORE Rust compilation.\n",
-        CYAN, RESET
-    ));
-    output.push_str(&format!(
-        "{}      fix these errors first - no Rust code will be generated.{}\n",
-        CYAN, RESET
-    ));
-    
     output
 }
 
-fn format_single_error(error: &RsplError) -> String {
+/// Format a single error with colors
+fn format_error(error: &RsplError) -> String {
     use ansi::*;
     
     let mut output = String::new();
@@ -2118,6 +2298,158 @@ fn main() {
         let result = check_logic_no_effects(source, "test.rss");
         assert!(result.is_ok());
     }
+    
+    //=========================================================================
+    // ENUM CONSTRUCTOR BUG FIX TESTS (NEW)
+    //=========================================================================
+    
+    /// REGRESSION TEST: Array of enum constructors MUST NOT trigger RSPL-071
+    /// This was the original bug report.
+    #[test]
+    fn test_array_enum_constructors_no_reassignment_error() {
+        let source = r#"
+fn main() {
+    txs = [
+        Tx::Deposit { id = 7, amount = 100 },
+        Tx::Withdraw { id = 7, amount = 50 }
+    ]
+}
+"#;
+        let result = check_logic_no_effects(source, "test.rss");
+        // MUST NOT have any errors
+        assert!(result.is_ok(), 
+            "Array of enum constructors should NOT trigger RSPL-071. Got errors: {:?}", 
+            result.unwrap_err());
+    }
+    
+    /// REGRESSION TEST: Enum constructors with tuple syntax
+    #[test]
+    fn test_array_enum_tuple_constructors() {
+        let source = r#"
+fn main() {
+    options = [
+        Some(1),
+        Some(2),
+        None
+    ]
+}
+"#;
+        let result = check_logic_no_effects(source, "test.rss");
+        assert!(result.is_ok(), 
+            "Array of enum tuple constructors should NOT trigger errors. Got: {:?}",
+            result.unwrap_err());
+    }
+    
+    /// Test that actual variable reassignment still triggers RSPL-071
+    #[test]
+    fn test_actual_reassignment_still_errors() {
+        let source = r#"
+fn main() {
+    x = 10
+    x = 20
+}
+"#;
+        let result = check_logic_no_effects(source, "test.rss");
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors[0].code, ErrorCode::RSPL071);
+    }
+    
+    /// Test that `x = Tx::Variant { ... }` correctly identifies x as the variable
+    #[test]
+    fn test_assignment_to_variable_with_enum_value() {
+        let source = r#"
+fn main() {
+    x = Tx::Deposit { id = 7, amount = 100 }
+    x = Tx::Withdraw { id = 7, amount = 50 }
+}
+"#;
+        let result = check_logic_no_effects(source, "test.rss");
+        // This SHOULD error because x is being reassigned without mut
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors[0].code, ErrorCode::RSPL071);
+    }
+    
+    /// Test that `mut x` allows reassignment with enum values
+    #[test]
+    fn test_mut_assignment_with_enum_value() {
+        let source = r#"
+fn main() {
+    mut x = Tx::Deposit { id = 7, amount = 100 }
+    x = Tx::Withdraw { id = 7, amount = 50 }
+}
+"#;
+        let result = check_logic_no_effects(source, "test.rss");
+        assert!(result.is_ok());
+    }
+    
+    /// Test enum constructor detection function
+    #[test]
+    fn test_is_enum_constructor() {
+        // Should be enum constructors
+        assert!(is_enum_constructor("Tx::Deposit { id = 7 }"));
+        assert!(is_enum_constructor("Tx::Withdraw { amount = 50 }"));
+        assert!(is_enum_constructor("Option::Some(value)"));
+        assert!(is_enum_constructor("Result::Ok(x)"));
+        
+        // Should NOT be enum constructors
+        assert!(!is_enum_constructor("x = 10"));
+        assert!(!is_enum_constructor("std::io::stdin()"));  // lowercase module
+        assert!(!is_enum_constructor("let x = 10"));
+    }
+    
+    /// Test pure enum constructor expression detection
+    #[test]
+    fn test_is_pure_enum_constructor_expr() {
+        // Pure enum constructors (start with Type::Variant)
+        assert!(is_pure_enum_constructor_expr("Tx::Deposit { id = 7 }"));
+        assert!(is_pure_enum_constructor_expr("Tx::Deposit { id = 7 },"));
+        assert!(is_pure_enum_constructor_expr("Option::Some(1)"));
+        
+        // NOT pure (has variable assignment on left)
+        assert!(!is_pure_enum_constructor_expr("x = Tx::Deposit { id = 7 }"));
+        assert!(!is_pure_enum_constructor_expr("mut x = Option::Some(1)"));
+    }
+    
+    /// Test extract_assignment_target with enum constructors
+    #[test]
+    fn test_extract_assignment_target() {
+        // Should return variable name
+        assert_eq!(extract_assignment_target("x = 10"), "x");
+        assert_eq!(extract_assignment_target("mut y = 20"), "y");
+        assert_eq!(extract_assignment_target("count = count + 1"), "count");
+        assert_eq!(extract_assignment_target("x = Tx::Deposit { id = 7 }"), "x");
+        
+        // Should return empty (NOT assignments)
+        assert_eq!(extract_assignment_target("Tx::Deposit { id = 7 }"), "");
+        assert_eq!(extract_assignment_target("Tx::Withdraw { amount = 50 }"), "");
+        assert_eq!(extract_assignment_target("if x == 10 {"), "");
+        assert_eq!(extract_assignment_target("while i <= n {"), "");
+    }
+    
+    /// Test nested array with multiple enum variants
+    #[test]
+    fn test_nested_enum_array() {
+        let source = r#"
+fn main() {
+    events = [
+        Event::Click { x = 10, y = 20 },
+        Event::KeyPress { key = 'a' },
+        Event::Scroll { delta = 5 },
+        Event::Click { x = 30, y = 40 }
+    ]
+}
+"#;
+        let result = check_logic_no_effects(source, "test.rss");
+        assert!(result.is_ok(), 
+            "Nested enum array should compile without RSPL-071. Got: {:?}",
+            result.unwrap_err());
+    }
+    
+    //=========================================================================
+    // Effect System Tests
+    //=========================================================================
     
     #[test]
     fn test_effect_parse() {
