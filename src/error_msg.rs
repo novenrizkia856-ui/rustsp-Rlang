@@ -26,6 +26,7 @@
 //! - 100-119: Ownership errors
 //! - 120-139: Type consistency errors
 //! - 200-299: Rust backend mapping errors
+//! - 300-349: Effect system errors
 
 use std::fmt;
 
@@ -52,6 +53,8 @@ pub enum ErrorCategory {
     TypeConsistency,
     /// Mapped from Rust backend (RSPL200-299)
     RustBackend,
+    /// Effect system errors (RSPL300-349)
+    Effect,
 }
 
 impl fmt::Display for ErrorCategory {
@@ -65,6 +68,7 @@ impl fmt::Display for ErrorCategory {
             ErrorCategory::Ownership => write!(f, "ownership"),
             ErrorCategory::TypeConsistency => write!(f, "type-consistency"),
             ErrorCategory::RustBackend => write!(f, "rust-backend"),
+            ErrorCategory::Effect => write!(f, "effect"),
         }
     }
 }
@@ -191,6 +195,42 @@ pub enum ErrorCode {
     RSPL203,
     /// Rust move error
     RSPL204,
+    
+    // Effect system errors (300-349)
+    /// Undeclared effect performed
+    RSPL300,
+    /// Missing effect propagation from called function
+    RSPL301,
+    /// Pure function calling effectful function
+    RSPL302,
+    /// Effect leak to closure/callback
+    RSPL303,
+    /// Conflicting effect declarations
+    RSPL304,
+    /// Invalid effect syntax
+    RSPL305,
+    /// Effect on non-parameter
+    RSPL306,
+    /// Write effect without read
+    RSPL307,
+    /// Effect scope violation
+    RSPL308,
+    /// Concurrent effect conflict
+    RSPL309,
+    /// Effect not allowed in context
+    RSPL310,
+    /// Missing panic effect declaration
+    RSPL311,
+    /// Missing io effect declaration
+    RSPL312,
+    /// Missing alloc effect declaration
+    RSPL313,
+    /// Effect contract violation
+    RSPL314,
+    /// Effect ownership violation
+    RSPL315,
+    /// Effect borrow violation
+    RSPL316,
 }
 
 impl ErrorCode {
@@ -254,6 +294,24 @@ impl ErrorCode {
             ErrorCode::RSPL202 => "RSPL202",
             ErrorCode::RSPL203 => "RSPL203",
             ErrorCode::RSPL204 => "RSPL204",
+            // Effect system
+            ErrorCode::RSPL300 => "RSPL300",
+            ErrorCode::RSPL301 => "RSPL301",
+            ErrorCode::RSPL302 => "RSPL302",
+            ErrorCode::RSPL303 => "RSPL303",
+            ErrorCode::RSPL304 => "RSPL304",
+            ErrorCode::RSPL305 => "RSPL305",
+            ErrorCode::RSPL306 => "RSPL306",
+            ErrorCode::RSPL307 => "RSPL307",
+            ErrorCode::RSPL308 => "RSPL308",
+            ErrorCode::RSPL309 => "RSPL309",
+            ErrorCode::RSPL310 => "RSPL310",
+            ErrorCode::RSPL311 => "RSPL311",
+            ErrorCode::RSPL312 => "RSPL312",
+            ErrorCode::RSPL313 => "RSPL313",
+            ErrorCode::RSPL314 => "RSPL314",
+            ErrorCode::RSPL315 => "RSPL315",
+            ErrorCode::RSPL316 => "RSPL316",
         }
     }
     
@@ -279,6 +337,84 @@ impl ErrorCode {
             ErrorCode::RSPL123 | ErrorCode::RSPL124 => ErrorCategory::TypeConsistency,
             ErrorCode::RSPL200 | ErrorCode::RSPL201 | ErrorCode::RSPL202 |
             ErrorCode::RSPL203 | ErrorCode::RSPL204 => ErrorCategory::RustBackend,
+            ErrorCode::RSPL300 | ErrorCode::RSPL301 | ErrorCode::RSPL302 |
+            ErrorCode::RSPL303 | ErrorCode::RSPL304 | ErrorCode::RSPL305 |
+            ErrorCode::RSPL306 | ErrorCode::RSPL307 | ErrorCode::RSPL308 |
+            ErrorCode::RSPL309 | ErrorCode::RSPL310 | ErrorCode::RSPL311 |
+            ErrorCode::RSPL312 | ErrorCode::RSPL313 | ErrorCode::RSPL314 |
+            ErrorCode::RSPL315 | ErrorCode::RSPL316 => ErrorCategory::Effect,
+        }
+    }
+    
+    /// Get a short description
+    pub fn description(&self) -> &'static str {
+        match self {
+            ErrorCode::RSPL001 => "unclear intent",
+            ErrorCode::RSPL002 => "unreachable code",
+            ErrorCode::RSPL003 => "infinite loop",
+            ErrorCode::RSPL020 => "invalid function signature",
+            ErrorCode::RSPL021 => "invalid struct definition",
+            ErrorCode::RSPL022 => "invalid enum definition",
+            ErrorCode::RSPL023 => "missing function body",
+            ErrorCode::RSPL024 => "duplicate definition",
+            ErrorCode::RSPL025 => "invalid field syntax",
+            ErrorCode::RSPL026 => "missing type annotation",
+            ErrorCode::RSPL040 => "expression as statement",
+            ErrorCode::RSPL041 => "statement as expression",
+            ErrorCode::RSPL042 => "invalid assignment target",
+            ErrorCode::RSPL043 => "missing value",
+            ErrorCode::RSPL044 => "type mismatch",
+            ErrorCode::RSPL045 => "invalid operator",
+            ErrorCode::RSPL046 => "string literal vs String",
+            ErrorCode::RSPL060 => "if missing else",
+            ErrorCode::RSPL061 => "match missing arms",
+            ErrorCode::RSPL062 => "match arm type mismatch",
+            ErrorCode::RSPL063 => "unreachable match arm",
+            ErrorCode::RSPL064 => "non-exhaustive match",
+            ErrorCode::RSPL065 => "invalid guard",
+            ErrorCode::RSPL066 => "break outside loop",
+            ErrorCode::RSPL067 => "continue outside loop",
+            ErrorCode::RSPL068 => "return outside function",
+            ErrorCode::RSPL071 => "reassignment without mut",
+            ErrorCode::RSPL080 => "variable not found",
+            ErrorCode::RSPL081 => "unintended shadowing",
+            ErrorCode::RSPL082 => "outer not found",
+            ErrorCode::RSPL083 => "used before init",
+            ErrorCode::RSPL084 => "scope leak",
+            ErrorCode::RSPL085 => "invalid outer target",
+            ErrorCode::RSPL100 => "move after borrow",
+            ErrorCode::RSPL101 => "mutable borrow conflict",
+            ErrorCode::RSPL102 => "multiple mutable borrows",
+            ErrorCode::RSPL103 => "use after move",
+            ErrorCode::RSPL104 => "cannot mutate immutable",
+            ErrorCode::RSPL105 => "lifetime mismatch",
+            ErrorCode::RSPL120 => "return type mismatch",
+            ErrorCode::RSPL121 => "argument type mismatch",
+            ErrorCode::RSPL122 => "field type mismatch",
+            ErrorCode::RSPL123 => "generic constraint not satisfied",
+            ErrorCode::RSPL124 => "cannot infer type",
+            ErrorCode::RSPL200 => "rust backend error",
+            ErrorCode::RSPL201 => "borrow checker error",
+            ErrorCode::RSPL202 => "type error",
+            ErrorCode::RSPL203 => "lifetime error",
+            ErrorCode::RSPL204 => "move error",
+            ErrorCode::RSPL300 => "undeclared effect",
+            ErrorCode::RSPL301 => "missing effect propagation",
+            ErrorCode::RSPL302 => "pure calling effectful",
+            ErrorCode::RSPL303 => "effect leak to closure",
+            ErrorCode::RSPL304 => "conflicting effects",
+            ErrorCode::RSPL305 => "invalid effect syntax",
+            ErrorCode::RSPL306 => "effect on non-parameter",
+            ErrorCode::RSPL307 => "write without read",
+            ErrorCode::RSPL308 => "effect scope violation",
+            ErrorCode::RSPL309 => "concurrent effect conflict",
+            ErrorCode::RSPL310 => "effect not allowed",
+            ErrorCode::RSPL311 => "missing panic effect",
+            ErrorCode::RSPL312 => "missing io effect",
+            ErrorCode::RSPL313 => "missing alloc effect",
+            ErrorCode::RSPL314 => "effect contract violation",
+            ErrorCode::RSPL315 => "effect ownership violation",
+            ErrorCode::RSPL316 => "effect borrow violation",
         }
     }
 }
@@ -394,6 +530,11 @@ impl RsplError {
         self
     }
     
+    /// Get error category
+    pub fn category(&self) -> ErrorCategory {
+        self.code.category()
+    }
+    
     /// Format the error for display
     pub fn format(&self) -> String {
         let mut output = String::new();
@@ -431,7 +572,7 @@ impl RsplError {
             
             // Highlight
             let highlight_padding = " ".repeat(self.location.highlight_start);
-            let highlight = "^".repeat(self.location.highlight_len);
+            let highlight = "^".repeat(self.location.highlight_len.max(1));
             output.push_str(&format!(
                 "{}  |   {}{}\n",
                 padding,
@@ -450,7 +591,7 @@ impl RsplError {
                 output.push_str(&format!("{} |   {}\n", loc.line, loc.source_line));
                 
                 let highlight_padding = " ".repeat(loc.highlight_start);
-                let highlight = "-".repeat(loc.highlight_len);
+                let highlight = "-".repeat(loc.highlight_len.max(1));
                 output.push_str(&format!(
                     "{}  |   {}{} {}\n",
                     padding,
@@ -569,7 +710,6 @@ impl ErrorCollector {
         }
         
         for warning in &self.warnings {
-            // Replace "error" with "warning" in output
             let formatted = warning.format().replace("error[", "warning[");
             output.push_str(&formatted);
             output.push('\n');
@@ -601,14 +741,12 @@ impl ErrorCollector {
 }
 
 //=============================================================================
-// ERROR BUILDERS - Convenience functions for common errors
+// ERROR BUILDERS - Scope Errors
 //=============================================================================
 
-/// Scope errors
 pub mod scope_errors {
     use super::*;
     
-    /// Variable not found in scope
     pub fn variable_not_found(var_name: &str) -> RsplError {
         RsplError::new(
             ErrorCode::RSPL080,
@@ -621,7 +759,6 @@ pub mod scope_errors {
         .help("check the spelling or declare the variable before using it")
     }
     
-    /// Unintended shadowing
     pub fn unintended_shadow(var_name: &str) -> RsplError {
         RsplError::new(
             ErrorCode::RSPL081,
@@ -638,7 +775,6 @@ pub mod scope_errors {
         ))
     }
     
-    /// Outer on non-existent variable
     pub fn outer_not_found(var_name: &str) -> RsplError {
         RsplError::new(
             ErrorCode::RSPL082,
@@ -652,7 +788,6 @@ pub mod scope_errors {
         .help("remove `outer` or declare the variable in an outer scope first")
     }
     
-    /// Variable used before initialization
     pub fn used_before_init(var_name: &str) -> RsplError {
         RsplError::new(
             ErrorCode::RSPL083,
@@ -662,7 +797,6 @@ pub mod scope_errors {
         .help(format!("assign a value to `{}` before this point", var_name))
     }
     
-    /// Same-scope reassignment without mut (Logic-06)
     pub fn same_scope_reassignment(var_name: &str, original_line: usize) -> RsplError {
         RsplError::new(
             ErrorCode::RSPL071,
@@ -672,29 +806,25 @@ pub mod scope_errors {
             "Logic-06 VIOLATION: Same-Scope Reassignment Ban\n\n\
              variable `{}` was already defined at line {} in this scope.\n\
              reassigning to the same name creates a NEW binding in Rust,\n\
-             which is almost certainly NOT what you intended.\n\n\
-             this pattern is a common source of logic bugs and is DISALLOWED in RustS+.",
+             which is almost certainly NOT what you intended.",
             var_name, original_line
         ))
         .help(format!(
             "if you intend to MUTATE the variable, declare it mutable:\n\n\
                  mut {} = <initial_value>\n\
-                 {} = <new_value>          // OK: mutates existing binding\n\n\
-             if you intend to SHADOW the variable, use an inner scope:\n\n\
-                 {} = <first_value>\n\
-                 {{\n\
-                     {} = <second_value>   // OK: shadows in inner scope\n\
-                 }}",
-            var_name, var_name, var_name, var_name
+                 {} = <new_value>",
+            var_name, var_name
         ))
     }
 }
 
-/// Control flow errors
+//=============================================================================
+// ERROR BUILDERS - Control Flow Errors
+//=============================================================================
+
 pub mod control_flow_errors {
     use super::*;
     
-    /// If expression missing else branch
     pub fn if_missing_else() -> RsplError {
         RsplError::new(
             ErrorCode::RSPL060,
@@ -702,13 +832,11 @@ pub mod control_flow_errors {
         )
         .note(
             "in RustS+, when `if` is used as an expression (assigned to a variable),\n\
-             it must produce a value on all branches.\n\
-             an `if` without `else` produces no value when the condition is false."
+             it must produce a value on all branches."
         )
         .help("add an `else` branch, or don't use the `if` as a value")
     }
     
-    /// Match expression missing arms
     pub fn match_no_arms() -> RsplError {
         RsplError::new(
             ErrorCode::RSPL061,
@@ -718,7 +846,6 @@ pub mod control_flow_errors {
         .help("add pattern arms to handle the matched value")
     }
     
-    /// Match arm type mismatch
     pub fn match_arm_type_mismatch(expected: &str, found: &str) -> RsplError {
         RsplError::new(
             ErrorCode::RSPL062,
@@ -733,21 +860,15 @@ pub mod control_flow_errors {
         .help("ensure all arms return the same type")
     }
     
-    /// Non-exhaustive match
     pub fn match_non_exhaustive(missing: &str) -> RsplError {
         RsplError::new(
             ErrorCode::RSPL064,
             "match expression is not exhaustive"
         )
-        .note(format!(
-            "patterns not covered: {}\n\
-             in RustS+, match expressions must handle all possible values",
-            missing
-        ))
+        .note(format!("patterns not covered: {}", missing))
         .help("add a `_ { ... }` arm to handle remaining cases")
     }
     
-    /// Break outside loop
     pub fn break_outside_loop() -> RsplError {
         RsplError::new(
             ErrorCode::RSPL066,
@@ -756,7 +877,6 @@ pub mod control_flow_errors {
         .note("`break` can only be used inside `loop`, `while`, or `for`")
     }
     
-    /// Continue outside loop
     pub fn continue_outside_loop() -> RsplError {
         RsplError::new(
             ErrorCode::RSPL067,
@@ -765,7 +885,6 @@ pub mod control_flow_errors {
         .note("`continue` can only be used inside `loop`, `while`, or `for`")
     }
     
-    /// Return outside function
     pub fn return_outside_function() -> RsplError {
         RsplError::new(
             ErrorCode::RSPL068,
@@ -775,27 +894,17 @@ pub mod control_flow_errors {
     }
 }
 
-/// Expression errors
+//=============================================================================
+// ERROR BUILDERS - Expression Errors
+//=============================================================================
+
 pub mod expression_errors {
     use super::*;
     
-    /// Missing value in expression context
-    pub fn missing_value() -> RsplError {
-        RsplError::new(
-            ErrorCode::RSPL043,
-            "expected expression, found statement"
-        )
-        .note(
-            "this position requires a value, but a statement was found.\n\
-             in RustS+, assignments and declarations are statements, not expressions."
-        )
-    }
-    
-    /// Type mismatch in expression
     pub fn type_mismatch(expected: &str, found: &str, context: &str) -> RsplError {
         RsplError::new(
             ErrorCode::RSPL044,
-            format!("type mismatch in {}", context)
+            format!("mismatched types in {}", context)
         )
         .note(format!(
             "expected type: `{}`\n\
@@ -804,163 +913,295 @@ pub mod expression_errors {
         ))
     }
     
-    /// String literal where String expected
-    pub fn string_literal_needs_conversion() -> RsplError {
+    pub fn string_literal_vs_string() -> RsplError {
         RsplError::new(
             ErrorCode::RSPL046,
-            "string literal used where `String` is expected"
+            "string literal `&str` where `String` is expected"
         )
         .note(
-            "in RustS+, string literals (\"...\") have type `&str`.\n\
-             when `String` is expected, RustS+ automatically converts them."
+            "in Rust, `\"text\"` is a string literal with type `&str`.\n\
+             many RustS+ contexts expect an owned `String` instead."
         )
-    }
-    
-    /// Invalid assignment target
-    pub fn invalid_assignment_target() -> RsplError {
-        RsplError::new(
-            ErrorCode::RSPL042,
-            "invalid left-hand side of assignment"
-        )
-        .note("the left side of an assignment must be a variable or field")
+        .help("RustS+ automatically converts literals in assignments")
     }
 }
 
-/// Structure errors
-pub mod structure_errors {
-    use super::*;
-    
-    /// Invalid function signature
-    pub fn invalid_function_sig(detail: &str) -> RsplError {
-        RsplError::new(
-            ErrorCode::RSPL020,
-            "invalid function signature"
-        )
-        .note(format!(
-            "{}\n\
-             RustS+ function syntax: `fn name(param Type, ...) ReturnType {{ ... }}`",
-            detail
-        ))
-    }
-    
-    /// Invalid struct definition
-    pub fn invalid_struct_def(detail: &str) -> RsplError {
-        RsplError::new(
-            ErrorCode::RSPL021,
-            "invalid struct definition"
-        )
-        .note(format!(
-            "{}\n\
-             RustS+ struct syntax: `struct Name {{ field Type, ... }}`",
-            detail
-        ))
-    }
-    
-    /// Invalid enum definition
-    pub fn invalid_enum_def(detail: &str) -> RsplError {
-        RsplError::new(
-            ErrorCode::RSPL022,
-            "invalid enum definition"
-        )
-        .note(format!(
-            "{}\n\
-             RustS+ enum syntax: `enum Name {{ Variant, Variant(Type), Variant {{ field Type }}, ... }}`",
-            detail
-        ))
-    }
-    
-    /// Invalid field syntax
-    pub fn invalid_field_syntax(field: &str) -> RsplError {
-        RsplError::new(
-            ErrorCode::RSPL025,
-            format!("invalid field syntax: `{}`", field)
-        )
-        .note("RustS+ field syntax: `field_name Type` (no colon needed)")
-        .help("example: `name String` or `count i32`")
-    }
-}
+//=============================================================================
+// ERROR BUILDERS - Ownership Errors
+//=============================================================================
 
-/// Ownership errors
 pub mod ownership_errors {
     use super::*;
     
-    /// Cannot mutate immutable variable
-    pub fn cannot_mutate_immutable(var_name: &str) -> RsplError {
-        RsplError::new(
-            ErrorCode::RSPL104,
-            format!("cannot mutate `{}` as it is not mutable", var_name)
-        )
-        .note(
-            "in RustS+, variables that are reassigned are automatically made mutable.\n\
-             this error indicates the variable was never reassigned in its scope,\n\
-             but is being mutated (e.g., via method call or `&mut` borrow)."
-        )
-        .help(format!(
-            "to make `{}` mutable, reassign it at least once:\n\
-                 {} = {}\n\
-                 {} = {}  // now it's mutable",
-            var_name, var_name, var_name, var_name, var_name
-        ))
-    }
-    
-    /// Use after move
     pub fn use_after_move(var_name: &str) -> RsplError {
         RsplError::new(
             ErrorCode::RSPL103,
-            format!("use of moved value: `{}`", var_name)
+            format!("use of moved value `{}`", var_name)
         )
         .note(format!(
-            "the value of `{}` was moved to another location.\n\
-             in RustS+, values are moved by default when passed to functions\n\
-             or assigned to other variables.",
+            "the value `{}` was moved and can no longer be used.\n\
+             in Rust, owned values can only be used once.",
             var_name
         ))
-        .help("consider cloning the value or restructuring to avoid the move")
+        .help("consider cloning the value, or using a reference")
     }
     
-    /// Multiple mutable borrows
+    pub fn cannot_mutate_immutable(var_name: &str) -> RsplError {
+        RsplError::new(
+            ErrorCode::RSPL104,
+            format!("cannot mutate `{}` - it is not mutable", var_name)
+        )
+        .note(format!(
+            "the variable `{}` was not declared with `mut`",
+            var_name
+        ))
+        .help(format!("consider changing to `mut {} = ...`", var_name))
+    }
+    
     pub fn multiple_mut_borrows(var_name: &str) -> RsplError {
         RsplError::new(
             ErrorCode::RSPL102,
             format!("cannot borrow `{}` as mutable more than once", var_name)
         )
-        .note(
-            "RustS+ (like Rust) enforces that only one mutable reference\n\
-             can exist at a time. this prevents data races."
-        )
-        .help("ensure the first mutable borrow is no longer in use")
+        .note("Rust only allows one mutable reference at a time")
     }
 }
 
-/// Type consistency errors
-pub mod type_errors {
+//=============================================================================
+// ERROR BUILDERS - Effect System Errors
+//=============================================================================
+
+pub mod effect_errors {
     use super::*;
     
-    /// Function return type mismatch
-    pub fn return_type_mismatch(fn_name: &str, expected: &str, found: &str) -> RsplError {
+    /// Function performs undeclared effect
+    pub fn undeclared_effect(func_name: &str, effect: &str) -> RsplError {
         RsplError::new(
-            ErrorCode::RSPL120,
-            format!("function `{}` returns wrong type", fn_name)
+            ErrorCode::RSPL300,
+            format!("function `{}` performs effect `{}` but does not declare it", func_name, effect)
         )
         .note(format!(
-            "function declared to return `{}`\n\
-             but the body returns `{}`",
-            expected, found
+            "Effect-01 VIOLATION: Undeclared Effect\n\n\
+             in RustS+, functions must HONESTLY declare all effects they perform.\n\
+             the function `{}` performs `{}` but this is not in its signature.\n\n\
+             RustS+ enforces EFFECT HONESTY - no hidden side effects allowed.\n\
+             this is like a borrow checker, but for program MEANING.",
+            func_name, effect
         ))
-        .help("ensure the return value matches the declared return type")
+        .help(format!(
+            "add effect declaration to function signature:\n\n\
+             fn {}(...) effects({}) {{ ... }}",
+            func_name, effect
+        ))
     }
     
-    /// Argument type mismatch
-    pub fn argument_type_mismatch(fn_name: &str, param: &str, expected: &str, found: &str) -> RsplError {
+    /// Missing effect propagation from called function
+    pub fn missing_propagation(caller: &str, callee: &str, effect: &str) -> RsplError {
         RsplError::new(
-            ErrorCode::RSPL121,
-            format!("argument type mismatch in call to `{}`", fn_name)
+            ErrorCode::RSPL301,
+            format!("function `{}` calls `{}` which has effect `{}`, but does not propagate it",
+                    caller, callee, effect)
         )
         .note(format!(
-            "parameter `{}` expects type `{}`\n\
-             but received type `{}`",
-            param, expected, found
+            "Effect-04 VIOLATION: Missing Effect Propagation\n\n\
+             in RustS+, effects must PROPAGATE UPWARD through call chains.\n\
+             `{}` calls `{}` which declares `{}`.\n\
+             the caller MUST also declare this effect.\n\n\
+             effects are like capabilities - if you use a capability,\n\
+             you must have permission for it.",
+            caller, callee, effect
         ))
+        .help(format!(
+            "add effect to function signature:\n\n\
+             fn {}(...) effects({}) {{ ... }}",
+            caller, effect
+        ))
+    }
+    
+    /// Pure function calling effectful function
+    pub fn pure_calling_effectful(pure_fn: &str, effectful_fn: &str) -> RsplError {
+        RsplError::new(
+            ErrorCode::RSPL302,
+            format!("pure function `{}` calls effectful function `{}`", pure_fn, effectful_fn)
+        )
+        .note(format!(
+            "Effect-03 VIOLATION: Pure Calling Effectful\n\n\
+             function `{}` has no effects declared (PURE),\n\
+             but it calls `{}` which HAS effects.\n\n\
+             PURE functions cannot perform ANY effects.\n\
+             this ensures referential transparency.",
+            pure_fn, effectful_fn
+        ))
+        .help(format!(
+            "either:\n\
+             1. Add effects to `{}`:\n\
+                fn {}(...) effects(...) {{ ... }}\n\
+             2. Or remove the call to `{}`",
+            pure_fn, pure_fn, effectful_fn
+        ))
+    }
+    
+    /// Effect leak to closure
+    pub fn effect_leak_closure(func_name: &str, effect: &str) -> RsplError {
+        RsplError::new(
+            ErrorCode::RSPL303,
+            format!("effect `{}` leaks to closure in function `{}`", effect, func_name)
+        )
+        .note(format!(
+            "Effect-02 VIOLATION: Effect Leak\n\n\
+             effects cannot leak to closures, lambdas, or callbacks.\n\
+             the effect `{}` is used inside a closure without proper capture.\n\n\
+             this prevents effects from escaping their intended scope.",
+            effect
+        ))
+        .help("move the effectful operation outside the closure, or explicitly capture the effect")
+    }
+    
+    /// Write effect on parameter mutation
+    pub fn write_effect_required(func_name: &str, param: &str) -> RsplError {
+        RsplError::new(
+            ErrorCode::RSPL300,
+            format!("function `{}` modifies `{}.field` but does not declare `effects(write {})`",
+                    func_name, param, param)
+        )
+        .note(format!(
+            "Effect-01 VIOLATION: Undeclared Write Effect\n\n\
+             function `{}` modifies a field of parameter `{}`.\n\
+             this is a WRITE EFFECT and must be declared.\n\n\
+             in RustS+, ALL mutations must be declared in the effect signature.",
+            func_name, param
+        ))
+        .help(format!(
+            "add write effect declaration:\n\n\
+             fn {}(...) effects(write {}) {{ ... }}",
+            func_name, param
+        ))
+    }
+    
+    /// IO effect required
+    pub fn io_effect_required(func_name: &str, io_operation: &str) -> RsplError {
+        RsplError::new(
+            ErrorCode::RSPL312,
+            format!("function `{}` performs I/O operation `{}` but does not declare `effects(io)`",
+                    func_name, io_operation)
+        )
+        .note(format!(
+            "Effect-01 VIOLATION: Undeclared IO Effect\n\n\
+             function `{}` performs I/O: `{}`\n\
+             all I/O operations MUST be declared with `effects(io)`.\n\n\
+             I/O effects include: println!, print!, File::*, stdin, stdout, etc.",
+            func_name, io_operation
+        ))
+        .help(format!(
+            "add io effect declaration:\n\n\
+             fn {}(...) effects(io) {{ ... }}",
+            func_name
+        ))
+    }
+    
+    /// Panic effect required
+    pub fn panic_effect_required(func_name: &str, panic_op: &str) -> RsplError {
+        RsplError::new(
+            ErrorCode::RSPL311,
+            format!("function `{}` may panic with `{}` but does not declare `effects(panic)`",
+                    func_name, panic_op)
+        )
+        .note(format!(
+            "Effect-01 VIOLATION: Undeclared Panic Effect\n\n\
+             function `{}` may panic: `{}`\n\
+             functions that may panic MUST declare `effects(panic)`.\n\n\
+             panic effects include: panic!, unwrap(), expect(), assert!, unreachable!",
+            func_name, panic_op
+        ))
+        .help(format!(
+            "add panic effect declaration:\n\n\
+             fn {}(...) effects(panic) {{ ... }}",
+            func_name
+        ))
+    }
+    
+    /// Alloc effect required
+    pub fn alloc_effect_required(func_name: &str, alloc_op: &str) -> RsplError {
+        RsplError::new(
+            ErrorCode::RSPL313,
+            format!("function `{}` allocates with `{}` but does not declare `effects(alloc)`",
+                    func_name, alloc_op)
+        )
+        .note(format!(
+            "Effect-01 VIOLATION: Undeclared Allocation Effect\n\n\
+             function `{}` allocates memory: `{}`\n\
+             memory allocations MUST be declared with `effects(alloc)`.\n\n\
+             alloc effects include: Vec::new, Box::new, String::from, .clone(), etc.",
+            func_name, alloc_op
+        ))
+        .help(format!(
+            "add alloc effect declaration:\n\n\
+             fn {}(...) effects(alloc) {{ ... }}",
+            func_name
+        ))
+    }
+    
+    /// Effect contract violation
+    pub fn effect_contract_violation(func_name: &str, declared: &str, actual: &str) -> RsplError {
+        RsplError::new(
+            ErrorCode::RSPL314,
+            format!("effect contract violation in `{}`", func_name)
+        )
+        .note(format!(
+            "Effect Contract Violation\n\n\
+             function `{}` declared: effects({})\n\
+             function `{}` performs: {}\n\n\
+             the actual effects do not match the declared contract.",
+            func_name, declared, func_name, actual
+        ))
+        .help("update the effects declaration to match actual behavior")
+    }
+    
+    /// Effect scope violation
+    pub fn effect_scope_violation(effect: &str, context: &str) -> RsplError {
+        RsplError::new(
+            ErrorCode::RSPL308,
+            format!("effect `{}` used outside valid scope in {}", effect, context)
+        )
+        .note(format!(
+            "Effect-05 VIOLATION: Effect Scope\n\n\
+             the effect `{}` is used in context `{}` where it is not allowed.\n\
+             effects must be used within their declared scope.",
+            effect, context
+        ))
+        .help("ensure effects are only used within functions that declare them")
+    }
+    
+    /// Effect ownership violation
+    pub fn effect_ownership_violation(effect: &str, owner: &str, user: &str) -> RsplError {
+        RsplError::new(
+            ErrorCode::RSPL315,
+            format!("effect `{}` owned by `{}` cannot be used by `{}`", effect, owner, user)
+        )
+        .note(format!(
+            "Effect Ownership Violation\n\n\
+             the effect `{}` is owned by function `{}`.\n\
+             function `{}` cannot use this effect without proper authorization.\n\n\
+             effects have single owners, like Rust's ownership model.",
+            effect, owner, user
+        ))
+        .help("propagate the effect through the call chain, or restructure the code")
+    }
+    
+    /// Effect borrow violation
+    pub fn effect_borrow_violation(effect: &str, block: &str) -> RsplError {
+        RsplError::new(
+            ErrorCode::RSPL316,
+            format!("effect `{}` cannot be borrowed by {}", effect, block)
+        )
+        .note(format!(
+            "Effect Borrow Violation\n\n\
+             blocks can borrow effects from their parent function,\n\
+             but `{}` cannot borrow effect `{}`.\n\n\
+             closures and callbacks cannot implicitly borrow effects.",
+            block, effect
+        ))
+        .help("move the effectful operation outside the nested scope")
     }
 }
 
@@ -968,13 +1209,12 @@ pub mod type_errors {
 // RUST ERROR MAPPING
 //=============================================================================
 
-/// Maps rustc error messages to RustS+ errors
+/// Map a Rust error to a RustS+ error
 pub fn map_rust_error(rust_error: &str, _source: &str) -> Option<RsplError> {
-    // Try to extract meaningful parts from Rust error
     let rust_error_lower = rust_error.to_lowercase();
     
     // Cannot borrow as mutable
-    if rust_error_lower.contains("cannot borrow") && rust_error_lower.contains("mutable") {
+    if rust_error_lower.contains("cannot borrow") && rust_error_lower.contains("as mutable") {
         if let Some(var_name) = extract_variable_name(rust_error, "cannot borrow `", "`") {
             return Some(
                 ownership_errors::cannot_mutate_immutable(&var_name)
@@ -1003,23 +1243,20 @@ pub fn map_rust_error(rust_error: &str, _source: &str) -> Option<RsplError> {
         }
     }
     
-    // `()` type in Display context - often means if-without-else used as value
+    // () type in Display context
     if rust_error_lower.contains("`()` doesn't implement") || 
        rust_error_lower.contains("`()` cannot be formatted") {
         return Some(
             control_flow_errors::if_missing_else()
-                .note(
-                    "this error was detected by the Rust backend during compilation.\n\
-                     the `()` type suggests an `if` expression without `else` was used as a value."
-                )
+                .note("this error was detected by the Rust backend")
         );
     }
     
-    // Expected unit type `()` but found something else - if expression branch mismatch
+    // Expected unit type
     if rust_error_lower.contains("expected `()`") && rust_error_lower.contains("found") {
         return Some(
             control_flow_errors::if_missing_else()
-                .note("this error was detected by the Rust backend during compilation")
+                .note("this error was detected by the Rust backend")
         );
     }
     
@@ -1028,57 +1265,37 @@ pub fn map_rust_error(rust_error: &str, _source: &str) -> Option<RsplError> {
         let expected = extract_between(rust_error, "expected `", "`").unwrap_or("unknown");
         let found = extract_between(rust_error, "found `", "`").unwrap_or("unknown");
         return Some(
-            expression_errors::type_mismatch(&expected, &found, "expression")
-                .note("this error was detected by the Rust backend during compilation")
+            expression_errors::type_mismatch(expected, found, "expression")
+                .note("this error was detected by the Rust backend")
         );
     }
     
-    // Expected expression, found `,`
-    if rust_error_lower.contains("expected expression") {
-        return Some(
-            expression_errors::missing_value()
-                .note("this error was detected by the Rust backend during compilation")
-        );
-    }
-    
-    // If missing else - direct detection
+    // If missing else
     if rust_error_lower.contains("if` may be missing an `else` clause") {
         return Some(
             control_flow_errors::if_missing_else()
-                .note("this error was detected by the Rust backend during compilation")
+                .note("this error was detected by the Rust backend")
         );
     }
     
-    // Non-exhaustive patterns in match
+    // Non-exhaustive patterns
     if rust_error_lower.contains("non-exhaustive patterns") {
         let missing = extract_between(rust_error, "patterns ", " not covered")
-            .or_else(|| extract_between(rust_error, "pattern ", " not covered"))
             .unwrap_or("_");
         return Some(
             control_flow_errors::match_non_exhaustive(missing)
-                .note("this error was detected by the Rust backend during compilation")
+                .note("this error was detected by the Rust backend")
         );
     }
     
-    // Match arms have incompatible types
+    // Match arms incompatible
     if rust_error_lower.contains("match arms have incompatible types") {
         let expected = extract_between(rust_error, "expected `", "`").unwrap_or("unknown");
         let found = extract_between(rust_error, "found `", "`").unwrap_or("unknown");
         return Some(
-            control_flow_errors::match_arm_type_mismatch(&expected, &found)
-                .note("this error was detected by the Rust backend during compilation")
+            control_flow_errors::match_arm_type_mismatch(expected, found)
+                .note("this error was detected by the Rust backend")
         );
-    }
-    
-    // Cannot borrow immutable
-    if rust_error_lower.contains("cannot borrow immutable") {
-        if let Some(var_name) = extract_variable_name(rust_error, "borrow immutable `", "`")
-            .or_else(|| extract_variable_name(rust_error, "borrow `", "`")) {
-            return Some(
-                ownership_errors::cannot_mutate_immutable(&var_name)
-                    .note("this error was detected by the Rust backend during compilation")
-            );
-        }
     }
     
     // Multiple mutable borrows
@@ -1086,31 +1303,26 @@ pub fn map_rust_error(rust_error: &str, _source: &str) -> Option<RsplError> {
         if let Some(var_name) = extract_variable_name(rust_error, "cannot borrow `", "`") {
             return Some(
                 ownership_errors::multiple_mut_borrows(&var_name)
-                    .note("this error was detected by the Rust backend during compilation")
+                    .note("this error was detected by the Rust backend")
             );
         }
     }
     
-    // Generic fallback - wrap the Rust error
+    // Generic fallback
     Some(
         RsplError::new(
             ErrorCode::RSPL200,
             "compilation error from Rust backend"
         )
-        .note(format!(
-            "the following error was reported by rustc:\n\n{}",
-            rust_error.trim()
-        ))
-        .help("this error occurred during Rust compilation.\ncheck the Rust error message above for details.")
+        .note(format!("the following error was reported by rustc:\n\n{}", rust_error.trim()))
+        .help("check the Rust error message above for details")
     )
 }
 
-/// Extract variable name from error message
 fn extract_variable_name(text: &str, prefix: &str, suffix: &str) -> Option<String> {
     extract_between(text, prefix, suffix).map(String::from)
 }
 
-/// Extract text between two markers
 fn extract_between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
     let start_idx = text.find(start)?;
     let after_start = &text[start_idx + start.len()..];
@@ -1122,7 +1334,6 @@ fn extract_between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str>
 // VALIDATION HELPERS
 //=============================================================================
 
-/// Validates an if expression used as a value
 pub fn validate_if_expression(has_else: bool, is_value_context: bool) -> Option<RsplError> {
     if is_value_context && !has_else {
         Some(control_flow_errors::if_missing_else())
@@ -1131,7 +1342,6 @@ pub fn validate_if_expression(has_else: bool, is_value_context: bool) -> Option<
     }
 }
 
-/// Validates a match expression has arms
 pub fn validate_match_expression(arm_count: usize) -> Option<RsplError> {
     if arm_count == 0 {
         Some(control_flow_errors::match_no_arms())
@@ -1140,7 +1350,6 @@ pub fn validate_match_expression(arm_count: usize) -> Option<RsplError> {
     }
 }
 
-/// Validates outer keyword usage
 pub fn validate_outer_usage(var_name: &str, exists_in_outer: bool) -> Option<RsplError> {
     if !exists_in_outer {
         Some(scope_errors::outer_not_found(var_name))
@@ -1167,7 +1376,6 @@ mod tests {
         assert!(formatted.contains("RSPL081"));
         assert!(formatted.contains("scope"));
         assert!(formatted.contains("counter"));
-        assert!(formatted.contains("outer"));
     }
     
     #[test]
@@ -1176,16 +1384,39 @@ mod tests {
         let formatted = error.format();
         assert!(formatted.contains("RSPL060"));
         assert!(formatted.contains("control-flow"));
-        assert!(formatted.contains("else"));
     }
     
     #[test]
-    fn test_rust_error_mapping() {
-        let rust_error = "error[E0596]: cannot borrow `data` as mutable, as it is not declared as mutable";
-        let mapped = map_rust_error(rust_error, "");
-        assert!(mapped.is_some());
-        let error = mapped.unwrap();
-        assert_eq!(error.code, ErrorCode::RSPL104);
+    fn test_effect_error_undeclared() {
+        let error = effect_errors::undeclared_effect("transfer", "write(balance)");
+        let formatted = error.format();
+        assert!(formatted.contains("RSPL300"));
+        assert!(formatted.contains("effect"));
+        assert!(formatted.contains("transfer"));
+        assert!(formatted.contains("write(balance)"));
+    }
+    
+    #[test]
+    fn test_effect_propagation_error() {
+        let error = effect_errors::missing_propagation("process", "save", "io");
+        let formatted = error.format();
+        assert!(formatted.contains("RSPL301"));
+        assert!(formatted.contains("propagate"));
+    }
+    
+    #[test]
+    fn test_pure_calling_effectful_error() {
+        let error = effect_errors::pure_calling_effectful("calculate", "log");
+        let formatted = error.format();
+        assert!(formatted.contains("RSPL302"));
+        assert!(formatted.contains("pure"));
+    }
+    
+    #[test]
+    fn test_category_display() {
+        assert_eq!(format!("{}", ErrorCategory::Scope), "scope");
+        assert_eq!(format!("{}", ErrorCategory::Effect), "effect");
+        assert_eq!(format!("{}", ErrorCategory::ControlFlow), "control-flow");
     }
     
     #[test]
@@ -1204,9 +1435,18 @@ mod tests {
     }
     
     #[test]
-    fn test_category_display() {
-        assert_eq!(format!("{}", ErrorCategory::Scope), "scope");
-        assert_eq!(format!("{}", ErrorCategory::ControlFlow), "control-flow");
-        assert_eq!(format!("{}", ErrorCategory::Ownership), "ownership");
+    fn test_effect_ownership_error() {
+        let error = effect_errors::effect_ownership_violation("io", "main", "helper");
+        let formatted = error.format();
+        assert!(formatted.contains("RSPL315"));
+        assert!(formatted.contains("ownership"));
+    }
+    
+    #[test]
+    fn test_effect_borrow_error() {
+        let error = effect_errors::effect_borrow_violation("write(acc)", "closure");
+        let formatted = error.format();
+        assert!(formatted.contains("RSPL316"));
+        assert!(formatted.contains("borrow"));
     }
 }

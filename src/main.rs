@@ -1,28 +1,61 @@
 //! RustS+ Compiler - Main Entry Point
 //!
-//! Pipeline kompilasi:
-//! 1. STAGE 1: Anti-Fail Logic Check (SEBELUM lowering)
-//! 2. STAGE 2: Lowering RustS+ → Rust + Sanity Check (L-05)
-//! 3. STAGE 3: Rust Compilation (rustc)
+//! ## Compilation Pipeline
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────────┐
+//! │  STAGE 0: EFFECT & FUNCTION ANALYSIS                                │
+//! │    → Parse all function signatures with effects declarations        │
+//! │    → Build function table with effect contracts                     │
+//! │    → Build effect dependency graph for cross-function checking      │
+//! ├─────────────────────────────────────────────────────────────────────┤
+//! │  STAGE 1: ANTI-FAIL LOGIC CHECK                                     │
+//! │    → Logic-01: Expression completeness (if/match branches)          │
+//! │    → Logic-02: Ambiguous shadowing detection                        │
+//! │    → Logic-03: Illegal statements in expression context             │
+//! │    → Logic-04: Implicit mutation detection                          │
+//! │    → Logic-05: Unclear intent patterns                              │
+//! │    → Logic-06: Same-scope reassignment without mut                  │
+//! │    → Effect-01: Undeclared effect validation                        │
+//! │    → Effect-02: Effect leak detection                               │
+//! │    → Effect-03: Pure calling effectful detection                    │
+//! │    → Effect-04: Cross-function effect propagation                   │
+//! │    → Effect-05: Effect scope validation                             │
+//! │    → Effect-06: Effect ownership validation                         │
+//! │                                                                     │
+//! │    ⚠️  IF ANY VIOLATION → COMPILATION STOPS HERE                    │
+//! │    ⚠️  RUST CODE IS NOT GENERATED                                   │
+//! ├─────────────────────────────────────────────────────────────────────┤
+//! │  STAGE 2: LOWERING (RustS+ → Rust)                                  │
+//! │    → Transform RustS+ syntax to valid Rust                          │
+//! │    → Apply L-01 through L-07 transformations                        │
+//! │    → Strip effects clause from signatures                           │
+//! │    → Sanity check generated Rust                                    │
+//! ├─────────────────────────────────────────────────────────────────────┤
+//! │  STAGE 3: RUST COMPILATION (rustc)                                  │
+//! │    → Compile generated Rust to binary                               │
+//! │    → Map rustc errors back to RustS+ source                         │
+//! └─────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! The key insight of RustS+ is that **dishonest code never reaches Rust**.
+//! If your code has logic errors or undeclared effects, it stops at Stage 1.
 
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio, exit};
 
-// NOTE: Change this import to match your crate name in Cargo.toml
-// If your crate is named "rustsp", use: use rustsp::...
-// If your crate is named "rusts_plus", use: use rusts_plus::...
 use rustsp::parse_rusts;
 use rustsp::error_msg::map_rust_error;
-use rustsp::anti_fail_logic::{check_logic, format_logic_errors, ansi};
+use rustsp::anti_fail_logic::{
+    check_logic, check_logic_no_effects, check_logic_custom,
+    format_logic_errors, ansi, analyze_functions
+};
 use rustsp::rust_sanity::{check_rust_output, format_internal_error};
 
 //=============================================================================
-// L-05: RUST SANITY GATE (Enhanced)
-// Validates generated Rust code before calling rustc
-// Uses the rust_sanity module for comprehensive validation
-// Returns Some(error_message) if invalid, None if OK
+// RUST SANITY CHECK (L-05 Validation)
 //=============================================================================
 
 fn rust_sanity_check(rust_code: &str) -> Option<String> {
@@ -40,10 +73,9 @@ fn rust_sanity_check(rust_code: &str) -> Option<String> {
     let mut prev_char = ' ';
     
     for (line_num, line) in rust_code.lines().enumerate() {
-        let line_num = line_num + 1; // 1-indexed
+        let line_num = line_num + 1;
         
         for c in line.chars() {
-            // Track string context
             if c == '"' && prev_char != '\\' {
                 in_string = !in_string;
             }
@@ -84,21 +116,14 @@ fn rust_sanity_check(rust_code: &str) -> Option<String> {
         }
     }
     
-    // Check final balance
     if brace_depth != 0 {
-        return Some(format!(
-            "unbalanced braces: {} unclosed '{{'", brace_depth
-        ));
+        return Some(format!("unbalanced braces: {} unclosed '{{'", brace_depth));
     }
     if bracket_depth != 0 {
-        return Some(format!(
-            "unbalanced brackets: {} unclosed '['", bracket_depth
-        ));
+        return Some(format!("unbalanced brackets: {} unclosed '['", bracket_depth));
     }
     if paren_depth != 0 {
-        return Some(format!(
-            "unbalanced parentheses: {} unclosed '('", paren_depth
-        ));
+        return Some(format!("unbalanced parentheses: {} unclosed '('", paren_depth));
     }
     
     // Check for illegal patterns
@@ -106,21 +131,18 @@ fn rust_sanity_check(rust_code: &str) -> Option<String> {
         let line_num = line_num + 1;
         let trimmed = line.trim();
         
-        // Pattern: `= [;` - incomplete array literal
         if trimmed.contains("= [;") {
             return Some(format!(
                 "incomplete array literal at line {}: found '= [;'", line_num
             ));
         }
         
-        // Pattern: `= {;` - incomplete struct literal
         if trimmed.contains("= {;") {
             return Some(format!(
                 "incomplete struct literal at line {}: found '= {{;'", line_num
             ));
         }
         
-        // Pattern: lonely semicolon after open bracket
         if trimmed == "[;" || trimmed == "{;" {
             return Some(format!(
                 "illegal semicolon after open delimiter at line {}", line_num
@@ -128,50 +150,213 @@ fn rust_sanity_check(rust_code: &str) -> Option<String> {
         }
     }
     
-    None // All checks passed
+    None
 }
 
+//=============================================================================
+// USAGE & HELP
+//=============================================================================
+
 fn print_usage() {
-    eprintln!("{}RustS+ Compiler{}", ansi::BOLD_CYAN, ansi::RESET);
-    eprintln!("Usage: rustsp <input.rss> [options]");
+    eprintln!("{}╔═══════════════════════════════════════════════════════════════╗{}", 
+        ansi::BOLD_CYAN, ansi::RESET);
+    eprintln!("{}║              RustS+ Compiler v0.5.0                           ║{}",
+        ansi::BOLD_CYAN, ansi::RESET);
+    eprintln!("{}║      The Language with Effect Honesty                         ║{}",
+        ansi::BOLD_CYAN, ansi::RESET);
+    eprintln!("{}╚═══════════════════════════════════════════════════════════════╝{}\n",
+        ansi::BOLD_CYAN, ansi::RESET);
+    
+    eprintln!("{}USAGE:{}", ansi::BOLD_YELLOW, ansi::RESET);
+    eprintln!("    rustsp <input.rss> [options]\n");
+    
+    eprintln!("{}OPTIONS:{}", ansi::BOLD_YELLOW, ansi::RESET);
+    eprintln!("    {}-o <file>{}        Specify output file (binary or .rs)", ansi::GREEN, ansi::RESET);
+    eprintln!("    {}--emit-rs{}        Only emit .rs file without compiling", ansi::GREEN, ansi::RESET);
+    eprintln!("    {}--raw-errors{}     Show raw Rust errors (no mapping)", ansi::GREEN, ansi::RESET);
+    eprintln!("    {}--skip-logic{}     Skip logic check (DANGEROUS)", ansi::BOLD_RED, ansi::RESET);
+    eprintln!("    {}--skip-effects{}   Skip effect checking only", ansi::YELLOW, ansi::RESET);
+    eprintln!("    {}--strict-effects{} Require ALL effects to be declared", ansi::YELLOW, ansi::RESET);
+    eprintln!("    {}--analyze{}        Analyze and show function effects", ansi::GREEN, ansi::RESET);
+    eprintln!("    {}--quiet, -q{}      Suppress success messages", ansi::GREEN, ansi::RESET);
+    eprintln!("    {}-h, --help{}       Show this help message", ansi::GREEN, ansi::RESET);
+    eprintln!("    {}-V, --version{}    Show version\n", ansi::GREEN, ansi::RESET);
+    
+    eprintln!("{}EXAMPLES:{}", ansi::BOLD_YELLOW, ansi::RESET);
+    eprintln!("    rustsp main.rss -o myprogram        {}Compile to binary{}", ansi::CYAN, ansi::RESET);
+    eprintln!("    rustsp main.rss --emit-rs           {}Print Rust to stdout{}", ansi::CYAN, ansi::RESET);
+    eprintln!("    rustsp main.rss --emit-rs -o out.rs {}Write Rust to file{}", ansi::CYAN, ansi::RESET);
+    eprintln!("    rustsp main.rss --skip-effects      {}Skip effect analysis{}", ansi::CYAN, ansi::RESET);
+    eprintln!("    rustsp main.rss --analyze           {}Show effect analysis{}\n", ansi::CYAN, ansi::RESET);
+    
+    eprintln!("{}EFFECT SYSTEM:{}", ansi::BOLD_YELLOW, ansi::RESET);
+    eprintln!("    RustS+ requires functions to declare their effects:");
+    eprintln!("    ");
+    eprintln!("    {}// Pure function (no effects){}", ansi::CYAN, ansi::RESET);
+    eprintln!("    fn add(a i32, b i32) i32 {{ a + b }}");
+    eprintln!("    ");
+    eprintln!("    {}// Function with I/O effect{}", ansi::CYAN, ansi::RESET);
+    eprintln!("    fn greet(name String) {}effects(io){} {{ println!(\"Hello, {{}}\", name) }}", ansi::BOLD_GREEN, ansi::RESET);
+    eprintln!("    ");
+    eprintln!("    {}// Function that mutates parameter{}", ansi::CYAN, ansi::RESET);
+    eprintln!("    fn deposit(acc Account, amt i64) {}effects(write acc){} Account {{ ... }}", ansi::BOLD_GREEN, ansi::RESET);
+    eprintln!("    ");
+    eprintln!("    {}// Function with multiple effects{}", ansi::CYAN, ansi::RESET);
+    eprintln!("    fn process(data Data) {}effects(io, alloc, write data){} {{ ... }}", ansi::BOLD_GREEN, ansi::RESET);
     eprintln!("");
-    eprintln!("Options:");
-    eprintln!("  -o <file>        Specify output file (binary or .rs with --emit-rs)");
-    eprintln!("  --emit-rs        Only emit .rs file without compiling");
-    eprintln!("  --raw-errors     Show raw Rust errors (no mapping)");
-    eprintln!("  --skip-logic     Skip anti-fail logic check (DANGEROUS)");
-    eprintln!("  --quiet          Suppress success messages (for tooling)");
-    eprintln!("  -h, --help       Show this help message");
-    eprintln!("  -V, --version    Show version");
+    
+    eprintln!("{}EFFECT TYPES:{}", ansi::BOLD_YELLOW, ansi::RESET);
+    eprintln!("    {}io{}        - I/O operations (println!, File::*, etc.)", ansi::GREEN, ansi::RESET);
+    eprintln!("    {}alloc{}     - Memory allocation (Vec::new, Box::new, etc.)", ansi::GREEN, ansi::RESET);
+    eprintln!("    {}panic{}     - May panic (unwrap, expect, panic!)", ansi::GREEN, ansi::RESET);
+    eprintln!("    {}read(x){}   - Reads from parameter x", ansi::GREEN, ansi::RESET);
+    eprintln!("    {}write(x){}  - Mutates parameter x", ansi::GREEN, ansi::RESET);
     eprintln!("");
-    eprintln!("Examples:");
-    eprintln!("  rustsp main.rss -o myprogram        Compile to binary");
-    eprintln!("  rustsp main.rss --emit-rs           Print Rust to stdout");
-    eprintln!("  rustsp main.rss --emit-rs -o out.rs Write Rust to file");
+    
+    eprintln!("{}DOCUMENTATION:{}", ansi::BOLD_YELLOW, ansi::RESET);
+    eprintln!("    https://rustsp.dev/effects");
 }
+
+fn print_version() {
+    println!("RustS+ Compiler v0.5.0");
+    println!("Effect System: Enabled (Full Effect Ownership)");
+    println!("Logic Checks: L-01 through L-06");
+    println!("Effect Checks: Effect-01 through Effect-06");
+    println!("");
+    println!("Effect System Features:");
+    println!("  - Effect Ownership Model");
+    println!("  - Effect Contract System");
+    println!("  - Cross-Function Effect Propagation");
+    println!("  - Effect Scope Validation");
+    println!("  - Zero Heuristics - Explicit Declaration Required");
+}
+
+fn print_analysis(source: &str, file_name: &str) {
+    let functions = analyze_functions(source, file_name);
+    
+    eprintln!("{}╔═══════════════════════════════════════════════════════════════╗{}",
+        ansi::BOLD_CYAN, ansi::RESET);
+    eprintln!("{}║              RustS+ Effect Analysis                           ║{}",
+        ansi::BOLD_CYAN, ansi::RESET);
+    eprintln!("{}╚═══════════════════════════════════════════════════════════════╝{}\n",
+        ansi::BOLD_CYAN, ansi::RESET);
+    
+    if functions.is_empty() {
+        eprintln!("  No functions found.");
+        return;
+    }
+    
+    for (name, info) in &functions {
+        let purity = if info.declared_effects.is_pure && info.detected_effects.is_pure {
+            format!("{}PURE{}", ansi::BOLD_GREEN, ansi::RESET)
+        } else {
+            format!("{}EFFECTFUL{}", ansi::BOLD_YELLOW, ansi::RESET)
+        };
+        
+        eprintln!("{}fn {}{} [{}]", ansi::BOLD_WHITE, name, ansi::RESET, purity);
+        eprintln!("  {}├─ Line:{} {}", ansi::BLUE, ansi::RESET, info.line_number);
+        
+        // Parameters
+        if !info.parameters.is_empty() {
+            let params: Vec<String> = info.parameters.iter()
+                .map(|(n, t)| format!("{}: {}", n, t))
+                .collect();
+            eprintln!("  {}├─ Parameters:{} ({})", ansi::BLUE, ansi::RESET, params.join(", "));
+        }
+        
+        // Return type
+        if let Some(ref ret) = info.return_type {
+            eprintln!("  {}├─ Returns:{} {}", ansi::BLUE, ansi::RESET, ret);
+        }
+        
+        // Declared effects
+        if !info.declared_effects.is_pure {
+            eprintln!("  {}├─ Declared:{} effects({})", 
+                ansi::BLUE, ansi::RESET,
+                info.declared_effects.display());
+        } else {
+            eprintln!("  {}├─ Declared:{} (none - pure)", ansi::BLUE, ansi::RESET);
+        }
+        
+        // Detected effects
+        if !info.detected_effects.is_pure {
+            let status = if info.undeclared_effects().is_empty() {
+                format!("{}✓{}", ansi::GREEN, ansi::RESET)
+            } else {
+                format!("{}✗{}", ansi::RED, ansi::RESET)
+            };
+            eprintln!("  {}├─ Detected:{} {} effects({})", 
+                ansi::BLUE, ansi::RESET, status,
+                info.detected_effects.display());
+        } else {
+            eprintln!("  {}├─ Detected:{} (none)", ansi::BLUE, ansi::RESET);
+        }
+        
+        // Function calls
+        if !info.calls.is_empty() {
+            eprintln!("  {}└─ Calls:{} {}", ansi::BLUE, ansi::RESET, info.calls.join(", "));
+        }
+        
+        // Undeclared effects warning
+        let undeclared = info.undeclared_effects();
+        if !undeclared.is_empty() && name != "main" {
+            eprintln!("     {}⚠ UNDECLARED:{} {}", 
+                ansi::BOLD_RED, ansi::RESET,
+                undeclared.iter().map(|e| e.display()).collect::<Vec<_>>().join(", "));
+        }
+        
+        eprintln!("");
+    }
+    
+    // Summary
+    let total = functions.len();
+    let pure_count = functions.values()
+        .filter(|f| f.declared_effects.is_pure && f.detected_effects.is_pure)
+        .count();
+    let effectful_count = total - pure_count;
+    let violations = functions.values()
+        .filter(|f| !f.undeclared_effects().is_empty() && f.name != "main")
+        .count();
+    
+    eprintln!("{}Summary:{}", ansi::BOLD_YELLOW, ansi::RESET);
+    eprintln!("  Total functions: {}", total);
+    eprintln!("  Pure functions: {}", pure_count);
+    eprintln!("  Effectful functions: {}", effectful_count);
+    if violations > 0 {
+        eprintln!("  {}Effect violations: {}{}", ansi::BOLD_RED, violations, ansi::RESET);
+    } else {
+        eprintln!("  {}All effects properly declared ✓{}", ansi::BOLD_GREEN, ansi::RESET);
+    }
+}
+
+//=============================================================================
+// MAIN ENTRY POINT
+//=============================================================================
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    
+    // Version check
     if args.len() == 2 && (args[1] == "--version" || args[1] == "-V") {
-        println!("RustS+ Compiler v0.3.0");
-        exit(0);
-    }
-
-    if args.len() < 2 {
-        print_usage();
-        exit(1);
-    }
-    
-    if args[1] == "-h" || args[1] == "--help" {
-        print_usage();
+        print_version();
         exit(0);
     }
     
+    // Help check
+    if args.len() < 2 || args[1] == "-h" || args[1] == "--help" {
+        print_usage();
+        exit(if args.len() < 2 { 1 } else { 0 });
+    }
+    
+    // Parse arguments
     let mut input_file: Option<String> = None;
     let mut output_file: Option<String> = None;
     let mut emit_rs_only = false;
     let mut raw_errors = false;
     let mut skip_logic = false;
+    let mut skip_effects = false;
+    let mut strict_effects = false;
+    let mut analyze_only = false;
     let mut quiet = false;
     
     let mut i = 1;
@@ -197,8 +382,34 @@ fn main() {
             }
             "--skip-logic" => {
                 skip_logic = true;
-                eprintln!("{}WARNING{}: --skip-logic flag is DANGEROUS. Logic errors will NOT be caught.",
+                eprintln!("{}╔═══════════════════════════════════════════════════════════════╗{}",
                     ansi::BOLD_YELLOW, ansi::RESET);
+                eprintln!("{}║  WARNING: --skip-logic flag is DANGEROUS                      ║{}",
+                    ansi::BOLD_YELLOW, ansi::RESET);
+                eprintln!("{}║  Logic errors will NOT be caught before Rust compilation!     ║{}",
+                    ansi::BOLD_YELLOW, ansi::RESET);
+                eprintln!("{}╚═══════════════════════════════════════════════════════════════╝{}",
+                    ansi::BOLD_YELLOW, ansi::RESET);
+                i += 1;
+            }
+            "--skip-effects" => {
+                skip_effects = true;
+                if !quiet {
+                    eprintln!("{}note{}: Effect checking disabled. Effects will not be validated.",
+                        ansi::CYAN, ansi::RESET);
+                }
+                i += 1;
+            }
+            "--strict-effects" => {
+                strict_effects = true;
+                if !quiet {
+                    eprintln!("{}note{}: Strict effect mode enabled. ALL effects must be declared.",
+                        ansi::CYAN, ansi::RESET);
+                }
+                i += 1;
+            }
+            "--analyze" => {
+                analyze_only = true;
                 i += 1;
             }
             "--quiet" | "-q" => {
@@ -206,14 +417,12 @@ fn main() {
                 i += 1;
             }
             arg => {
-                if arg.starts_with("-") {
-                    eprintln!("{}error{}: Unknown option '{}'",
+                if arg.starts_with('-') {
+                    eprintln!("{}error{}: unknown option '{}'",
                         ansi::BOLD_RED, ansi::RESET, arg);
                     exit(1);
                 }
-                if arg.ends_with(".rss") || arg.ends_with(".rs") {
-                    input_file = Some(arg.to_string());
-                } else if input_file.is_none() {
+                if input_file.is_none() {
                     input_file = Some(arg.to_string());
                 }
                 i += 1;
@@ -221,6 +430,7 @@ fn main() {
         }
     }
     
+    // Validate input file
     let input_path = match input_file {
         Some(p) => p,
         None => {
@@ -237,6 +447,7 @@ fn main() {
         exit(1);
     }
     
+    // Read source file
     let source = match fs::read_to_string(&input_path) {
         Ok(content) => content,
         Err(e) => {
@@ -247,41 +458,91 @@ fn main() {
     };
     
     //=========================================================================
-    // STAGE 1: ANTI-FAIL LOGIC CHECK
+    // ANALYZE MODE
     //=========================================================================
-    // Ini adalah GATE PERTAMA. Jika ada logic error, kompilasi BERHENTI DI SINI.
-    // Kode yang tidak jujur TIDAK akan diteruskan ke Rust.
+    
+    if analyze_only {
+        print_analysis(&source, &input_path);
+        exit(0);
+    }
+    
+    //=========================================================================
+    // STAGE 0 & 1: ANTI-FAIL LOGIC CHECK (Effect & Logic Analysis)
+    //=========================================================================
+    // 
+    // This is the GATE. If your code is dishonest, it stops here.
+    // No Rust code will be generated for dishonest programs.
+    //
+    // Stage 0: Parse function signatures, build effect table
+    // Stage 1: Validate logic rules and effect contracts
+    //
+    // Checks performed:
+    // - Logic-01: Expression completeness
+    // - Logic-02: Ambiguous shadowing
+    // - Logic-03: Illegal statements in expression
+    // - Logic-04: Implicit mutation
+    // - Logic-05: Unclear intent
+    // - Logic-06: Same-scope reassignment
+    // - Effect-01: Undeclared effects
+    // - Effect-02: Effect leaks
+    // - Effect-03: Pure calling effectful
+    // - Effect-04: Effect propagation
+    // - Effect-05: Effect scope
+    // - Effect-06: Effect ownership
     
     if !skip_logic {
-        if let Err(errors) = check_logic(&source, &input_path) {
+        if !quiet {
+            eprintln!("{}[Stage 0]{} Building effect table and dependency graph...", 
+                ansi::BOLD_BLUE, ansi::RESET);
+            eprintln!("{}[Stage 1]{} Analyzing effects and logic...", 
+                ansi::BOLD_BLUE, ansi::RESET);
+        }
+        
+        let check_result = if skip_effects {
+            check_logic_no_effects(&source, &input_path)
+        } else {
+            check_logic_custom(&source, &input_path, true, strict_effects)
+        };
+        
+        if let Err(errors) = check_result {
             // ╔═══════════════════════════════════════════════════════════════╗
-            // ║  LOGIC ERRORS FOUND - STOP COMPILATION                        ║
+            // ║  LOGIC/EFFECT ERRORS FOUND - STOP COMPILATION                 ║
             // ║  Do NOT forward dishonest code to rustc                       ║
             // ╚═══════════════════════════════════════════════════════════════╝
             eprintln!("{}", format_logic_errors(&errors));
             exit(1);
+        }
+        
+        if !quiet {
+            eprintln!("{}[Stage 1]{} ✓ All logic and effect checks passed", 
+                ansi::BOLD_GREEN, ansi::RESET);
         }
     }
     
     //=========================================================================
     // STAGE 2: LOWERING (RustS+ → Rust)
     //=========================================================================
-    // Hanya tercapai jika Stage 1 lolos
+    // Only reached if Stage 1 passes
+    
+    if !quiet {
+        eprintln!("{}[Stage 2]{} Lowering RustS+ to Rust...", 
+            ansi::BOLD_BLUE, ansi::RESET);
+    }
     
     let rust_code = parse_rusts(&source);
     
     //=========================================================================
-    // STAGE 2.5: RUST SANITY GATE (Internal Validation)
+    // STAGE 2.5: RUST SANITY GATE
     //=========================================================================
-    // Validates that generated Rust is syntactically sound before calling rustc
-    // If this fails, it's a COMPILER BUG, not a user error
+    // Validates generated Rust before calling rustc
+    // If this fails, it's a COMPILER BUG
     
     if let Some(sanity_error) = rust_sanity_check(&rust_code) {
-        eprintln!("\n{}══════════════════════════════════════════════════════════════════{}",
+        eprintln!("\n{}╔═══════════════════════════════════════════════════════════════╗{}",
             ansi::BOLD_RED, ansi::RESET);
-        eprintln!("{}█   RUSTS+ INTERNAL ERROR (Lowering Bug Detected)   █{}",
+        eprintln!("{}║   RUSTS+ INTERNAL ERROR (Lowering Bug Detected)              ║{}",
             ansi::BOLD_RED, ansi::RESET);
-        eprintln!("{}══════════════════════════════════════════════════════════════════{}\n",
+        eprintln!("{}╚═══════════════════════════════════════════════════════════════╝{}\n",
             ansi::BOLD_RED, ansi::RESET);
         
         eprintln!("{}error[RUSTSP_INTERNAL][lowering]{}: invalid Rust code generated\n",
@@ -296,7 +557,7 @@ fn main() {
         eprintln!("  {}Please report this issue with your source code.{}\n",
             ansi::GREEN, ansi::RESET);
         
-        // Save the broken Rust code for debugging
+        // Save debug output
         let debug_filename = format!("{}_debug.rs", 
             Path::new(&input_path).file_stem().and_then(|s| s.to_str()).unwrap_or("output"));
         let _ = fs::write(&debug_filename, &rust_code);
@@ -306,14 +567,18 @@ fn main() {
         exit(1);
     }
     
+    if !quiet {
+        eprintln!("{}[Stage 2]{} ✓ Lowering complete", 
+            ansi::BOLD_GREEN, ansi::RESET);
+    }
+    
     //=========================================================================
-    // EMIT RS MODE: Write Rust code to file or stdout
+    // EMIT RS MODE
     //=========================================================================
     
     if emit_rs_only {
         match output_file {
             Some(ref out_path) => {
-                // Write to specified file
                 if let Err(e) = fs::write(out_path, &rust_code) {
                     eprintln!("{}error{}: writing '{}': {}",
                         ansi::BOLD_RED, ansi::RESET, out_path, e);
@@ -325,7 +590,6 @@ fn main() {
                 }
             }
             None => {
-                // Print to stdout
                 println!("{}", rust_code);
             }
         }
@@ -333,8 +597,14 @@ fn main() {
     }
     
     //=========================================================================
-    // BINARY COMPILATION MODE
+    // STAGE 3: RUST COMPILATION
     //=========================================================================
+    // Only reached if Stage 1 and Stage 2 pass
+    
+    if !quiet {
+        eprintln!("{}[Stage 3]{} Compiling with rustc...", 
+            ansi::BOLD_BLUE, ansi::RESET);
+    }
     
     let input_stem = Path::new(&input_path)
         .file_stem()
@@ -354,11 +624,6 @@ fn main() {
         format!("./{}", input_stem)
     });
     
-    //=========================================================================
-    // STAGE 3: RUST COMPILATION (rustc)
-    //=========================================================================
-    // Hanya tercapai jika Stage 1 dan Stage 2 lolos
-    
     let rustc_output = Command::new("rustc")
         .arg(&temp_rs_path_str)
         .arg("-o")
@@ -371,27 +636,28 @@ fn main() {
         Ok(output) => {
             if output.status.success() {
                 if !quiet {
-                    println!("{}✓ Successfully compiled{}: {}",
-                        ansi::BOLD_GREEN, ansi::RESET, output_binary);
+                    eprintln!("{}╔═══════════════════════════════════════════════════════════════╗{}",
+                        ansi::BOLD_GREEN, ansi::RESET);
+                    eprintln!("{}║  ✓ Successfully compiled: {:<36} ║{}",
+                        ansi::BOLD_GREEN, output_binary, ansi::RESET);
+                    eprintln!("{}╚═══════════════════════════════════════════════════════════════╝{}",
+                        ansi::BOLD_GREEN, ansi::RESET);
                 }
                 let _ = fs::remove_file(&temp_rs_path_str);
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 
                 if raw_errors {
-                    // Show raw Rust errors
                     eprintln!("{}", stderr);
                 } else {
-                    // Map Rust errors to RustS+ errors dengan warna
-                    eprintln!("\n{}══════════════════════════════════════════════════════════════════{}",
+                    eprintln!("\n{}╔═══════════════════════════════════════════════════════════════╗{}",
                         ansi::BOLD_RED, ansi::RESET);
-                    eprintln!("{}█   RUSTS+ COMPILATION ERROR (Stage 2 - Rust Backend)   █{}",
+                    eprintln!("{}║   RUSTS+ COMPILATION ERROR (Stage 3 - Rust Backend)          ║{}",
                         ansi::BOLD_RED, ansi::RESET);
-                    eprintln!("{}══════════════════════════════════════════════════════════════════{}\n",
+                    eprintln!("{}╚═══════════════════════════════════════════════════════════════╝{}\n",
                         ansi::BOLD_RED, ansi::RESET);
                     
                     if let Some(mapped_error) = map_rust_error(&stderr, &source) {
-                        // Format error dengan warna
                         eprintln!("{}error{}: {}", ansi::BOLD_RED, ansi::RESET, mapped_error.title);
                         if let Some(ref note) = mapped_error.explanation {
                             eprintln!("\n{}note{}:", ansi::BOLD_CYAN, ansi::RESET);
@@ -407,11 +673,11 @@ fn main() {
                         }
                     }
                     
-                    eprintln!("\n{}───────────────────────────────────────────────────────────────────{}",
+                    eprintln!("\n{}───────────────────────────────────────────────────────────────{}",
                         ansi::BLUE, ansi::RESET);
                     eprintln!("{}Original Rust error (for reference):{}",
                         ansi::CYAN, ansi::RESET);
-                    eprintln!("{}───────────────────────────────────────────────────────────────────{}",
+                    eprintln!("{}───────────────────────────────────────────────────────────────{}",
                         ansi::BLUE, ansi::RESET);
                     eprintln!("{}", stderr);
                 }

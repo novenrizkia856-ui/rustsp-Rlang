@@ -1,0 +1,101 @@
+// =======================================================
+// RustS+ Effect System Stress Test (VALID)
+// =======================================================
+
+struct Wallet {
+    id u32
+    balance i64
+}
+
+enum Tx {
+    Deposit { id u32, amount i64 }
+    Withdraw { id u32, amount i64 }
+    Query(u32)
+}
+
+fn classify(balance i64) String {
+    if balance >= 1000 {
+        "gold"
+    } else if balance >= 0 {
+        "normal"
+    } else {
+        "debt"
+    }
+}
+
+fn apply_tx(w Wallet, tx Tx) effects(write w) Wallet {
+    match tx {
+        Tx::Deposit { id, amount } {
+            if w.id == id {
+                mut next = w
+                next.balance = next.balance + amount
+                next
+            } else {
+                w
+            }
+        }
+
+        Tx::Withdraw { id, amount } {
+            if w.id == id {
+                mut next = w
+                next.balance = next.balance - amount
+                next
+            } else {
+                w
+            }
+        }
+
+        Tx::Query(_) {
+            w
+        }
+    }
+}
+
+fn process_all(w Wallet, txs [Tx]) effects(write w) Wallet {
+    mut acc = w
+    mut i = 0
+
+    while i < 3 {
+        acc = apply_tx(acc, txs[i])
+        i = i + 1
+    }
+
+    acc
+}
+
+fn log_status(label String, value i64) effects(io) () {
+    println("{} = {}", label, value)
+}
+
+fn main() effects(io, write account) () {
+
+    mut account = Wallet {
+        id = 7
+        balance = 100
+    }
+
+    // ---- Build txs WITHOUT enum literals inline ----
+    t1 = Tx::Deposit { id = 7, amount = 500 }
+    t2 = Tx::Withdraw { id = 7, amount = 200 }
+    t3 = Tx::Deposit { id = 7, amount = 900 }
+
+    txs = [ t1, t2, t3 ]
+
+    account = process_all(account, txs)
+
+    tier = classify(account.balance)
+
+    log_status("balance", account.balance)
+
+    match tier {
+        "gold" {
+            log_status("tier", 1)
+        }
+        "normal" {
+            log_status("tier", 2)
+        }
+        _ {
+            log_status("tier", 3)
+        }
+    }
+}
