@@ -12,15 +12,15 @@ RustS+ adalah **cara baru menulis Rust** — lebih sederhana, lebih jujur, dan l
 ## 🧠 Filosofi
 
 **Rust** mencegah:
-- segmentation fault  
-- use-after-free  
-- data race  
+- segmentation fault
+- use-after-free
+- data race
 
 **RustS+** mencegah:
-- logic race  
-- ambiguous mutation  
-- shadowing yang tidak disadari  
-- perubahan state tanpa niat eksplisit  
+- logic race
+- ambiguous mutation
+- shadowing yang tidak disadari
+- perubahan state tanpa niat eksplisit
 
 Jika Rust melindungi **memori**,  
 RustS+ melindungi **makna program**.
@@ -33,19 +33,18 @@ RustS+ adalah **superset dari Rust**.
 
 Pipeline kompilasi:
 
+```
 .rss (RustS+ source)
-│
-▼
+      │
+      ▼
 RustS+ compiler (logic + intent checker)
-│
-▼
+      │
+      ▼
 Rust (.rs)
-│
-▼
+      │
+      ▼
 rustc → LLVM → machine code
-
-yaml
-Salin kode
+```
 
 Jika analisis logika gagal, kode **tidak akan pernah** diteruskan ke Rust.
 
@@ -64,24 +63,23 @@ let mut a = 10;
 a = a + 1;
 ```
 
-### Rustsp
-```RustS+
-rusts
-Salin kode
+### RustS+
+
+```rusts
 a = 10
 a = a + 1
 ```
 
 RustS+ akan:
+- menentukan `mut` secara otomatis  
+- mencegah shadowing ambigu  
+- memastikan niat programmer eksplisit  
 
-menentukan mut secara otomatis
+---
 
-mencegah shadowing ambigu
+## 📦 Struct & Enum
 
-memastikan niat programmer eksplisit
-
-📦 Struct & Enum
-```rustsp
+```rusts
 struct Node {
     id u32
     balance i64
@@ -90,17 +88,19 @@ struct Node {
 enum Event {
     Init(Node)
     Credit { id u32, amount i64 }
-    Debit { id u32, amount i64 }
+    Debit  { id u32, amount i64 }
 }
-rusts
-Salin kode
+
 node = Node {
     id = 1
     balance = 100
-}```
+}
+```
 
+---
 
- 🔀 Control Flow as Expression
+## 🔀 Control Flow as Expression
+
 ```rusts
 status = if balance > 1000 {
     "rich"
@@ -108,7 +108,8 @@ status = if balance > 1000 {
     "normal"
 } else {
     "debt"
-}```
+}
+```
 
 ```rusts
 match status {
@@ -118,33 +119,39 @@ match status {
     _ {
         println("other")
     }
-}```
+}
+```
 
-Semua if dan match adalah ekspresi.
+Semua `if` dan `match` adalah **ekspresi**.
 
-🧠 Anti-Fail Logic
-RustS+ memperkenalkan Effect Ownership:
+---
 
-Fungsi default-nya pure
+## 🧠 Anti-Fail Logic
 
-Mutasi dan efek harus eksplisit
+RustS+ memperkenalkan **Effect Ownership**:
 
-Tidak ada perubahan state tersembunyi
+- Fungsi default-nya **pure**
+- Mutasi dan efek harus **eksplisit**
+- Tidak ada perubahan state tersembunyi
 
-Seperti Rust melarang dua mutable reference,
+Seperti Rust melarang dua `mutable reference`,  
 RustS+ melarang dua sumber efek tanpa kontrak eksplisit.
 
-🚀 Cargo Integration (Planned)
+---
+
+## 🚀 Cargo Integration (Planned)
+
 RustS+ dirancang untuk hidup di dalam ekosistem Cargo:
 
-bash
+```bash
 cargo rustsp build
 cargo rustsp run
 cargo build --rustsp
+```
+
 Satu project bisa mencampur:
 
-.rs (Rust)
-
-.rss (RustS+)
+- `.rs` (Rust)
+- `.rss` (RustS+)
 
 dalam satu crate.
