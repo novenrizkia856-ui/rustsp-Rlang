@@ -9,7 +9,7 @@ RustS+ adalah **cara baru menulis Rust** — lebih sederhana, lebih jujur, dan l
 
 ---
 
-## 🧠 Filosofi
+## Filosofi
 
 **Rust** mencegah:
 - segmentation fault
@@ -27,7 +27,7 @@ RustS+ melindungi **makna program**.
 
 ---
 
-## 🧩 Arsitektur
+## Arsitektur
 
 RustS+ adalah **superset dari Rust**.
 
@@ -54,7 +54,7 @@ Ini menciptakan dua lapisan keamanan:
 
 ---
 
-## ✨ Contoh
+## Contoh
 
 ### Rust
 
@@ -77,7 +77,7 @@ RustS+ akan:
 
 ---
 
-## 📦 Struct & Enum
+## Struct & Enum
 
 ```rusts
 struct Node {
@@ -99,7 +99,7 @@ node = Node {
 
 ---
 
-## 🔀 Control Flow as Expression
+## Control Flow as Expression
 
 ```rusts
 status = if balance > 1000 {
@@ -126,7 +126,7 @@ Semua `if` dan `match` adalah **ekspresi**.
 
 ---
 
-## 🧠 Anti-Fail Logic
+## Anti-Fail Logic
 
 RustS+ memperkenalkan **Effect Ownership**:
 
@@ -139,7 +139,7 @@ RustS+ melarang dua sumber efek tanpa kontrak eksplisit.
 
 ---
 
-## 🚀 Cargo Integration (Planned)
+## Cargo Integration (Planned)
 
 RustS+ dirancang untuk hidup di dalam ekosistem Cargo:
 
