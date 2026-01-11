@@ -1,152 +1,651 @@
-# RustS+ Language Guide (Draft v0.1)
+# RustS+ Language Specification v0.8
 
-> **RustS+** adalah bahasa sistem berbasis Rust yang dirancang untuk mencegah **bug logika** dengan tingkat keseriusan yang sama seperti Rust mencegah **bug memori**. Dokumen ini menjelaskan *cara berpikir*, *cara menulis*, dan *aturan inti* RustS+, sehingga manusia maupun AI dapat mempelajarinya sebagai satu bahasa yang utuh.
-
----
-
-## 1. Filosofi Inti RustS+
-
-RustS+ bukan bahasa baru yang menggantikan Rust, melainkan **lapisan bahasa (superset)** di atas Rust.
-
-* Rust = penjaga **keamanan memori**
-* RustS+ = penjaga **kejujuran makna program (logic safety)**
-
-Tujuan utama RustS+:
-
-* Tidak ada perubahan state tanpa niat eksplisit
-* Tidak ada efek samping tersembunyi
-* Tidak ada shadowing ambigu
-* Tidak ada logika "terasa benar tapi salah"
-
-RustS+ selalu dikompilasi melalui dua tahap:
-
-1. **Stage 1 – Logic & Intent Analysis (RustS+)**
-2. **Stage 2 – Memory & Type Safety (Rust / rustc)**
-
-Jika Stage 1 gagal, **kode tidak akan pernah diteruskan ke Rust**.
+> **RustS+** adalah superset Rust yang dirancang untuk mencegah **bug logika** dengan tingkat keseriusan yang sama seperti Rust mencegah **bug memori**. Dokumen ini adalah **spesifikasi normatif** — setiap aturan di sini di-enforce oleh compiler.
 
 ---
 
-## 2. Anti-Fail Logic & Effect Ownership
+## Daftar Isi
 
-Dalam RustS+, bug logika diperlakukan sebagai *pelanggaran kontrak niat*.
+1. [Filosofi Inti](#1-filosofi-inti)
+2. [Pipeline Compiler](#2-pipeline-compiler)
+3. [Sistem Variabel](#3-sistem-variabel)
+4. [Scope dan Block Semantics](#4-scope-dan-block-semantics)
+5. [Effect Ownership Model](#5-effect-ownership-model)
+6. [Function Semantics](#6-function-semantics)
+7. [Struct dan Enum](#7-struct-dan-enum)
+8. [Control Flow sebagai Ekspresi](#8-control-flow-sebagai-ekspresi)
+9. [Error Codes Reference](#9-error-codes-reference)
+10. [Cargo Integration](#10-cargo-integration)
+11. [Lowering ke Rust](#11-lowering-ke-rust)
 
-### 2.1 Effect Ownership
+---
 
-* Fungsi **default-nya murni (pure)**
-* Perubahan state adalah **efek**
-* Efek harus:
+## 1. Filosofi Inti
 
-  * eksplisit
-  * terlokalisasi
-  * dapat diaudit
+### 1.1 Tujuan RustS+
 
-Seperti Rust melarang dua mutable owner atas memori yang sama,
-RustS+ melarang dua sumber efek yang tidak terkoordinasi atas state yang sama.
+RustS+ adalah **lapisan bahasa (superset)** di atas Rust dengan tujuan:
 
-### 2.2 Default Aman
+| Layer | Penjaga | Dicegah |
+|-------|---------|---------|
+| Rust | Memory Safety | Use-after-free, double-free, data races |
+| RustS+ | Logic Safety | Hidden effects, ambiguous intent, dishonest code |
 
-```rusts
+**Prinsip Fundamental:**
+
+1. **Tidak ada perubahan state tanpa niat eksplisit**
+2. **Tidak ada efek samping tersembunyi**  
+3. **Tidak ada shadowing ambigu**
+4. **Tidak ada logika "terasa benar tapi salah"**
+
+### 1.2 Kode Tidak Jujur Tidak Pernah Dikompilasi
+
+RustS+ menerapkan filosofi **"Honest Code Only"**:
+
+- Jika fungsi melakukan efek → **WAJIB** mendeklarasikannya
+- Jika variabel di-reassign → **WAJIB** menggunakan `mut`
+- Jika modifikasi variabel outer scope → **WAJIB** menggunakan `outer`
+
+Kode yang melanggar aturan ini **TIDAK AKAN** diteruskan ke Rust compiler.
+
+---
+
+## 2. Pipeline Compiler
+
+### 2.1 Diagram Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  STAGE 0: EFFECT & FUNCTION ANALYSIS                                │
+│    → Parse semua function signatures dengan effect declarations     │
+│    → Build function table dengan effect contracts                   │
+│    → Build effect dependency graph untuk cross-function checking    │
+├─────────────────────────────────────────────────────────────────────┤
+│  STAGE 1: ANTI-FAIL LOGIC CHECK                                     │
+│    → Logic-01: Expression completeness (if/match branches)          │
+│    → Logic-02: Ambiguous shadowing detection                        │
+│    → Logic-03: Illegal statements in expression context             │
+│    → Logic-04: Implicit mutation detection                          │
+│    → Logic-05: Unclear intent patterns                              │
+│    → Logic-06: Same-scope reassignment without mut                  │
+│    → Effect-01: Undeclared effect validation                        │
+│    → Effect-02: Effect leak detection                               │
+│    → Effect-03: Pure calling effectful detection                    │
+│    → Effect-04: Cross-function effect propagation                   │
+│    → Effect-05: Effect scope validation                             │
+│    → Effect-06: Effect ownership validation                         │
+│                                                                     │
+│    ⚠️  JIKA ADA PELANGGARAN → KOMPILASI BERHENTI DI SINI            │
+│    ⚠️  KODE RUST TIDAK AKAN DIHASILKAN                              │
+├─────────────────────────────────────────────────────────────────────┤
+│  STAGE 2: LOWERING (RustS+ → Rust)                                  │
+│    → Transform sintaks RustS+ ke Rust valid                         │
+│    → Strip effects clause dari signatures                           │
+│    → Transform parameter types ([T] → &[T])                         │
+│    → Add #[derive(Clone)] untuk value semantics                     │
+│    → RUST SANITY GATE: Validasi output Rust                         │
+├─────────────────────────────────────────────────────────────────────┤
+│  STAGE 3: RUST COMPILATION (rustc)                                  │
+│    → Compile generated Rust ke binary                               │
+│    → Map rustc errors kembali ke RustS+ source                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Stage 1: Anti-Fail Logic (CRITICAL)
+
+Stage 1 adalah **gerbang utama** RustS+. Semua pengecekan logika terjadi di sini:
+
+| Check | Rule | Dicegah |
+|-------|------|---------|
+| Logic-01 | Expression completeness | `if` tanpa `else` saat digunakan sebagai value |
+| Logic-02 | Ambiguous shadowing | Assignment ke outer variable tanpa `outer` keyword |
+| Logic-03 | Statement in expression | `let` statement di dalam expression context |
+| Logic-04 | Implicit mutation | Field mutation tanpa tracking |
+| Logic-05 | Unclear intent | Empty blocks, ambiguous patterns |
+| Logic-06 | Same-scope reassignment | Reassignment tanpa `mut` declaration |
+| Effect-01 | Undeclared effect | Fungsi melakukan efek yang tidak dideklarasikan |
+| Effect-02 | Effect leak | Efek bocor ke closure tanpa propagation |
+| Effect-03 | Pure calling effectful | Fungsi pure memanggil fungsi effectful |
+| Effect-04 | Missing propagation | Efek dari callee tidak dipropagasi |
+| Effect-05 | Effect scope violation | Efek dilakukan di luar scope yang valid |
+| Effect-06 | Effect ownership conflict | Dua sumber efek menulis state yang sama |
+
+### 2.3 Rust Sanity Gate
+
+Sebelum kode dikirim ke rustc, RustS+ menjalankan **Sanity Gate**:
+
+- Validasi balanced delimiters: `()`, `[]`, `{}`
+- Validasi tidak ada `mut x = ...` tanpa `let`
+- Validasi tidak ada effect annotations yang bocor (`effects(...)`)
+- Validasi tidak ada unclosed strings
+
+Jika Sanity Gate gagal → **INTERNAL COMPILER ERROR** (bukan error Rust).
+
+---
+
+## 3. Sistem Variabel
+
+### 3.1 Deklarasi Variabel
+
+Dalam RustS+, `let` **tidak wajib**. Assignment adalah deklarasi:
+
+```rust
+// RustS+
+a = 10
+
+// Diturunkan ke Rust:
+let a = 10;
+```
+
+### 3.2 Same-Scope Reassignment (Logic-06)
+
+**ATURAN:** Reassignment ke variabel di scope yang sama **WAJIB** menggunakan `mut`.
+
+❌ **INVALID:**
+```rust
+fn main() {
+    x = 10
+    x = x + 1    // ERROR! Reassignment tanpa mut
+}
+```
+
+Compiler error:
+```
+error[RSPL071][scope]: reassignment to `x` without `mut` declaration
+  --> main.rss:3:5
+    |
+3   |     x = x + 1
+    |     ^^^^^^^^^
+
+note:
+  Logic-06 VIOLATION: Same-Scope Reassignment
+
+  variable `x` was first assigned on line 2.
+  reassigning without `mut` is not allowed in RustS+.
+
+help:
+  change original declaration to:
+
+    mut x = ...
+```
+
+✔ **VALID:**
+```rust
+fn main() {
+    mut x = 10      // Declare sebagai mutable
+    x = x + 1       // OK - sudah mut
+}
+```
+
+### 3.3 Shadowing vs Reassignment
+
+| Konsep | Definisi | Contoh |
+|--------|----------|--------|
+| **Assignment** | Deklarasi binding baru | `x = 10` |
+| **Reassignment** | Mengubah binding yang sudah ada | `mut x = 10; x = 20` |
+| **Shadowing** | Membuat binding baru dengan nama sama | `x = 10; { x = "hello" }` |
+
+**ATURAN:** RustS+ **TIDAK** mengizinkan reassignment tanpa `mut`.
+
+**ATURAN:** Shadowing di inner scope akan membuat variabel **BARU**. Outer variable **TIDAK** berubah.
+
+```rust
+a = 10
+{
+    a = "inner"    // Ini adalah SHADOWING, bukan reassignment
+    // Inner `a` adalah String, outer `a` tetap i32
+}
+println(a)         // Output: 10 (outer tidak berubah)
+```
+
+### 3.4 Type Inference
+
+RustS+ melakukan type inference dari nilai:
+
+| Value | Inferred Type |
+|-------|---------------|
+| `"hello"` | `String` |
+| `42` | `i32` |
+| `3.14` | `f64` |
+| `true`/`false` | `bool` |
+| `'c'` | `char` |
+
+---
+
+## 4. Scope dan Block Semantics
+
+### 4.1 Block Scope Rules
+
+Setiap `{}` membuat scope baru. Assignment di inner scope **default-nya** membuat variabel baru (shadowing).
+
+```rust
+fn main() {
+    x = 10
+    {
+        x = 20     // SHADOWING - outer x tidak berubah
+    }
+    // x masih 10
+}
+```
+
+### 4.2 Ambiguous Shadowing (Logic-02)
+
+**ATURAN:** Assignment ke nama yang sudah ada di outer scope **AKAN ERROR** karena ambigu.
+
+❌ **INVALID:**
+```rust
+fn main() {
+    counter = 0
+    {
+        counter = counter + 1    // ERROR! Ambiguous shadowing
+    }
+}
+```
+
+Compiler error:
+```
+error[RSPL081][scope]: ambiguous shadowing of outer variable `counter`
+  --> main.rss:4:9
+    |
+4   |         counter = counter + 1
+    |         ^^^^^^^^^^^^^^^^^^^^^
+
+note:
+  Logic-02 VIOLATION: Ambiguous Shadowing
+
+  in RustS+, assignment in inner block creates NEW variable by default.
+  outer `counter` will NOT change after this block.
+  use `outer counter` to modify the outer variable.
+
+help:
+  use `outer counter = ...` to modify outer variable
+```
+
+### 4.3 Outer Mutation Keyword
+
+Untuk memodifikasi variabel dari scope luar, gunakan keyword `outer`:
+
+✔ **VALID:**
+```rust
+fn main() {
+    mut counter = 0
+    {
+        outer counter = counter + 1    // Eksplisit modifikasi outer
+    }
+    // counter sekarang 1
+}
+```
+
+**Syntax:**
+```rust
+outer <var_name> = <expression>
+```
+
+**ATURAN:** `outer` **WAJIB** digunakan saat ingin memodifikasi variabel dari scope luar.
+
+---
+
+## 5. Effect Ownership Model
+
+### 5.1 Konsep Dasar
+
+RustS+ mengimplementasi **borrow checker untuk makna program** melalui Effect System. Sama seperti Rust melarang dua mutable owner atas memori yang sama, RustS+ melarang dua sumber efek yang tidak terkoordinasi atas state yang sama.
+
+### 5.2 Effect Types
+
+| Effect | Syntax | Deskripsi |
+|--------|--------|-----------|
+| `read(param)` | `effects(read x)` | Fungsi membaca dari parameter |
+| `write(param)` | `effects(write x)` | Fungsi memutasi parameter |
+| `io` | `effects(io)` | Fungsi melakukan I/O (println!, read, write) |
+| `alloc` | `effects(alloc)` | Fungsi mengalokasi memori (Vec::new, Box::new) |
+| `panic` | `effects(panic)` | Fungsi mungkin panic (unwrap, expect, panic!) |
+
+### 5.3 Effect Declaration Syntax
+
+```rust
+fn function_name(params) effects(effect1, effect2, ...) ReturnType {
+    body
+}
+```
+
+**Contoh:**
+```rust
+fn transfer(acc Account, amount i64) effects(write acc) Account {
+    acc.balance = acc.balance - amount
+    acc
+}
+
+fn log(msg String) effects(io) {
+    println("{}", msg)
+}
+```
+
+### 5.4 Function Classification
+
+| Classification | Definisi |
+|----------------|----------|
+| **PURE** | Tidak ada efek. Referentially transparent. |
+| **EFFECTFUL** | Memiliki satu atau lebih efek yang dideklarasikan. |
+
+```rust
+// PURE - tidak ada efek
 fn add(a i32, b i32) i32 {
+    a + b
+}
+
+// EFFECTFUL - memiliki efek io
+fn greet(name String) effects(io) {
+    println("Hello, {}", name)
+}
+```
+
+### 5.5 Effect Rules (WAJIB)
+
+#### Rule 1: Effect Honesty (Effect-01)
+
+**ATURAN:** Jika fungsi melakukan efek, fungsi **WAJIB** mendeklarasikannya.
+
+❌ **INVALID:**
+```rust
+fn save(data String) {     // Tidak ada deklarasi efek
+    println("Saving...")   // ERROR! I/O effect tidak dideklarasi
+}
+```
+
+Compiler error:
+```
+error[RSPL300][effect]: function `save` performs effect `io` but does not declare it
+  --> main.rss:1:4
+    |
+1   | fn save(data String) {
+    |    ^^^^
+
+note:
+  Effect-01 VIOLATION: Undeclared Effect
+
+  in RustS+, functions must HONESTLY declare their effects.
+  the function `save` performs `io` but this is not in its signature.
+
+help:
+  add effect declaration to function signature:
+
+  fn save(...) effects(io) { ... }
+```
+
+✔ **VALID:**
+```rust
+fn save(data String) effects(io) {
+    println("Saving...")
+}
+```
+
+#### Rule 2: Effect Propagation (Effect-04)
+
+**ATURAN:** Jika fungsi A memanggil fungsi B yang memiliki efek propagatable, A **WAJIB** mendeklarasikan efek tersebut.
+
+**Propagatable effects:** `io`, `alloc`, `panic`
+
+❌ **INVALID:**
+```rust
+fn inner() effects(io) {
+    println("inner")
+}
+
+fn outer() {           // ERROR! Tidak mendeklarasi io
+    inner()            // inner() memiliki efek io
+}
+```
+
+Compiler error:
+```
+error[RSPL301][effect]: function `outer` calls `inner` which has effect `io` but does not propagate it
+  --> main.rss:5:4
+    |
+5   | fn outer() {
+    |    ^^^^^
+
+note:
+  Effect-04 VIOLATION: Missing Effect Propagation
+
+  `outer` calls `inner` which declares effects: io
+  these effects must be propagated to the caller.
+
+help:
+  add effect declaration:
+
+  fn outer(...) effects(io) { ... }
+```
+
+✔ **VALID:**
+```rust
+fn inner() effects(io) {
+    println("inner")
+}
+
+fn outer() effects(io) {   // Propagate efek dari inner
+    inner()
+}
+```
+
+#### Rule 3: Pure Calling Effectful (Effect-03)
+
+**ATURAN:** Fungsi pure **TIDAK BOLEH** memanggil fungsi effectful secara langsung.
+
+❌ **INVALID:**
+```rust
+fn logger() effects(io) {
+    println("log")
+}
+
+fn compute(x i32) i32 {    // Pure function
+    logger()               // ERROR! Pure calling effectful
+    x * 2
+}
+```
+
+#### Rule 4: Effect Ownership (Effect-06)
+
+**ATURAN:** Dua fungsi berbeda **TIDAK BOLEH** menulis ke parameter yang sama tanpa koordinasi.
+
+### 5.6 Effect vs Rust Output
+
+**CRITICAL:** Effect annotations adalah **compile-time contracts**. Mereka **TIDAK PERNAH** muncul di output Rust.
+
+```rust
+// RustS+ Source:
+fn apply_tx(w Wallet, tx Tx) effects(write w) Wallet {
+    // ...
+}
+
+// Rust Output (effect stripped):
+fn apply_tx(w: Wallet, tx: Tx) -> Wallet {
+    // ...
+}
+```
+
+### 5.7 Special Case: main() Function
+
+Fungsi `main()` **diizinkan** memiliki implicit `io` effect untuk kenyamanan.
+
+```rust
+fn main() {
+    println("Hello")    // OK - main() memiliki implicit io
+}
+```
+
+---
+
+## 6. Function Semantics
+
+### 6.1 Function Syntax
+
+RustS+ menggunakan syntax yang lebih bersih dari Rust:
+
+```rust
+// RustS+
+fn add(a i32, b i32) i32 {
+    a + b
+}
+
+// Diturunkan ke Rust:
+fn add(a: i32, b: i32) -> i32 {
     a + b
 }
 ```
 
-Fungsi di atas **tidak memiliki efek**.
-RustS+ akan menolak efek tersembunyi di dalamnya.
+**Perbedaan utama:**
+- Parameter: `name Type` (bukan `name: Type`)
+- Return type langsung setelah `)` (bukan `-> Type`)
 
----
+### 6.2 Single-Line Functions
 
-## 3. Sistem Variabel RustS+
-
-### 3.1 Deklarasi Variabel
-
-* `let` **tidak wajib**
-* Assignment = deklarasi
-
-```rusts
-a = 10
-```
-
-Diturunkan menjadi:
+Fungsi pendek bisa ditulis dalam satu baris:
 
 ```rust
-let a = 10;
+fn double(x i32) i32 = x * 2
 ```
 
-### 3.2 Mutability Otomatis
+### 6.3 Generic Functions
 
-Jika variabel diassign ulang:
-
-```rusts
-a = 10
-a = 20
-```
-
-RustS+ otomatis menghasilkan:
+Generics menggunakan `[]` bukan `<>`:
 
 ```rust
-let mut a = 10;
-a = 20;
-```
-
-### 3.3 Shadowing
-
-```rusts
-a = 10
-a = "hello"
-```
-
-Ini **bukan mutasi**, tapi **shadowing**:
-
-```rust
-let a = 10;
-let a = String::from("hello");
-```
-
-Shadowing selalu eksplisit dan aman.
-
----
-
-## 4. Scope & Block Semantics
-
-* `{}` selalu membuat scope baru
-* Assignment di block = **variable baru (default)**
-* Tidak ada mutasi implisit ke scope luar
-
-### 4.1 Shadowing Lokal
-
-```rusts
-a = 10
-{
-    a = "inner"
+// RustS+
+fn identity[T](x T) T {
+    x
 }
-println(a)
+
+// Diturunkan ke Rust:
+fn identity<T>(x: T) -> T {
+    x
+}
 ```
 
-Hasil:
+### 6.4 Parameter Ownership
 
+| Syntax | Ownership |
+|--------|-----------|
+| `x T` | Move (transfer ownership) |
+| `x &T` | Immutable borrow |
+| `x &mut T` | Mutable borrow |
+
+### 6.5 Slice Parameters
+
+**ATURAN:** Bare slice type `[T]` sebagai parameter **otomatis** ditransform ke `&[T]`.
+
+```rust
+// RustS+ Source:
+fn process(items [Item]) {
+    // ...
+}
+
+// Rust Output:
+fn process(items: &[Item]) {
+    // ...
+}
 ```
-10
+
+### 6.6 Return Value
+
+- Ekspresi terakhir = return value (tanpa `;`)
+- Fungsi void tidak memiliki return type
+- `()` sebagai return type akan di-strip
+
+```rust
+fn compute(x i32) i32 {
+    x * 2       // Return value (tanpa ;)
+}
+
+fn log(msg String) effects(io) () {
+    println("{}", msg)
+}
+// Diturunkan ke: fn log(msg: String) { ... }
 ```
-
-### 4.2 Mutasi Variabel Luar
-
-```rusts
-outer a = a + 1
-```
-
-Tanpa `outer`, RustS+ **akan error**.
 
 ---
 
-## 5. Control Flow sebagai Ekspresi
+## 7. Struct dan Enum
 
-### 5.1 if / else
+### 7.1 Struct Definition
 
-Semua `if` adalah **ekspresi**:
+```rust
+struct Node {
+    id u32
+    balance i64
+    name String
+}
 
-```rusts
+// Diturunkan ke Rust:
+#[derive(Clone)]
+struct Node {
+    id: u32,
+    balance: i64,
+    name: String,
+}
+```
+
+**ATURAN:** Semua struct mendapat `#[derive(Clone)]` otomatis untuk value semantics.
+
+### 7.2 Struct Instantiation
+
+```rust
+node = Node {
+    id = 1
+    balance = 100
+    name = "Alice"
+}
+
+// Diturunkan ke Rust:
+let node = Node {
+    id: 1,
+    balance: 100,
+    name: String::from("Alice"),
+};
+```
+
+**Transformasi:**
+- `field = value` → `field: value`
+- String literal → `String::from("...")`
+
+### 7.3 Enum Definition
+
+```rust
+enum Event {
+    Init(Node)
+    Credit { id u32, amount i64 }
+    Debit { id u32, amount i64 }
+    Query(u32)
+}
+
+// Diturunkan ke Rust:
+#[derive(Clone)]
+enum Event {
+    Init(Node),
+    Credit { id: u32, amount: i64 },
+    Debit { id: u32, amount: i64 },
+    Query(u32),
+}
+```
+
+### 7.4 Enum Instantiation
+
+```rust
+ev = Event::Credit { id = 1, amount = 500 }
+
+// Diturunkan ke Rust:
+let ev = Event::Credit { id: 1, amount: 500 };
+```
+
+---
+
+## 8. Control Flow sebagai Ekspresi
+
+### 8.1 if/else sebagai Ekspresi
+
+Semua `if` adalah **ekspresi** yang menghasilkan nilai:
+
+```rust
 result = if x > 0 {
     "positive"
 } else {
@@ -154,194 +653,356 @@ result = if x > 0 {
 }
 ```
 
-Semua cabang **wajib menghasilkan nilai**.
+### 8.2 Expression Completeness (Logic-01)
 
-### 5.2 else if
+**ATURAN:** Jika `if` digunakan sebagai value, **WAJIB** memiliki `else` branch.
 
-`else if` hanyalah chaining ekspresi:
+❌ **INVALID:**
+```rust
+result = if x > 0 {
+    "positive"
+}
+// ERROR! Missing else branch
+```
 
-```rusts
-if x > 10 {
-    "big"
-} else if x > 0 {
-    "small"
+Compiler error:
+```
+error[RSPL060][control-flow]: `if` expression used as value must have `else` branch
+```
+
+✔ **VALID:**
+```rust
+result = if x > 0 {
+    "positive"
 } else {
-    "zero"
+    "negative"
 }
 ```
 
----
+### 8.3 Match Expression
 
-## 6. match Expression
+RustS+ menggunakan syntax match yang lebih bersih (tanpa `=>`):
 
-`match` adalah ekspresi utama RustS+.
-
-```rusts
+```rust
+// RustS+
 match status {
     "ok" {
         1
+    }
+    "error" {
+        -1
     }
     _ {
         0
     }
 }
-```
 
-* Tidak ada fallthrough
-* Semua cabang wajib menghasilkan nilai
-* Exhaustiveness tetap dijamin oleh Rust
-
----
-
-## 7. Struct dalam RustS+
-
-### 7.1 Definisi Struct
-
-```rusts
-struct Node {
-    id u32
-    balance i64
+// Diturunkan ke Rust:
+match status.as_str() {
+    "ok" => {
+        1
+    },
+    "error" => {
+        -1
+    },
+    _ => {
+        0
+    },
 }
 ```
 
-* Satu field per baris
-* Urutan field = layout memori
+### 8.4 Match dengan Enum Destructuring
 
-### 7.2 Instansiasi
-
-```rusts
-node = Node {
-    id = 1
-    balance = 100
-}
-```
-
-String literal otomatis diturunkan ke `String::from`.
-
-### 7.3 Akses & Mutasi Field
-
-```rusts
-mut n = node
-n.balance = n.balance + 10
-```
-
-Mutasi selalu eksplisit dan lokal.
-
----
-
-## 8. Enum dalam RustS+
-
-### 8.1 Definisi Enum
-
-```rusts
-enum Event {
-    Init(Node)
-    Credit { id u32, amount i64 }
-    Debit { id u32, amount i64 }
-}
-```
-
-### 8.2 Pattern Matching
-
-```rusts
+```rust
 match ev {
-    Event::Init(n) { n }
-    Event::Credit { id, amount } { ... }
+    Event::Credit { id, amount } {
+        if id == target_id {
+            process_credit(amount)
+        } else {
+            skip()
+        }
+    }
+    Event::Debit { id, amount } {
+        process_debit(id, amount)
+    }
+    _ {
+        ignore()
+    }
 }
 ```
 
-* Tidak ada simbol `=>`
-* Tidak ada koma
-* Semua cabang adalah ekspresi
+---
+
+## 9. Error Codes Reference
+
+### 9.1 Logic Errors (RSPL001-019)
+
+| Code | Deskripsi |
+|------|-----------|
+| RSPL001 | Generic logic error |
+| RSPL002 | Unreachable code detected |
+| RSPL003 | Infinite loop detected |
+
+### 9.2 Structure Errors (RSPL020-039)
+
+| Code | Deskripsi |
+|------|-----------|
+| RSPL020 | Invalid function signature |
+| RSPL021 | Invalid struct definition |
+| RSPL022 | Invalid enum definition |
+| RSPL023 | Missing function body |
+| RSPL024 | Duplicate definition |
+| RSPL025 | Invalid field syntax |
+| RSPL026 | Missing type annotation |
+
+### 9.3 Expression Errors (RSPL040-059)
+
+| Code | Deskripsi |
+|------|-----------|
+| RSPL040 | Expression used as statement |
+| RSPL041 | Statement used as expression |
+| RSPL042 | Invalid assignment target |
+| RSPL043 | Missing value in expression context |
+| RSPL044 | Type mismatch in expression |
+| RSPL045 | Invalid operator usage |
+| RSPL046 | String literal where String expected |
+
+### 9.4 Control Flow Errors (RSPL060-079)
+
+| Code | Deskripsi |
+|------|-----------|
+| RSPL060 | If expression missing else branch |
+| RSPL061 | Match expression missing arms |
+| RSPL062 | Match arm type mismatch |
+| RSPL063 | Unreachable match arm |
+| RSPL064 | Non-exhaustive match |
+| RSPL065 | Invalid guard expression |
+| RSPL066 | Break outside loop |
+| RSPL067 | Continue outside loop |
+| RSPL068 | Return outside function |
+| **RSPL071** | **Same-scope reassignment without mut** |
+
+### 9.5 Scope Errors (RSPL080-099)
+
+| Code | Deskripsi |
+|------|-----------|
+| RSPL080 | Variable not found in scope |
+| **RSPL081** | **Ambiguous shadowing (outer variable)** |
+| RSPL082 | Outer keyword on non-existent variable |
+| RSPL083 | Variable used before initialization |
+| RSPL084 | Scope leak attempt |
+| RSPL085 | Invalid outer mutation target |
+
+### 9.6 Effect System Errors (RSPL300-349)
+
+| Code | Deskripsi |
+|------|-----------|
+| **RSPL300** | **Undeclared effect performed** |
+| **RSPL301** | **Missing effect propagation** |
+| **RSPL302** | **Pure function calling effectful** |
+| RSPL303 | Effect leak to closure |
+| RSPL304 | Conflicting effect declarations |
+| RSPL305 | Invalid effect syntax |
+| RSPL306 | Effect on non-parameter |
+| RSPL307 | Write effect without read |
+| RSPL308 | Effect scope violation |
+| RSPL309 | Concurrent effect conflict |
+| RSPL310 | Effect not allowed in context |
+| RSPL311 | Missing panic effect |
+| RSPL312 | Missing io effect |
+| RSPL313 | Missing alloc effect |
+| RSPL314 | Effect contract violation |
+| RSPL315 | Effect ownership violation |
+| RSPL316 | Effect borrow violation |
 
 ---
 
-## 9. Function & Parameter Semantics
+## 10. Cargo Integration
 
-### 9.1 Definisi Fungsi
+### 10.1 Instalasi cargo-rustsp
 
-```rusts
-fn add(a i32, b i32) i32 {
-    a + b
-}
+`cargo-rustsp` adalah tool untuk mengintegrasikan RustS+ dengan Cargo workflow.
+
+```bash
+# Build cargo-rustsp
+rustc cargo-rustsp.rs -o cargo-rustsp
+
+# Install ke PATH
+cp cargo-rustsp ~/.cargo/bin/
 ```
 
-### 9.2 Return Value
-
-* Ekspresi terakhir = return
-* `;` di akhir fungsi non-void **dilarang**
-
-### 9.3 Ownership Parameter
-
-* `x T` → move
-* `&T` → immutable borrow
-* `&mut T` → mutable borrow
-
-Semantik **identik dengan Rust**.
-
----
-
-## 10. Error Message System
-
-Error RustS+:
-
-* manusiawi
-* kontekstual
-* menjelaskan *niat vs realita*
-
-Contoh:
+### 10.2 Project Structure
 
 ```
-error[RSPL081][scope]: ambiguous shadowing of outer variable `x`
-
-note:
-  assignment di dalam block membuat variable BARU secara default
-
-help:
-  gunakan `outer x = ...` jika ingin memodifikasi scope luar
+my_project/
+├── Cargo.toml
+└── src/
+    ├── main.rss      # RustS+ source (bukan .rs)
+    ├── lib.rss       # Library module
+    └── utils.rss     # Other modules
 ```
 
-Rust error hanya muncul jika **benar-benar berasal dari Rust**, dan akan dipetakan ulang sejauh mungkin.
+### 10.3 Commands
+
+| Command | Deskripsi |
+|---------|-----------|
+| `cargo rustsp build` | Compile project |
+| `cargo rustsp run` | Build dan run |
+| `cargo rustsp test` | Run tests |
+| `cargo rustsp check` | Check tanpa compile |
+| `cargo rustsp clean` | Clean artifacts |
+
+### 10.4 Options
+
+```bash
+cargo rustsp build --release     # Release build
+cargo rustsp run -- arg1 arg2    # Pass arguments
+```
+
+### 10.5 Workflow
+
+```
+cargo rustsp build
+    │
+    ├─→ Scan src/ untuk .rss files
+    │
+    ├─→ Compile setiap .rss ke .rs (via rustsp)
+    │   └─→ Stage 0: Effect Analysis
+    │   └─→ Stage 1: Anti-Fail Logic ← ERROR STOPS HERE
+    │   └─→ Stage 2: Lowering
+    │
+    ├─→ Copy .rs files ke shadow directory
+    │
+    ├─→ Generate Cargo.toml
+    │
+    └─→ Run cargo build di shadow directory
+```
+
+### 10.6 Shadow Directory
+
+cargo-rustsp menggunakan **shadow directory** di TEMP untuk mengisolasi build:
+
+```
+/tmp/rustsp_shadow_<project_name>/
+├── Cargo.toml           # Generated
+└── src/
+    ├── main.rs          # Compiled dari main.rss
+    └── lib.rs           # Compiled dari lib.rss
+```
+
+Target artifacts tetap di `target/rustsp_build/` dalam project directory.
 
 ---
 
-## 11. Hubungan dengan Rust
+## 11. Lowering ke Rust
 
-* Rust mentah **selalu boleh digunakan**
-* RustS+ tidak membatasi fitur Rust
-* RustS+ hanya menambah *kejujuran semantik*
+### 11.1 Syntax Transformations
 
-RustS+ bukan bahasa alternatif terhadap Rust.
-RustS+ adalah **cara manusia menulis Rust tanpa berbohong pada dirinya sendiri**.
+| RustS+ | Rust |
+|--------|------|
+| `fn foo(x i32) i32 {` | `fn foo(x: i32) -> i32 {` |
+| `fn foo[T](x T) T {` | `fn foo<T>(x: T) -> T {` |
+| `effects(io) ()` | *(stripped)* |
+| `x = 10` | `let x = 10;` |
+| `mut x = 10` | `let mut x = 10;` |
+| `struct S { x i32 }` | `#[derive(Clone)] struct S { x: i32, }` |
 
-Rust
-let mut a = 10;
-a = a + 1;
-rusts
-Salin kode
-RustS+
-a = 10
-a = a + 1
+### 11.2 Effect Stripping
+
+Effect annotations di-strip saat lowering:
+
+```rust
+// RustS+
+fn apply(w Wallet) effects(write w) Wallet { w }
+
+// Rust Output
+fn apply(w: Wallet) -> Wallet { w }
+```
+
+### 11.3 Automatic Transformations
+
+| Transformation | Contoh |
+|----------------|--------|
+| Slice to ref | `[T]` → `&[T]` |
+| String literal coercion | `"hello"` → `String::from("hello")` |
+| Slice index clone | `arr[i]` → `arr[i].clone()` |
+| Call-site borrow | `f(arr)` → `f(&arr)` (jika param `&[T]`) |
+| Derive Clone | `struct S {}` → `#[derive(Clone)] struct S {}` |
+| Macro bang | `println(x)` → `println!(x)` |
+
+### 11.4 Statement Transformations
+
+| RustS+ Statement | Rust Output |
+|------------------|-------------|
+| `effect write(x)` | *(skipped entirely)* |
+| `outer x = y` | `x = y;` |
+| Match arm `Pattern { body }` | `Pattern => { body },` |
+
 ---
 
-## 12. Penutup
+## Appendix A: Quick Reference Card
 
-RustS+ bertujuan menjadi bahasa sistem yang:
+### Variables
+```rust
+x = 10              // Deklarasi
+mut x = 10          // Mutable declaration
+x = x + 1           // ERROR tanpa mut
+outer x = y         // Modify outer scope
+```
 
-* keras pada logika
-* aman pada memori
-* jujur pada niat
-* ramah pada manusia
+### Functions
+```rust
+fn pure(a i32) i32 { a }                    // Pure function
+fn effectful() effects(io) { println("!") } // Effectful
+fn generic[T](x T) T { x }                  // Generic
+```
 
-Jika Rust mencegah *segmentation fault*,
-RustS+ mencegah *logical fault*.
+### Effects
+```rust
+effects(io)              // I/O operations
+effects(write x)         // Mutate parameter x
+effects(read x)          // Read parameter x
+effects(alloc)           // Memory allocation
+effects(panic)           // May panic
+effects(io, write x)     // Multiple effects
+```
 
-Ini menjadikan RustS+ cocok untuk:
+### Control Flow
+```rust
+if cond { a } else { b }    // If expression
+match x { P { body } }      // Match (no =>)
+while cond { body }         // While loop
+```
 
-* infrastructure
-* distributed systems
-* consensus engine
-* protocol & VM
-* sistem kritikal seperti DSDN
+---
 
-**RustS+ Core v0.1 — Stable Foundation**
+## Appendix B: Differences from Rust
+
+| Aspect | Rust | RustS+ |
+|--------|------|--------|
+| Variable declaration | `let x = 10;` | `x = 10` |
+| Mutable variable | `let mut x = 10;` | `mut x = 10` |
+| Function param | `x: i32` | `x i32` |
+| Return type | `-> i32` | `i32` (langsung setelah `)`) |
+| Generics | `<T>` | `[T]` |
+| Match arm | `=> { }` | `{ }` |
+| Effect declaration | N/A | `effects(...)` |
+| Outer mutation | N/A | `outer x = ...` |
+
+---
+
+## Appendix C: Effect System Checklist
+
+Sebelum compile, pastikan:
+
+- [ ] Setiap fungsi yang melakukan I/O memiliki `effects(io)`
+- [ ] Setiap fungsi yang memutasi parameter memiliki `effects(write param)`
+- [ ] Setiap fungsi yang memanggil effectful function mempropagasi efeknya
+- [ ] Tidak ada fungsi pure yang memanggil effectful function
+- [ ] Effect annotations menggunakan syntax yang benar
+
+---
+
+**RustS+ Language Specification v0.8**
+
+*"Jika Rust mencegah segmentation fault, RustS+ mencegah logical fault."*
