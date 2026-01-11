@@ -1,0 +1,436 @@
+//! Rust Sanity Check Module (L-05)
+//! 
+//! ATURAN L-05: Jika Stage-1 Lulus ⇒ Rust Output TIDAK BOLEH INVALID
+//! 
+//! This module validates that the generated Rust code is syntactically valid
+//! BEFORE passing it to rustc. If invalid Rust is generated, we emit an
+//! INTERNAL COMPILER ERROR instead of letting rustc fail.
+//!
+//! Checks performed:
+//! - Balanced delimiters: (), [], {}
+//! - No illegal tokens: bare `mut x = ...` without `let`
+//! - No unclosed strings/chars
+//! - Valid expression structure
+
+/// Result of sanity check
+#[derive(Debug, Clone)]
+pub struct SanityCheckResult {
+    pub is_valid: bool,
+    pub errors: Vec<SanityError>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SanityError {
+    pub line: usize,
+    pub column: usize,
+    pub message: String,
+    pub kind: SanityErrorKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SanityErrorKind {
+    UnbalancedDelimiter,
+    IllegalToken,
+    UnclosedString,
+    InvalidExpression,
+    InternalLoweringError,
+}
+
+impl SanityCheckResult {
+    pub fn ok() -> Self {
+        SanityCheckResult {
+            is_valid: true,
+            errors: Vec::new(),
+        }
+    }
+    
+    pub fn error(errors: Vec<SanityError>) -> Self {
+        SanityCheckResult {
+            is_valid: false,
+            errors,
+        }
+    }
+}
+
+/// Perform comprehensive sanity check on generated Rust code
+pub fn check_rust_output(rust_code: &str) -> SanityCheckResult {
+    let mut errors = Vec::new();
+    
+    // Check 1: Balanced delimiters
+    if let Some(err) = check_balanced_delimiters(rust_code) {
+        errors.push(err);
+    }
+    
+    // Check 2: Illegal tokens (bare `mut` without `let`)
+    errors.extend(check_illegal_tokens(rust_code));
+    
+    // Check 3: Unclosed strings
+    errors.extend(check_unclosed_strings(rust_code));
+    
+    // Check 4: Invalid patterns that indicate lowering bugs
+    errors.extend(check_lowering_patterns(rust_code));
+    
+    if errors.is_empty() {
+        SanityCheckResult::ok()
+    } else {
+        SanityCheckResult::error(errors)
+    }
+}
+
+/// Check for balanced delimiters: (), [], {}
+fn check_balanced_delimiters(code: &str) -> Option<SanityError> {
+    let mut paren_stack: Vec<(char, usize, usize)> = Vec::new();
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut escape_next = false;
+    
+    for (line_num, line) in code.lines().enumerate() {
+        for (col, ch) in line.chars().enumerate() {
+            // Handle escapes
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+            
+            if ch == '\\' && (in_string || in_char) {
+                escape_next = true;
+                continue;
+            }
+            
+            // Track string/char state
+            if ch == '"' && !in_char {
+                in_string = !in_string;
+                continue;
+            }
+            
+            if ch == '\'' && !in_string {
+                in_char = !in_char;
+                continue;
+            }
+            
+            if in_string || in_char {
+                continue;
+            }
+            
+            // Check delimiters
+            match ch {
+                '(' | '[' | '{' => {
+                    paren_stack.push((ch, line_num + 1, col + 1));
+                }
+                ')' => {
+                    if let Some((open, _, _)) = paren_stack.pop() {
+                        if open != '(' {
+                            return Some(SanityError {
+                                line: line_num + 1,
+                                column: col + 1,
+                                message: format!("Mismatched delimiter: expected closing for '{}', found ')'", open),
+                                kind: SanityErrorKind::UnbalancedDelimiter,
+                            });
+                        }
+                    } else {
+                        return Some(SanityError {
+                            line: line_num + 1,
+                            column: col + 1,
+                            message: "Unexpected closing ')'".to_string(),
+                            kind: SanityErrorKind::UnbalancedDelimiter,
+                        });
+                    }
+                }
+                ']' => {
+                    if let Some((open, _, _)) = paren_stack.pop() {
+                        if open != '[' {
+                            return Some(SanityError {
+                                line: line_num + 1,
+                                column: col + 1,
+                                message: format!("Mismatched delimiter: expected closing for '{}', found ']'", open),
+                                kind: SanityErrorKind::UnbalancedDelimiter,
+                            });
+                        }
+                    } else {
+                        return Some(SanityError {
+                            line: line_num + 1,
+                            column: col + 1,
+                            message: "Unexpected closing ']'".to_string(),
+                            kind: SanityErrorKind::UnbalancedDelimiter,
+                        });
+                    }
+                }
+                '}' => {
+                    if let Some((open, _, _)) = paren_stack.pop() {
+                        if open != '{' {
+                            return Some(SanityError {
+                                line: line_num + 1,
+                                column: col + 1,
+                                message: format!("Mismatched delimiter: expected closing for '{}', found '}}'", open),
+                                kind: SanityErrorKind::UnbalancedDelimiter,
+                            });
+                        }
+                    } else {
+                        return Some(SanityError {
+                            line: line_num + 1,
+                            column: col + 1,
+                            message: "Unexpected closing '}'".to_string(),
+                            kind: SanityErrorKind::UnbalancedDelimiter,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    if let Some((ch, line, col)) = paren_stack.pop() {
+        return Some(SanityError {
+            line,
+            column: col,
+            message: format!("Unclosed delimiter '{}'", ch),
+            kind: SanityErrorKind::UnbalancedDelimiter,
+        });
+    }
+    
+    None
+}
+
+/// Check for illegal tokens that indicate lowering bugs
+fn check_illegal_tokens(code: &str) -> Vec<SanityError> {
+    let mut errors = Vec::new();
+    
+    for (line_num, line) in code.lines().enumerate() {
+        let trimmed = line.trim();
+        
+        // Skip comments
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+        
+        // L-01 VIOLATION: bare `mut x = ...` without `let`
+        // Pattern: line starts with `mut` but not `let mut`
+        if trimmed.starts_with("mut ") && !line.contains("let mut") && !line.contains("&mut") {
+            // Make sure it's not inside a function parameter or something
+            // Check if there's an = sign (assignment)
+            if trimmed.contains('=') && !trimmed.contains("==") {
+                errors.push(SanityError {
+                    line: line_num + 1,
+                    column: 1,
+                    message: format!("L-01 VIOLATION: bare 'mut' without 'let': {}", trimmed),
+                    kind: SanityErrorKind::IllegalToken,
+                });
+            }
+        }
+        
+        // Check for `= [;` which indicates broken array handling
+        if trimmed.contains("= [;") || trimmed.contains("[;") && !trimmed.contains("\"") {
+            errors.push(SanityError {
+                line: line_num + 1,
+                column: 1,
+                message: "Broken array literal: contains '[;'".to_string(),
+                kind: SanityErrorKind::InternalLoweringError,
+            });
+        }
+        
+        // Check for double semicolons (common lowering bug)
+        if trimmed.ends_with(";;") {
+            errors.push(SanityError {
+                line: line_num + 1,
+                column: line.len(),
+                message: "Double semicolon detected".to_string(),
+                kind: SanityErrorKind::InternalLoweringError,
+            });
+        }
+    }
+    
+    errors
+}
+
+/// Check for unclosed strings
+fn check_unclosed_strings(code: &str) -> Vec<SanityError> {
+    let mut errors = Vec::new();
+    
+    for (line_num, line) in code.lines().enumerate() {
+        let trimmed = line.trim();
+        
+        // Skip comments
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        
+        // Count unescaped quotes
+        let mut in_string = false;
+        let mut escape_next = false;
+        
+        for ch in line.chars() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+            
+            if ch == '\\' {
+                escape_next = true;
+                continue;
+            }
+            
+            if ch == '"' {
+                in_string = !in_string;
+            }
+        }
+        
+        // If line ends with string open and doesn't have continuation markers
+        if in_string && !line.ends_with('\\') && !trimmed.ends_with(',') {
+            // Check if it might be a multiline string (raw string)
+            if !line.contains("r#\"") && !line.contains("r\"") {
+                errors.push(SanityError {
+                    line: line_num + 1,
+                    column: 1,
+                    message: "Possible unclosed string literal".to_string(),
+                    kind: SanityErrorKind::UnclosedString,
+                });
+            }
+        }
+    }
+    
+    errors
+}
+
+/// Check for patterns that indicate specific lowering bugs
+fn check_lowering_patterns(code: &str) -> Vec<SanityError> {
+    let mut errors = Vec::new();
+    
+    for (line_num, line) in code.lines().enumerate() {
+        let trimmed = line.trim();
+        
+        // Pattern: `=> {}` without proper arm body (L-02 violation)
+        // Valid: `=> { ... }` or `=> (...)` or `=> expr,`
+        // Invalid: `=> {};` at end of match arm
+        
+        // Pattern: assignment in expression position without parens
+        // e.g., `let x = if { ... }` instead of `let x = (if { ... })`
+        // This is technically valid Rust, so we won't flag it
+        
+        // Pattern: Empty match arm body
+        if trimmed == "=> {}," || trimmed == "=> { }," {
+            errors.push(SanityError {
+                line: line_num + 1,
+                column: 1,
+                message: "Empty match arm body detected".to_string(),
+                kind: SanityErrorKind::InvalidExpression,
+            });
+        }
+        
+        // Pattern: `}); }` - malformed if expression close
+        if trimmed.contains("}); }") {
+            errors.push(SanityError {
+                line: line_num + 1,
+                column: 1,
+                message: "Malformed expression close: '}); }'".to_string(),
+                kind: SanityErrorKind::InternalLoweringError,
+            });
+        }
+    }
+    
+    errors
+}
+
+/// Format internal compiler error for display
+pub fn format_internal_error(result: &SanityCheckResult) -> String {
+    let mut output = String::new();
+    
+    output.push_str("\n");
+    output.push_str("╔══════════════════════════════════════════════════════════════════╗\n");
+    output.push_str("║  error[RUSTSP_INTERNAL][lowering]: invalid Rust code generated   ║\n");
+    output.push_str("╚══════════════════════════════════════════════════════════════════╝\n");
+    output.push_str("\n");
+    output.push_str("note:\n");
+    output.push_str("  This is a compiler bug, not your fault.\n");
+    output.push_str("\n");
+    
+    for error in &result.errors {
+        output.push_str(&format!("  --> line {}:{}\n", error.line, error.column));
+        output.push_str(&format!("      {}\n", error.message));
+        output.push_str(&format!("      kind: {:?}\n", error.kind));
+        output.push_str("\n");
+    }
+    
+    output.push_str("help:\n");
+    output.push_str("  Please report this issue to the RustS+ developers.\n");
+    output.push_str("  Include your RustS+ source code for debugging.\n");
+    
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_balanced_delimiters_ok() {
+        let code = r#"
+fn main() {
+    let x = [1, 2, 3];
+    if (x > 0) {
+        println!("ok");
+    }
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(result.is_valid, "Expected valid code: {:?}", result.errors);
+    }
+    
+    #[test]
+    fn test_unbalanced_braces() {
+        let code = r#"
+fn main() {
+    let x = 1;
+"#;
+        let result = check_rust_output(code);
+        assert!(!result.is_valid);
+        assert!(result.errors.iter().any(|e| e.kind == SanityErrorKind::UnbalancedDelimiter));
+    }
+    
+    #[test]
+    fn test_bare_mut_detected() {
+        let code = r#"
+fn main() {
+    mut x = 10;
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(!result.is_valid);
+        assert!(result.errors.iter().any(|e| e.kind == SanityErrorKind::IllegalToken));
+    }
+    
+    #[test]
+    fn test_valid_let_mut() {
+        let code = r#"
+fn main() {
+    let mut x = 10;
+    x = x + 1;
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(result.is_valid, "Expected valid code: {:?}", result.errors);
+    }
+    
+    #[test]
+    fn test_double_semicolon() {
+        let code = r#"
+fn main() {
+    let x = 10;;
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(!result.is_valid);
+    }
+    
+    #[test]
+    fn test_broken_array() {
+        let code = r#"
+fn main() {
+    let arr = [;
+        1,
+    ];
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(!result.is_valid);
+    }
+}

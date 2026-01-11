@@ -1,0 +1,95 @@
+
+// RustS+ Ultra Stress Test 
+
+struct Account {
+    id u32
+    balance i64
+}
+
+enum Action {
+    Create(Account)
+    Deposit { id u32, amount i64 }
+    Withdraw { id u32, amount i64 }
+    Check(u32)
+}
+
+fn apply(acc Account, act Action) Account {
+    match act {
+        Action::Create(a) {
+            a
+        }
+
+        Action::Deposit { id, amount } {
+            if acc.id == id {
+                mut updated = acc
+                updated.balance = updated.balance + amount
+                updated
+            } else {
+                acc
+            }
+        }
+
+        Action::Withdraw { id, amount } {
+            if acc.id == id {
+                mut updated2 = acc
+                updated2.balance = updated2.balance - amount
+                updated2
+            } else {
+                acc
+            }
+        }
+
+        Action::Check(_) {
+            acc
+        }
+    }
+}
+
+fn tier(balance i64) String {
+    if balance >= 1_000 {
+        "gold"
+    } else if balance >= 0 {
+        "standard"
+    } else {
+        "debt"
+    }
+}
+
+fn main() {
+    // init account
+    account = Account {
+        id = 42
+        balance = 100
+    }
+
+    actions = [
+        Action::Deposit { id = 42, amount = 500 },
+        Action::Withdraw { id = 42, amount = 200 },
+        Action::Deposit { id = 42, amount = 700 },
+        Action::Withdraw { id = 42, amount = 50 },
+        Action::Check(42)
+    ]
+
+    mut i = 0
+    while i < 5 {
+        act = actions[i]
+        account = apply(account, act)
+        i = i + 1
+    }
+
+    level = tier(account.balance)
+
+    match level {
+        "gold" {
+            println!("account tier = GOLD")
+        }
+        "standard" {
+            println!("account tier = STANDARD")
+        }
+        _ {
+            println!("account tier = DEBT")
+        }
+    }
+
+    println!("final balance = {}", account.balance)
+}
