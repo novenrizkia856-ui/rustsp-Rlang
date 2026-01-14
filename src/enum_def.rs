@@ -184,7 +184,8 @@ fn transform_struct_variant_field(line: &str) -> String {
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
     if parts.len() >= 2 {
         let field_name = parts[0];
-        let field_type = parts[1..].join(" ");
+        // CRITICAL FIX: Strip trailing comma from field_type to avoid double comma
+        let field_type = parts[1..].join(" ").trim_end_matches(',').to_string();
         return format!("{}{}: {},", leading_ws, field_name, field_type);
     }
     

@@ -91,7 +91,8 @@ pub fn transform_struct_field(line: &str) -> String {
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
     if parts.len() >= 2 {
         let field_name = parts[0];
-        let field_type = parts[1..].join(" ");
+        // CRITICAL FIX: Strip trailing comma from field_type to avoid double comma
+        let field_type = parts[1..].join(" ").trim_end_matches(',').to_string();
         
         // Validate field name
         if is_valid_field_name(field_name) {
@@ -279,6 +280,13 @@ mod tests {
         assert_eq!(transform_struct_field("    id u64"), "    id: u64,");
         assert_eq!(transform_struct_field("    name String"), "    name: String,");
         assert_eq!(transform_struct_field("    active bool"), "    active: bool,");
+    }
+    
+    #[test]
+    fn test_struct_field_with_trailing_comma() {
+        // CRITICAL: Input with trailing comma should NOT produce double comma
+        assert_eq!(transform_struct_field("    value i32,"), "    value: i32,");
+        assert_eq!(transform_struct_field("    name String,"), "    name: String,");
     }
     
     #[test]
