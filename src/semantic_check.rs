@@ -313,6 +313,29 @@ impl SemanticChecker {
         s.chars().all(|c| c.is_alphanumeric() || c == '_')
     }
     
+    /// Check if a line is a macro call (not an assignment)
+    /// Macro calls follow the pattern: identifier!(args) or identifier![args]
+    fn is_macro_call(&self, line: &str) -> bool {
+        let trimmed = line.trim();
+        
+        // Find the first `!` in the line
+        if let Some(excl_pos) = trimmed.find('!') {
+            // Get the part before `!`
+            let before = &trimmed[..excl_pos];
+            
+            // The part before `!` should be a valid identifier
+            if !before.is_empty() && self.is_valid_identifier(before) {
+                // Check that `!` is followed by `(` or `[`
+                let after = &trimmed[excl_pos..];
+                if after.starts_with("!(") || after.starts_with("![") {
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
+    
     /// Check for `let` in expression context (RULE 2)
     fn check_let_in_expression_context(&mut self, trimmed: &str, line_num: usize) {
         // Check if we're in an expression context
@@ -357,6 +380,12 @@ impl SemanticChecker {
            trimmed.starts_with("if ") || trimmed.starts_with("while ") ||
            trimmed.starts_with("match ") || trimmed.starts_with("for ") ||
            trimmed.contains("= if ") || trimmed.contains("= match ") {
+            return;
+        }
+        
+        // Skip macro calls - they may contain `=` in their arguments
+        // but are not variable assignments
+        if self.is_macro_call(trimmed) {
             return;
         }
         

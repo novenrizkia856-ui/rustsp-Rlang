@@ -280,6 +280,48 @@ pub fn is_pure_enum_constructor_expr(line: &str) -> bool {
     false
 }
 
+/// Check if a line is a macro call (not an assignment)
+/// 
+/// Macro calls follow the pattern: identifier!(args) or identifier![args]
+/// Examples:
+/// - `println!("Hello")` → true
+/// - `vec![1, 2, 3]` → true  
+/// - `format!("{}", x)` → true
+/// - `x = vec![1, 2, 3]` → false (assignment with macro on RHS)
+/// - `x = 10` → false (regular assignment)
+fn is_macro_call(line: &str) -> bool {
+    let trimmed = line.trim();
+    
+    // Find the first `!` in the line
+    if let Some(excl_pos) = trimmed.find('!') {
+        // Get the part before `!`
+        let before = &trimmed[..excl_pos];
+        
+        // The part before `!` should be a valid identifier (alphanumeric + underscore)
+        // and must start with a letter or underscore
+        if before.is_empty() {
+            return false;
+        }
+        
+        let first_char = before.chars().next().unwrap_or('_');
+        if !first_char.is_alphabetic() && first_char != '_' {
+            return false;
+        }
+        
+        if !before.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return false;
+        }
+        
+        // Check that `!` is followed by `(` or `[`
+        let after = &trimmed[excl_pos..];
+        if after.starts_with("!(") || after.starts_with("![") {
+            return true;
+        }
+    }
+    
+    false
+}
+
 /// Extract the actual variable name from an assignment line.
 /// Returns empty string if the line is NOT a variable assignment.
 /// 
@@ -287,6 +329,7 @@ pub fn is_pure_enum_constructor_expr(line: &str) -> bool {
 /// - `x = 10` → returns "x"
 /// - `Tx::Deposit { id = 7 }` → returns "" (NOT an assignment)
 /// - `x = Tx::Deposit { ... }` → returns "x"
+/// - `println!("x = 5")` → returns "" (macro call, NOT assignment)
 pub fn extract_assignment_target(line: &str) -> String {
     let trimmed = line.trim();
     
@@ -294,6 +337,12 @@ pub fn extract_assignment_target(line: &str) -> String {
     if trimmed.starts_with("if ") || trimmed.starts_with("while ") ||
        trimmed.starts_with("for ") || trimmed.starts_with("match ") ||
        trimmed.starts_with("return ") || trimmed.starts_with("else") {
+        return String::new();
+    }
+    
+    // CRITICAL FIX: Skip macro calls like println!(), vec![], format!(), etc.
+    // Macro calls are NEVER assignment targets - the `=` inside them is part of the macro args
+    if is_macro_call(trimmed) {
         return String::new();
     }
     
@@ -858,6 +907,9 @@ pub struct EffectAnalyzer {
     function_calls: Vec<(String, usize)>,  // (name, line)
     /// Effect ownership tracker
     ownership_tracker: EffectOwnershipTracker,
+    // NEW: IR-based effect context
+    ir_context: Option<crate::eir::EffectContext>,
+    ir_detected_effects: Option<crate::eir::EffectSet>,
 }
 
 impl EffectAnalyzer {
@@ -869,6 +921,8 @@ impl EffectAnalyzer {
             declared_effects: EffectSignature::new(),
             function_calls: Vec::new(),
             ownership_tracker: EffectOwnershipTracker::new(),
+            ir_context: None,
+            ir_detected_effects: None,
         }
     }
     
@@ -942,6 +996,12 @@ impl EffectAnalyzer {
     }
     
     fn detect_io_effect(&self, line: &str) -> bool {
+        // Use IR-based detection when available
+        if let Some(effects) = self.ir_detected_effects.as_ref() {
+            return effects.has_io();
+        }
+        
+        // Fallback to pattern matching
         let io_patterns = [
             "println!", "print!", "eprintln!", "eprint!",
             "std::io", "File::", "stdin()", "stdout()", "stderr()",
@@ -1092,6 +1152,24 @@ impl EffectAnalyzer {
     
     pub fn is_in_closure(&self) -> bool {
         self.ownership_tracker.is_in_closure()
+    }
+
+    /// Initialize IR-based effect context
+    pub fn init_ir_context(&mut self, bindings: std::collections::HashMap<crate::hir::BindingId, crate::hir::BindingInfo>) {
+        self.ir_context = Some(crate::eir::EffectContext::new(bindings));
+    }
+    
+    /// Perform IR-based effect inference for current function body
+    pub fn infer_effects_from_hir(&mut self, body: &crate::hir::Spanned<crate::hir::HirBlock>) {
+        if let Some(ctx) = &self.ir_context {
+            let inference = crate::eir::EffectInference::new(ctx);
+            self.ir_detected_effects = Some(inference.infer_block(body));
+        }
+    }
+    
+    /// Get IR-detected effects
+    pub fn get_ir_effects(&self) -> Option<&crate::eir::EffectSet> {
+        self.ir_detected_effects.as_ref()
     }
 }
 
@@ -1828,6 +1906,15 @@ impl AntiFailLogicChecker {
         
         // Handle `outer` keyword
         if trimmed.starts_with("outer ") {
+            return;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX: Skip macro calls
+        // ═══════════════════════════════════════════════════════════════════════
+        // Macro calls like `println!("x = 5")` contain `=` but are NOT assignments.
+        // The `=` is inside the macro arguments, not an assignment operator.
+        if is_macro_call(trimmed) {
             return;
         }
         

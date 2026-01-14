@@ -1,3 +1,4 @@
+// Core modules
 pub mod variable;
 pub mod scope;
 pub mod function;
@@ -8,6 +9,18 @@ pub mod error_msg;
 pub mod semantic_check;
 pub mod anti_fail_logic;
 pub mod rust_sanity;
+
+//IR-based modules
+pub mod ast;
+pub mod hir;
+pub mod eir;
+pub mod parser;
+
+// Re-export IR types for convenience
+pub use ast::{Span, Spanned, EffectDecl};
+pub use hir::{BindingId, BindingInfo, ScopeResolver, HirModule};
+pub use eir::{Effect, EffectSet, EffectContext, EffectInference};
+pub use parser::{Lexer, FunctionParser, extract_function_signatures};
 
 use std::collections::{HashSet, HashMap};
 

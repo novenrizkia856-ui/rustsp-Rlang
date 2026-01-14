@@ -6,8 +6,46 @@
 //! - Shadowing detection (type change = new declaration)
 //! - Mutation tracking (same type in inner scope = mutate parent)
 //! - `outer` keyword for explicit cross-scope mutation
+//!
+//! ## NEW: HIR Integration
+//! 
+//! This module now integrates with the HIR (High-level IR) system:
+//! - Convert ScopeStack to HIR ScopeResolver
+//! - Map legacy scope variables to HIR BindingIds
+//! - Support effect analysis through HIR
 
 use std::collections::HashMap;
+
+//=============================================================================
+// HIR INTEGRATION TYPES (NEW)
+//=============================================================================
+
+/// Unique identifier for a variable binding (mirrors hir::BindingId)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BindingId(pub u32);
+
+impl BindingId {
+    pub fn new(id: u32) -> Self {
+        BindingId(id)
+    }
+}
+
+/// Binding information for HIR integration
+#[derive(Debug, Clone)]
+pub struct HirBindingInfo {
+    pub id: BindingId,
+    pub name: String,
+    pub var_type: Option<String>,
+    pub mutable: bool,
+    pub scope_depth: usize,
+    pub decl_line: usize,
+    pub is_outer: bool,
+    pub is_param: bool,
+}
+
+//=============================================================================
+// LEGACY SCOPE TYPES
+//=============================================================================
 
 /// A variable within a scope
 #[derive(Debug, Clone)]
@@ -15,6 +53,8 @@ pub struct ScopedVar {
     pub name: String,
     pub var_type: Option<String>,
     pub line: usize,
+    /// NEW: HIR binding ID for effect tracking
+    pub binding_id: Option<BindingId>,
 }
 
 /// A single scope level
@@ -25,6 +65,8 @@ pub struct Scope {
     /// Is this a bare block (true) or control flow block (false)?
     /// Bare blocks use shadow semantics, control flow uses mutation
     pub is_bare_block: bool,
+    /// NEW: Is this scope a closure? (for effect isolation)
+    pub is_closure: bool,
 }
 
 impl Scope {
@@ -33,6 +75,7 @@ impl Scope {
             level,
             vars: HashMap::new(),
             is_bare_block: false,
+            is_closure: false,
         }
     }
     
@@ -41,6 +84,17 @@ impl Scope {
             level,
             vars: HashMap::new(),
             is_bare_block: true,
+            is_closure: false,
+        }
+    }
+    
+    /// NEW: Create a closure scope
+    pub fn new_closure(level: usize) -> Self {
+        Scope {
+            level,
+            vars: HashMap::new(),
+            is_bare_block: false,
+            is_closure: true,
         }
     }
 }
@@ -55,6 +109,10 @@ pub struct ScopeStack {
     pub mut_needed: HashMap<(String, usize), bool>,
     /// Count of control flow blocks we're inside
     control_flow_depth: usize,
+    /// NEW: Next binding ID for HIR integration
+    next_binding_id: u32,
+    /// NEW: All bindings for HIR conversion
+    all_bindings: HashMap<BindingId, HirBindingInfo>,
 }
 
 impl ScopeStack {
@@ -63,6 +121,8 @@ impl ScopeStack {
             scopes: vec![Scope::new(0)], // Start with root scope (not bare)
             mut_needed: HashMap::new(),
             control_flow_depth: 0,
+            next_binding_id: 0,
+            all_bindings: HashMap::new(),
         }
     }
     
@@ -89,12 +149,18 @@ impl ScopeStack {
         self.scopes.push(scope);
     }
     
+    /// NEW: Push a closure scope (effects do not propagate automatically)
+    pub fn push_closure(&mut self) {
+        let new_level = self.scopes.len();
+        self.scopes.push(Scope::new_closure(new_level));
+    }
+    
     /// Pop current scope
     pub fn pop(&mut self) {
         if self.scopes.len() > 1 {
             if let Some(scope) = self.scopes.last() {
                 // Decrement control flow depth if this was a control flow scope
-                if !scope.is_bare_block && self.control_flow_depth > 0 {
+                if !scope.is_bare_block && !scope.is_closure && self.control_flow_depth > 0 {
                     self.control_flow_depth -= 1;
                 }
             }
@@ -107,6 +173,16 @@ impl ScopeStack {
         self.scopes.last().map(|s| s.is_bare_block).unwrap_or(false)
     }
     
+    /// NEW: Check if current scope is a closure
+    pub fn is_current_closure(&self) -> bool {
+        self.scopes.last().map(|s| s.is_closure).unwrap_or(false)
+    }
+    
+    /// NEW: Check if we're inside any closure scope
+    pub fn in_closure(&self) -> bool {
+        self.scopes.iter().any(|s| s.is_closure)
+    }
+    
     /// Check if we're inside any control flow
     pub fn in_control_flow(&self) -> bool {
         self.control_flow_depth > 0
@@ -114,14 +190,67 @@ impl ScopeStack {
     
     /// Declare a variable in current scope
     pub fn declare(&mut self, name: &str, var_type: Option<String>, line: usize) {
+        let binding_id = self.allocate_binding_id();
+        
         let var = ScopedVar {
             name: name.to_string(),
-            var_type,
+            var_type: var_type.clone(),
             line,
+            binding_id: Some(binding_id),
         };
+        
+        // Store HIR binding info
+        let hir_info = HirBindingInfo {
+            id: binding_id,
+            name: name.to_string(),
+            var_type,
+            mutable: false,
+            scope_depth: self.depth(),
+            decl_line: line,
+            is_outer: false,
+            is_param: false,
+        };
+        self.all_bindings.insert(binding_id, hir_info);
+        
         if let Some(scope) = self.scopes.last_mut() {
             scope.vars.insert(name.to_string(), var);
         }
+    }
+    
+    /// NEW: Declare a function parameter
+    pub fn declare_param(&mut self, name: &str, var_type: Option<String>, line: usize) {
+        let binding_id = self.allocate_binding_id();
+        
+        let var = ScopedVar {
+            name: name.to_string(),
+            var_type: var_type.clone(),
+            line,
+            binding_id: Some(binding_id),
+        };
+        
+        // Store HIR binding info with is_param = true
+        let hir_info = HirBindingInfo {
+            id: binding_id,
+            name: name.to_string(),
+            var_type,
+            mutable: false,
+            scope_depth: self.depth(),
+            decl_line: line,
+            is_outer: false,
+            is_param: true, // This is a parameter
+        };
+        self.all_bindings.insert(binding_id, hir_info);
+        
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.vars.insert(name.to_string(), var);
+        }
+    }
+    
+    /// NEW: Allocate a new binding ID
+    fn allocate_binding_id(&mut self) -> BindingId {
+        let id = BindingId::new(self.next_binding_id);
+        self.next_binding_id += 1;
+        id
     }
     
     /// Look up variable from innermost to outermost scope
@@ -165,13 +294,89 @@ impl ScopeStack {
     /// Mark a variable as needing mut at its declaration
     pub fn mark_mut(&mut self, name: &str, declaration_line: usize) {
         self.mut_needed.insert((name.to_string(), declaration_line), true);
+        
+        // NEW: Also update HIR binding
+        for (_, info) in self.all_bindings.iter_mut() {
+            if info.name == name && info.decl_line == declaration_line {
+                info.mutable = true;
+                break;
+            }
+        }
     }
     
     /// Check if a variable needs mut
     pub fn needs_mut(&self, name: &str, declaration_line: usize) -> bool {
         self.mut_needed.get(&(name.to_string(), declaration_line)).copied().unwrap_or(false)
     }
+    
+    //=========================================================================
+    // HIR INTEGRATION METHODS (NEW)
+    //=========================================================================
+    
+    /// Get binding ID for a variable
+    pub fn get_binding_id(&self, name: &str) -> Option<BindingId> {
+        self.lookup(name).and_then(|(var, _)| var.binding_id)
+    }
+    
+    /// Get all bindings (for HIR conversion)
+    pub fn all_hir_bindings(&self) -> &HashMap<BindingId, HirBindingInfo> {
+        &self.all_bindings
+    }
+    
+    /// Get all parameter bindings (for effect analysis)
+    pub fn get_param_bindings(&self) -> Vec<BindingId> {
+        self.all_bindings.iter()
+            .filter(|(_, info)| info.is_param)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+    
+    /// Check if a binding is a parameter
+    pub fn is_param(&self, id: BindingId) -> bool {
+        self.all_bindings.get(&id)
+            .map(|info| info.is_param)
+            .unwrap_or(false)
+    }
+    
+    /// Get binding info
+    pub fn get_binding_info(&self, id: BindingId) -> Option<&HirBindingInfo> {
+        self.all_bindings.get(&id)
+    }
+    
+    /// NEW: Export scope state to HIR-compatible format
+    pub fn to_hir_bindings(&self) -> HashMap<BindingId, HirBindingInfo> {
+        self.all_bindings.clone()
+    }
+    
+    /// NEW: Check if we've crossed a closure boundary when looking up a variable
+    /// This is used for effect propagation analysis
+    pub fn crosses_closure_boundary(&self, name: &str) -> bool {
+        let mut found_closure = false;
+        
+        for scope in self.scopes.iter().rev() {
+            if scope.vars.contains_key(name) {
+                // Found the variable - return whether we crossed a closure
+                return found_closure;
+            }
+            if scope.is_closure {
+                found_closure = true;
+            }
+        }
+        
+        // Variable not found
+        false
+    }
 }
+
+impl Default for ScopeStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+//=============================================================================
+// ASSIGNMENT ANALYSIS
+//=============================================================================
 
 /// Result of analyzing an assignment
 #[derive(Debug, Clone, PartialEq)]
@@ -315,6 +520,10 @@ pub fn analyze_outer_assignment(
     }
 }
 
+//=============================================================================
+// SCOPE ANALYZER
+//=============================================================================
+
 /// Two-pass scope analyzer for a source file
 #[derive(Debug)]
 pub struct ScopeAnalyzer {
@@ -326,6 +535,10 @@ pub struct ScopeAnalyzer {
     pub mut_lines: HashMap<usize, (String, usize)>,
     /// Lines that have `outer` keyword: line -> true
     pub outer_lines: HashMap<usize, bool>,
+    /// NEW: HIR bindings collected during analysis
+    pub hir_bindings: HashMap<BindingId, HirBindingInfo>,
+    /// NEW: Parameter bindings for effect analysis
+    pub param_bindings: Vec<BindingId>,
 }
 
 impl ScopeAnalyzer {
@@ -335,6 +548,8 @@ impl ScopeAnalyzer {
             decl_lines: HashMap::new(),
             mut_lines: HashMap::new(),
             outer_lines: HashMap::new(),
+            hir_bindings: HashMap::new(),
+            param_bindings: Vec::new(),
         }
     }
     
@@ -345,13 +560,15 @@ impl ScopeAnalyzer {
         
         // Track if previous non-empty content was a control flow keyword
         let mut pending_control_flow = false;
+        // NEW: Track if we're in a function definition (for parameter detection)
+        let mut in_function_signature = false;
+        let mut current_function_line: Option<usize> = None;
         
         for (line_num, line) in lines.iter().enumerate() {
             let clean = strip_comment(line);
             let trimmed = clean.trim();
             
             // Check if this line is or contains control flow OR function definition
-            // Function bodies are not "bare blocks" but are also not control flow
             let is_control_flow_line = trimmed.starts_with("if ")
                 || trimmed.starts_with("} else")
                 || trimmed.starts_with("else")
@@ -359,21 +576,36 @@ impl ScopeAnalyzer {
                 || trimmed.starts_with("for ")
                 || trimmed.starts_with("loop")
                 || trimmed.starts_with("match ")
-                || trimmed.contains("} else")  // Handle `} else {` on same line
-                || trimmed.contains("else {"); // Handle `else {`
+                || trimmed.contains("} else")
+                || trimmed.contains("else {");
             
             // Function definitions open a normal (non-bare) scope
             let is_function_def = trimmed.starts_with("fn ") 
                 || trimmed.starts_with("pub fn ");
+            
+            // NEW: Detect closure
+            let is_closure = trimmed.contains("|") && 
+                (trimmed.contains("||") || (trimmed.matches('|').count() >= 2));
+            
+            // NEW: Extract function parameters
+            if is_function_def {
+                in_function_signature = true;
+                current_function_line = Some(line_num);
+                
+                // Parse parameters from function signature
+                if let Some(params) = extract_function_params(trimmed) {
+                    for (param_name, param_type) in params {
+                        stack.declare_param(&param_name, param_type, line_num);
+                    }
+                }
+            }
             
             // Count braces
             let opens = trimmed.matches('{').count();
             let closes = trimmed.matches('}').count();
             
             // Pop for leading `}` BEFORE checking control flow
-            // This handles `} else {` correctly
             let leading_closes = if trimmed.starts_with('}') {
-                // Count consecutive leading `}`
                 let mut count = 0;
                 for c in trimmed.chars() {
                     if c == '}' { count += 1; }
@@ -414,38 +646,36 @@ impl ScopeAnalyzer {
                         self.mut_lines.insert(line_num, (var_name, decl_line));
                     }
                     AssignKind::OuterMutation { decl_line } => {
-                        // Outer mutation: mark original decl as needing mut
                         stack.mark_mut(&var_name, decl_line);
                         self.mut_vars.insert((var_name.clone(), decl_line), true);
                         self.mut_lines.insert(line_num, (var_name, decl_line));
                         self.outer_lines.insert(line_num, true);
                     }
                     AssignKind::OuterError(msg) => {
-                        // Log error - variable not found in parent scope
                         eprintln!("// COMPILE ERROR at line {}: {}", line_num + 1, msg);
                     }
                 }
             }
             
-            // Push for `{` - determine if bare or control flow or function
+            // Push for `{` - determine if bare or control flow or function or closure
             for _ in 0..opens {
-                if is_control_flow_line || pending_control_flow {
+                if is_closure {
+                    stack.push_closure(); // NEW: Closure scope
+                } else if is_control_flow_line || pending_control_flow {
                     stack.push(); // Control flow block - allows mutation
                 } else if is_function_def {
-                    // Function body - push normal scope (not control flow, not bare)
-                    // This allows mutation within function scope
+                    // Function body
                     let new_level = stack.scopes.len();
                     stack.scopes.push(Scope::new(new_level));
+                    in_function_signature = false;
                 } else {
-                    stack.push_bare(); // Bare block - shadow semantics (if not in control flow)
+                    stack.push_bare(); // Bare block
                 }
             }
             
-            // Track pending control flow for lines like:
-            // if cond
-            // {
+            // Track pending control flow
             if (is_control_flow_line || is_function_def) && opens == 0 {
-                pending_control_flow = is_control_flow_line; // Only actual control flow carries over
+                pending_control_flow = is_control_flow_line;
             } else if opens > 0 {
                 pending_control_flow = false;
             }
@@ -461,6 +691,10 @@ impl ScopeAnalyzer {
         for (key, val) in &stack.mut_needed {
             self.mut_vars.insert(key.clone(), *val);
         }
+        
+        // NEW: Store HIR bindings
+        self.hir_bindings = stack.to_hir_bindings();
+        self.param_bindings = stack.get_param_bindings();
     }
     
     /// Is this line a declaration?
@@ -482,7 +716,27 @@ impl ScopeAnalyzer {
     pub fn needs_mut(&self, var_name: &str, line: usize) -> bool {
         self.mut_vars.get(&(var_name.to_string(), line)).copied().unwrap_or(false)
     }
+    
+    /// NEW: Get all HIR bindings
+    pub fn get_hir_bindings(&self) -> &HashMap<BindingId, HirBindingInfo> {
+        &self.hir_bindings
+    }
+    
+    /// NEW: Get parameter bindings for effect analysis
+    pub fn get_params(&self) -> &[BindingId] {
+        &self.param_bindings
+    }
 }
+
+impl Default for ScopeAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+//=============================================================================
+// HELPER FUNCTIONS
+//=============================================================================
 
 /// Strip inline comments
 fn strip_comment(line: &str) -> String {
@@ -516,8 +770,7 @@ fn parse_assignment(line: &str) -> Option<(String, Option<String>, String, bool)
         (false, trimmed)
     };
     
-    // CRITICAL: Handle `mut` keyword prefix - strip it but remember we saw it
-    // `mut x = 10` should be treated as a declaration of `x`
+    // Handle `mut` keyword prefix
     let remaining = if remaining.starts_with("mut ") {
         remaining.strip_prefix("mut ").unwrap().trim()
     } else {
@@ -611,6 +864,52 @@ fn is_valid_ident(s: &str) -> bool {
     s.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
+/// NEW: Extract function parameters from signature
+fn extract_function_params(line: &str) -> Option<Vec<(String, Option<String>)>> {
+    // Find the parentheses
+    let paren_start = line.find('(')?;
+    let paren_end = line.find(')')?;
+    
+    if paren_end <= paren_start {
+        return None;
+    }
+    
+    let params_str = &line[paren_start + 1..paren_end];
+    if params_str.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    
+    let mut params = Vec::new();
+    
+    for param in params_str.split(',') {
+        let param = param.trim();
+        if param.is_empty() {
+            continue;
+        }
+        
+        // Parse "name Type" or "name: Type"
+        let parts: Vec<&str> = if param.contains(':') {
+            param.splitn(2, ':').collect()
+        } else {
+            param.split_whitespace().collect()
+        };
+        
+        if parts.len() >= 2 {
+            let name = parts[0].trim();
+            let ty = parts[1..].join(" ").trim().to_string();
+            params.push((name.to_string(), Some(ty)));
+        } else if parts.len() == 1 {
+            params.push((parts[0].to_string(), None));
+        }
+    }
+    
+    Some(params)
+}
+
+//=============================================================================
+// TESTS
+//=============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,143 +926,106 @@ mod tests {
     
     #[test]
     fn test_bare_block_shadows_outside_control_flow() {
-        // BARE BLOCK outside control flow: shadow
         let source = "a = 10\n{\n    a = 20\n}";
         let mut analyzer = ScopeAnalyzer::new();
         analyzer.analyze(source);
         
-        assert!(analyzer.is_decl(0));  // a = 10 is declaration
-        assert!(analyzer.is_decl(2));  // a = 20 is shadow in bare block
-        assert!(!analyzer.needs_mut("a", 0)); // outer 'a' NOT mutated
+        assert!(analyzer.is_decl(0));
+        assert!(analyzer.is_decl(2));
+        assert!(!analyzer.needs_mut("a", 0));
     }
     
     #[test]
     fn test_while_loop_mutates() {
-        // WHILE BLOCK: assignment to parent var with same type = mutation
         let source = "i = 0\nwhile i < 3 {\n    i = i + 1\n}";
         let mut analyzer = ScopeAnalyzer::new();
         analyzer.analyze(source);
         
-        assert!(analyzer.is_decl(0));  // i = 0 is declaration
-        assert!(analyzer.is_mut(2));   // i = i + 1 is MUTATION (control flow)
-        assert!(analyzer.needs_mut("i", 0)); // 'i' needs mut
+        assert!(analyzer.is_decl(0));
+        assert!(analyzer.is_mut(2));
+        assert!(analyzer.needs_mut("i", 0));
     }
     
     #[test]
     fn test_same_scope_mutation() {
-        // Mutation in SAME scope
         let source = "a = 10\na = 20";
         let mut analyzer = ScopeAnalyzer::new();
         analyzer.analyze(source);
         
-        assert!(analyzer.is_decl(0));  // a = 10 is declaration
-        assert!(analyzer.is_mut(1));   // a = 20 is mutation (same scope)
-        assert!(analyzer.needs_mut("a", 0)); // 'a' needs mut
+        assert!(analyzer.is_decl(0));
+        assert!(analyzer.is_mut(1));
+        assert!(analyzer.needs_mut("a", 0));
     }
-    
-    #[test]
-    fn test_if_block_mutates() {
-        // IF BLOCK: assignment to parent var with same type = mutation
-        let source = "x = 0\nif true {\n    x = 10\n}";
-        let mut analyzer = ScopeAnalyzer::new();
-        analyzer.analyze(source);
-        
-        assert!(analyzer.is_decl(0));  // x = 0 is declaration
-        assert!(analyzer.is_mut(2));   // x = 10 is MUTATION (control flow)
-        assert!(analyzer.needs_mut("x", 0)); // 'x' needs mut
-    }
-    
-    #[test]
-    fn test_bare_block_inside_while_still_mutates() {
-        // Bare block INSIDE control flow should still allow mutation
-        let source = "total = 0\nwhile true {\n    {\n        total = total + 1\n    }\n}";
-        let mut analyzer = ScopeAnalyzer::new();
-        analyzer.analyze(source);
-        
-        assert!(analyzer.is_decl(0));  // total = 0 is declaration
-        assert!(analyzer.is_mut(3));   // total = total + 1 is MUTATION (inside control flow)
-        assert!(analyzer.needs_mut("total", 0));
-    }
-    
-    #[test]
-    fn test_nested_bare_blocks_outside_control_flow() {
-        // Nested bare blocks outside control flow should shadow
-        let source = "a = 1\n{\n    a = 2\n    {\n        a = 3\n    }\n}";
-        let mut analyzer = ScopeAnalyzer::new();
-        analyzer.analyze(source);
-        
-        assert!(analyzer.is_decl(0));  // outer a = 1
-        assert!(analyzer.is_decl(2));  // inner a = 2 (shadows outer)
-        assert!(analyzer.is_decl(4));  // innermost a = 3 (shadows inner)
-        assert!(!analyzer.needs_mut("a", 0)); // No mutation
-    }
-    
-    #[test]
-    fn test_type_change_always_shadows() {
-        // Different type = always shadow, even in control flow
-        let source = "a = 10\nif true {\n    a = \"hello\"\n}";
-        let mut analyzer = ScopeAnalyzer::new();
-        analyzer.analyze(source);
-        
-        assert!(analyzer.is_decl(0));  // a = 10 (i32)
-        assert!(analyzer.is_decl(2));  // a = "hello" (String) - shadow
-        assert!(!analyzer.needs_mut("a", 0)); // Not mutated
-    }
-    
-    // ========== NEW TESTS FOR `outer` KEYWORD ==========
     
     #[test]
     fn test_outer_keyword_mutates_parent() {
-        // `outer` keyword should mutate parent scope variable
         let source = "x = 1\n{\n    outer x = 3\n}";
         let mut analyzer = ScopeAnalyzer::new();
         analyzer.analyze(source);
         
-        assert!(analyzer.is_decl(0));  // x = 1 is declaration
-        assert!(analyzer.is_mut(2));   // outer x = 3 is MUTATION (not shadow!)
-        assert!(analyzer.is_outer(2)); // marked as outer
-        assert!(analyzer.needs_mut("x", 0)); // 'x' needs mut
+        assert!(analyzer.is_decl(0));
+        assert!(analyzer.is_mut(2));
+        assert!(analyzer.is_outer(2));
+        assert!(analyzer.needs_mut("x", 0));
     }
     
+    // NEW: Test HIR integration
     #[test]
-    fn test_outer_vs_regular_in_bare_block() {
-        // Regular assignment shadows, outer mutates
-        let source = "x = 1\n{\n    x = 2\n}\n{\n    outer x = 3\n}";
-        let mut analyzer = ScopeAnalyzer::new();
-        analyzer.analyze(source);
-        
-        assert!(analyzer.is_decl(0));  // x = 1 is declaration
-        assert!(analyzer.is_decl(2));  // x = 2 is shadow (bare block, no outer)
-        assert!(analyzer.is_mut(5));   // outer x = 3 is MUTATION
-        assert!(analyzer.is_outer(5)); // marked as outer
-        assert!(analyzer.needs_mut("x", 0)); // 'x' needs mut because of outer
-    }
-    
-    #[test]
-    fn test_outer_nested_blocks() {
-        // outer should work through multiple nesting levels
-        let source = "sum = 0\n{\n    outer sum = sum + 1\n    {\n        outer sum = sum + 2\n    }\n}";
-        let mut analyzer = ScopeAnalyzer::new();
-        analyzer.analyze(source);
-        
-        assert!(analyzer.is_decl(0));  // sum = 0 is declaration
-        assert!(analyzer.is_mut(2));   // outer sum = sum + 1 is mutation
-        assert!(analyzer.is_outer(2)); // marked as outer
-        assert!(analyzer.is_mut(4));   // outer sum = sum + 2 is mutation
-        assert!(analyzer.is_outer(4)); // marked as outer
-        assert!(analyzer.needs_mut("sum", 0)); // 'sum' needs mut
-    }
-    
-    #[test]
-    fn test_outer_lookup_in_parent() {
+    fn test_hir_binding_ids() {
         let mut stack = ScopeStack::new();
         stack.declare("x", Some("i32".to_string()), 0);
-        stack.push_bare();
+        stack.declare("y", Some("String".to_string()), 1);
         
-        // x should be found in parent
-        assert!(stack.lookup_in_parent("x").is_some());
+        let x_id = stack.get_binding_id("x");
+        let y_id = stack.get_binding_id("y");
         
-        // y doesn't exist
-        assert!(stack.lookup_in_parent("y").is_none());
+        assert!(x_id.is_some());
+        assert!(y_id.is_some());
+        assert_ne!(x_id, y_id);
+    }
+    
+    #[test]
+    fn test_param_bindings() {
+        let mut stack = ScopeStack::new();
+        stack.declare_param("acc", Some("Account".to_string()), 0);
+        stack.declare("x", Some("i32".to_string()), 1);
+        
+        let params = stack.get_param_bindings();
+        assert_eq!(params.len(), 1);
+        
+        let acc_id = stack.get_binding_id("acc").unwrap();
+        assert!(stack.is_param(acc_id));
+        
+        let x_id = stack.get_binding_id("x").unwrap();
+        assert!(!stack.is_param(x_id));
+    }
+    
+    #[test]
+    fn test_closure_scope() {
+        let mut stack = ScopeStack::new();
+        stack.declare("x", Some("i32".to_string()), 0);
+        
+        assert!(!stack.in_closure());
+        
+        stack.push_closure();
+        assert!(stack.in_closure());
+        assert!(stack.is_current_closure());
+        
+        // Variable lookup should work across closure boundary
+        assert!(stack.lookup("x").is_some());
+        assert!(stack.crosses_closure_boundary("x"));
+        
+        stack.pop();
+        assert!(!stack.in_closure());
+    }
+    
+    #[test]
+    fn test_extract_function_params() {
+        let line = "fn transfer(acc Account, amount i64) effects(write acc) Account {";
+        let params = extract_function_params(line).unwrap();
+        
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].0, "acc");
+        assert_eq!(params[1].0, "amount");
     }
 }

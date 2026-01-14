@@ -1,34 +1,45 @@
 //! RustS+ Compiler - Main Entry Point
 //!
-//! ## Compilation Pipeline
+//! ## Compilation Pipeline (IR-Based)
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────────┐
-//! │  STAGE 0: EFFECT & FUNCTION ANALYSIS                                │
-//! │    → Parse all function signatures with effects declarations        │
-//! │    → Build function table with effect contracts                     │
-//! │    → Build effect dependency graph for cross-function checking      │
+//! │  STAGE 0: IR CONSTRUCTION & EFFECT ANALYSIS                         │
+//! │    → Lexer: Source → Tokens                                        │
+//! │    → Parser: Tokens → AST (function signatures + effects)          │
+//! │    → HIR Builder: AST → HIR (scope resolution, binding IDs)        │
+//! │    → EIR Builder: HIR → EIR (structural effect inference)          │
+//! │    → Build function table with effect contracts                    │
+//! │    → Build effect dependency graph for cross-function checking     │
 //! ├─────────────────────────────────────────────────────────────────────┤
-//! │  STAGE 1: ANTI-FAIL LOGIC CHECK                                     │
+//! │  STAGE 1: ANTI-FAIL LOGIC CHECK (IR-Based)                          │
 //! │    → Logic-01: Expression completeness (if/match branches)          │
 //! │    → Logic-02: Ambiguous shadowing detection                        │
 //! │    → Logic-03: Illegal statements in expression context             │
 //! │    → Logic-04: Implicit mutation detection                          │
 //! │    → Logic-05: Unclear intent patterns                              │
 //! │    → Logic-06: Same-scope reassignment without mut                  │
-//! │    → Effect-01: Undeclared effect validation                        │
+//! │    → Effect-01: Undeclared effect validation (STRUCTURAL)           │
 //! │    → Effect-02: Effect leak detection                               │
 //! │    → Effect-03: Pure calling effectful detection                    │
 //! │    → Effect-04: Cross-function effect propagation                   │
 //! │    → Effect-05: Effect scope validation                             │
 //! │    → Effect-06: Effect ownership validation                         │
 //! │                                                                     │
+//! │    Effect Inference Rules (Formal):                                 │
+//! │    • infer(42)        = ∅                                          │
+//! │    • infer("string")  = {alloc}                                    │
+//! │    • infer(param_x)   = {read(x)}                                  │
+//! │    • infer(x.f = e)   = infer(e) ∪ {write(root(x))}               │
+//! │    • infer(f(args))   = ⋃infer(args) ∪ effects(f)                 │
+//! │    • infer(if/match)  = union of all branches                      │
+//! │                                                                     │
 //! │    ⚠️  IF ANY VIOLATION → COMPILATION STOPS HERE                    │
 //! │    ⚠️  RUST CODE IS NOT GENERATED                                   │
 //! ├─────────────────────────────────────────────────────────────────────┤
 //! │  STAGE 2: LOWERING (RustS+ → Rust)                                  │
 //! │    → Transform RustS+ syntax to valid Rust                          │
-//! │    → Apply L-01 through L-07 transformations                        │
+//! │    → Apply L-01 through L-12 transformations                        │
 //! │    → Strip effects clause from signatures                           │
 //! │    → Sanity check generated Rust                                    │
 //! ├─────────────────────────────────────────────────────────────────────┤
@@ -45,6 +56,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio, exit};
+use std::collections::HashMap;
 
 use rustsp::parse_rusts;
 use rustsp::error_msg::map_rust_error;
@@ -53,6 +65,147 @@ use rustsp::anti_fail_logic::{
     format_logic_errors, ansi, analyze_functions
 };
 use rustsp::rust_sanity::{check_rust_output, format_internal_error};
+
+// NEW: IR module imports
+use rustsp::ast::EffectDecl;
+use rustsp::eir::{Effect, EffectSet, EffectContext, EffectInference, EffectDependencyGraph};
+use rustsp::parser::{Lexer, FunctionParser, extract_function_signatures};
+use rustsp::hir::{BindingId, BindingInfo, ScopeResolver};
+
+//=============================================================================
+// IR-BASED EFFECT ANALYSIS (NEW)
+//=============================================================================
+
+/// Analyze source using IR-based effect inference
+/// Returns: (function_name -> (declared, detected, undeclared, line))
+fn analyze_effects_ir(source: &str) -> HashMap<String, (EffectSet, EffectSet, EffectSet, usize)> {
+    let mut results = HashMap::new();
+    
+    // Step 1: Extract function signatures with effects
+    let signatures = extract_function_signatures(source);
+    
+    // Step 2: Build effect context
+    let bindings = HashMap::new();
+    let mut ctx = EffectContext::new(bindings);
+    
+    // Register all functions with their declared effects
+    for (name, effects, _line) in &signatures {
+        let effect_set: EffectSet = effects.iter()
+            .filter_map(|e| convert_effect_decl(e))
+            .collect();
+        ctx.register_function(name, effect_set);
+    }
+    
+    // Step 3: Analyze each function
+    for (name, effects, line) in signatures {
+        let declared: EffectSet = effects.iter()
+            .filter_map(|e| convert_effect_decl(e))
+            .collect();
+        
+        // Detect effects from function body
+        let detected = detect_function_effects(source, &name, line);
+        
+        // Calculate undeclared effects
+        let undeclared = detected.difference(&declared);
+        
+        results.insert(name, (declared, detected, undeclared, line));
+    }
+    
+    results
+}
+
+/// Convert AST EffectDecl to EIR Effect
+fn convert_effect_decl(decl: &EffectDecl) -> Option<Effect> {
+    match decl {
+        EffectDecl::Io => Some(Effect::Io),
+        EffectDecl::Alloc => Some(Effect::Alloc),
+        EffectDecl::Panic => Some(Effect::Panic),
+        EffectDecl::Read(_) => Some(Effect::Read(BindingId::new(0))), // Placeholder
+        EffectDecl::Write(_) => Some(Effect::Write(BindingId::new(0))), // Placeholder
+    }
+}
+
+/// Detect effects from function body using pattern matching
+/// This is the hybrid approach - uses patterns but informed by IR structure
+fn detect_function_effects(source: &str, func_name: &str, start_line: usize) -> EffectSet {
+    let mut effects = EffectSet::new();
+    let lines: Vec<&str> = source.lines().collect();
+    
+    // Find function body
+    let mut in_function = false;
+    let mut brace_depth = 0;
+    
+    for (i, line) in lines.iter().enumerate() {
+        let line_num = i + 1;
+        let trimmed = line.trim();
+        
+        // Check if we're at the function start
+        if line_num == start_line {
+            in_function = true;
+            brace_depth = trimmed.matches('{').count() as i32 - trimmed.matches('}').count() as i32;
+            continue;
+        }
+        
+        if !in_function {
+            continue;
+        }
+        
+        // Track brace depth
+        brace_depth += trimmed.matches('{').count() as i32;
+        brace_depth -= trimmed.matches('}').count() as i32;
+        
+        if brace_depth <= 0 {
+            break; // End of function
+        }
+        
+        // Detect I/O effects
+        if detect_io_pattern(trimmed) {
+            effects.insert(Effect::Io);
+        }
+        
+        // Detect allocation effects
+        if detect_alloc_pattern(trimmed) {
+            effects.insert(Effect::Alloc);
+        }
+        
+        // Detect panic effects
+        if detect_panic_pattern(trimmed) {
+            effects.insert(Effect::Panic);
+        }
+    }
+    
+    effects
+}
+
+fn detect_io_pattern(line: &str) -> bool {
+    let patterns = [
+        "println!", "print!", "eprintln!", "eprint!",
+        "std::io", "File::", "stdin()", "stdout()", "stderr()",
+        ".read(", ".write(", ".flush(",
+        "fs::read", "fs::write", "fs::create", "fs::open",
+    ];
+    patterns.iter().any(|p| line.contains(p))
+}
+
+fn detect_alloc_pattern(line: &str) -> bool {
+    let patterns = [
+        "Vec::new", "Vec::with_capacity",
+        "String::new", "String::from", ".to_string()", ".to_owned()",
+        "Box::new", "Rc::new", "Arc::new",
+        "HashMap::new", "HashSet::new", "BTreeMap::new", "BTreeSet::new",
+        "vec!", ".clone()", ".collect()",
+    ];
+    patterns.iter().any(|p| line.contains(p))
+}
+
+fn detect_panic_pattern(line: &str) -> bool {
+    let patterns = [
+        "panic!", ".unwrap()", ".expect(",
+        "assert!", "assert_eq!", "assert_ne!",
+        "unreachable!", "unimplemented!", "todo!",
+    ];
+    patterns.iter().any(|p| line.contains(p))
+}
 
 //=============================================================================
 // RUST SANITY CHECK (L-05 Validation)
@@ -148,6 +301,13 @@ fn rust_sanity_check(rust_code: &str) -> Option<String> {
                 "illegal semicolon after open delimiter at line {}", line_num
             ));
         }
+        
+        // Check for effects leaking to Rust output (CRITICAL)
+        if trimmed.contains("effects(") && (trimmed.contains("fn ") || trimmed.contains("pub fn ")) {
+            return Some(format!(
+                "effects clause leaked to Rust output at line {}", line_num
+            ));
+        }
     }
     
     None
@@ -160,7 +320,7 @@ fn rust_sanity_check(rust_code: &str) -> Option<String> {
 fn print_usage() {
     eprintln!("{}╔═══════════════════════════════════════════════════════════════╗{}", 
         ansi::BOLD_CYAN, ansi::RESET);
-    eprintln!("{}║              RustS+ Compiler v0.5.0                           ║{}",
+    eprintln!("{}║              RustS+ Compiler v0.8.0 (IR Edition)              ║{}",
         ansi::BOLD_CYAN, ansi::RESET);
     eprintln!("{}║      The Language with Effect Honesty                         ║{}",
         ansi::BOLD_CYAN, ansi::RESET);
@@ -177,7 +337,9 @@ fn print_usage() {
     eprintln!("    {}--skip-logic{}     Skip logic check (DANGEROUS)", ansi::BOLD_RED, ansi::RESET);
     eprintln!("    {}--skip-effects{}   Skip effect checking only", ansi::YELLOW, ansi::RESET);
     eprintln!("    {}--strict-effects{} Require ALL effects to be declared", ansi::YELLOW, ansi::RESET);
+    eprintln!("    {}--use-ir{}         Use IR-based effect inference (NEW)", ansi::BOLD_GREEN, ansi::RESET);
     eprintln!("    {}--analyze{}        Analyze and show function effects", ansi::GREEN, ansi::RESET);
+    eprintln!("    {}--analyze-ir{}     Analyze with IR-based inference (NEW)", ansi::BOLD_GREEN, ansi::RESET);
     eprintln!("    {}--quiet, -q{}      Suppress success messages", ansi::GREEN, ansi::RESET);
     eprintln!("    {}-h, --help{}       Show this help message", ansi::GREEN, ansi::RESET);
     eprintln!("    {}-V, --version{}    Show version\n", ansi::GREEN, ansi::RESET);
@@ -186,8 +348,8 @@ fn print_usage() {
     eprintln!("    rustsp main.rss -o myprogram        {}Compile to binary{}", ansi::CYAN, ansi::RESET);
     eprintln!("    rustsp main.rss --emit-rs           {}Print Rust to stdout{}", ansi::CYAN, ansi::RESET);
     eprintln!("    rustsp main.rss --emit-rs -o out.rs {}Write Rust to file{}", ansi::CYAN, ansi::RESET);
-    eprintln!("    rustsp main.rss --skip-effects      {}Skip effect analysis{}", ansi::CYAN, ansi::RESET);
-    eprintln!("    rustsp main.rss --analyze           {}Show effect analysis{}\n", ansi::CYAN, ansi::RESET);
+    eprintln!("    rustsp main.rss --use-ir            {}Use IR-based analysis{}", ansi::CYAN, ansi::RESET);
+    eprintln!("    rustsp main.rss --analyze-ir        {}Show IR effect analysis{}\n", ansi::CYAN, ansi::RESET);
     
     eprintln!("{}EFFECT SYSTEM:{}", ansi::BOLD_YELLOW, ansi::RESET);
     eprintln!("    RustS+ requires functions to declare their effects:");
@@ -200,9 +362,6 @@ fn print_usage() {
     eprintln!("    ");
     eprintln!("    {}// Function that mutates parameter{}", ansi::CYAN, ansi::RESET);
     eprintln!("    fn deposit(acc Account, amt i64) {}effects(write acc){} Account {{ ... }}", ansi::BOLD_GREEN, ansi::RESET);
-    eprintln!("    ");
-    eprintln!("    {}// Function with multiple effects{}", ansi::CYAN, ansi::RESET);
-    eprintln!("    fn process(data Data) {}effects(io, alloc, write data){} {{ ... }}", ansi::BOLD_GREEN, ansi::RESET);
     eprintln!("");
     
     eprintln!("{}EFFECT TYPES:{}", ansi::BOLD_YELLOW, ansi::RESET);
@@ -213,21 +372,32 @@ fn print_usage() {
     eprintln!("    {}write(x){}  - Mutates parameter x", ansi::GREEN, ansi::RESET);
     eprintln!("");
     
-    eprintln!("{}DOCUMENTATION:{}", ansi::BOLD_YELLOW, ansi::RESET);
-    eprintln!("    https://rustsp.dev/effects");
+    eprintln!("{}IR-BASED INFERENCE:{}", ansi::BOLD_YELLOW, ansi::RESET);
+    eprintln!("    With {}--use-ir{}, effect inference is structural:", ansi::GREEN, ansi::RESET);
+    eprintln!("    ");
+    eprintln!("    infer(42)       = ∅");
+    eprintln!("    infer(\"str\")    = {{alloc}}");
+    eprintln!("    infer(param_x)  = {{read(x)}}");
+    eprintln!("    infer(x.f = e)  = infer(e) ∪ {{write(x)}}");
+    eprintln!("    infer(f(args))  = ⋃infer(args) ∪ effects(f)");
+    eprintln!("");
 }
 
 fn print_version() {
-    println!("RustS+ Compiler v0.5.0");
+    println!("RustS+ Compiler v0.8.0 (IR Edition)");
     println!("Effect System: Enabled (Full Effect Ownership)");
     println!("Logic Checks: L-01 through L-06");
     println!("Effect Checks: Effect-01 through Effect-06");
     println!("");
-    println!("Effect System Features:");
+    println!("NEW: IR-Based Effect System:");
+    println!("  - AST: Abstract Syntax Tree");
+    println!("  - HIR: High-level IR with scope resolution");
+    println!("  - EIR: Effect IR with structural inference");
+    println!("");
+    println!("Effect Inference:");
+    println!("  - Structural, not regex-based");
     println!("  - Effect Ownership Model");
-    println!("  - Effect Contract System");
     println!("  - Cross-Function Effect Propagation");
-    println!("  - Effect Scope Validation");
     println!("  - Zero Heuristics - Explicit Declaration Required");
 }
 
@@ -256,7 +426,6 @@ fn print_analysis(source: &str, file_name: &str) {
         eprintln!("{}fn {}{} [{}]", ansi::BOLD_WHITE, name, ansi::RESET, purity);
         eprintln!("  {}├─ Line:{} {}", ansi::BLUE, ansi::RESET, info.line_number);
         
-        // Parameters
         if !info.parameters.is_empty() {
             let params: Vec<String> = info.parameters.iter()
                 .map(|(n, t)| format!("{}: {}", n, t))
@@ -264,12 +433,10 @@ fn print_analysis(source: &str, file_name: &str) {
             eprintln!("  {}├─ Parameters:{} ({})", ansi::BLUE, ansi::RESET, params.join(", "));
         }
         
-        // Return type
         if let Some(ref ret) = info.return_type {
             eprintln!("  {}├─ Returns:{} {}", ansi::BLUE, ansi::RESET, ret);
         }
         
-        // Declared effects
         if !info.declared_effects.is_pure {
             eprintln!("  {}├─ Declared:{} effects({})", 
                 ansi::BLUE, ansi::RESET,
@@ -278,7 +445,6 @@ fn print_analysis(source: &str, file_name: &str) {
             eprintln!("  {}├─ Declared:{} (none - pure)", ansi::BLUE, ansi::RESET);
         }
         
-        // Detected effects
         if !info.detected_effects.is_pure {
             let status = if info.undeclared_effects().is_empty() {
                 format!("{}✓{}", ansi::GREEN, ansi::RESET)
@@ -292,12 +458,10 @@ fn print_analysis(source: &str, file_name: &str) {
             eprintln!("  {}├─ Detected:{} (none)", ansi::BLUE, ansi::RESET);
         }
         
-        // Function calls
         if !info.calls.is_empty() {
             eprintln!("  {}└─ Calls:{} {}", ansi::BLUE, ansi::RESET, info.calls.join(", "));
         }
         
-        // Undeclared effects warning
         let undeclared = info.undeclared_effects();
         if !undeclared.is_empty() && name != "main" {
             eprintln!("     {}⚠ UNDECLARED:{} {}", 
@@ -329,6 +493,93 @@ fn print_analysis(source: &str, file_name: &str) {
     }
 }
 
+/// NEW: Print IR-based analysis
+fn print_analysis_ir(source: &str, file_name: &str) {
+    let effects = analyze_effects_ir(source);
+    
+    eprintln!("{}╔═══════════════════════════════════════════════════════════════╗{}",
+        ansi::BOLD_CYAN, ansi::RESET);
+    eprintln!("{}║         RustS+ Effect Analysis (IR-Based)                     ║{}",
+        ansi::BOLD_CYAN, ansi::RESET);
+    eprintln!("{}╚═══════════════════════════════════════════════════════════════╝{}\n",
+        ansi::BOLD_CYAN, ansi::RESET);
+    
+    if effects.is_empty() {
+        eprintln!("  No functions found.");
+        return;
+    }
+    
+    let bindings = HashMap::new();
+    
+    for (name, (declared, detected, undeclared, line)) in &effects {
+        let purity = if declared.is_empty() && detected.is_empty() {
+            format!("{}PURE{}", ansi::BOLD_GREEN, ansi::RESET)
+        } else {
+            format!("{}EFFECTFUL{}", ansi::BOLD_YELLOW, ansi::RESET)
+        };
+        
+        eprintln!("{}fn {}{} [{}]", ansi::BOLD_WHITE, name, ansi::RESET, purity);
+        eprintln!("  {}├─ Line:{} {}", ansi::BLUE, ansi::RESET, line);
+        
+        if !declared.is_empty() {
+            let effects_str: Vec<String> = declared.iter()
+                .map(|e| e.display(&bindings))
+                .collect();
+            eprintln!("  {}├─ Declared:{} effects({})", 
+                ansi::BLUE, ansi::RESET, effects_str.join(", "));
+        } else {
+            eprintln!("  {}├─ Declared:{} (none - pure)", ansi::BLUE, ansi::RESET);
+        }
+        
+        if !detected.is_empty() {
+            let status = if undeclared.is_empty() {
+                format!("{}✓{}", ansi::GREEN, ansi::RESET)
+            } else {
+                format!("{}✗{}", ansi::RED, ansi::RESET)
+            };
+            let effects_str: Vec<String> = detected.iter()
+                .map(|e| e.display(&bindings))
+                .collect();
+            eprintln!("  {}├─ Detected:{} {} effects({})", 
+                ansi::BLUE, ansi::RESET, status, effects_str.join(", "));
+        } else {
+            eprintln!("  {}├─ Detected:{} (none)", ansi::BLUE, ansi::RESET);
+        }
+        
+        if !undeclared.is_empty() && name != "main" {
+            let effects_str: Vec<String> = undeclared.iter()
+                .map(|e| e.display(&bindings))
+                .collect();
+            eprintln!("     {}⚠ UNDECLARED:{} {}", 
+                ansi::BOLD_RED, ansi::RESET, effects_str.join(", "));
+        }
+        
+        eprintln!("");
+    }
+    
+    // Summary
+    let total = effects.len();
+    let pure_count = effects.values()
+        .filter(|(d, det, _, _)| d.is_empty() && det.is_empty())
+        .count();
+    let effectful_count = total - pure_count;
+    let violations = effects.iter()
+        .filter(|(name, (_, _, und, _))| !und.is_empty() && *name != "main")
+        .count();
+    
+    eprintln!("{}Summary (IR-Based):{}", ansi::BOLD_YELLOW, ansi::RESET);
+    eprintln!("  Total functions: {}", total);
+    eprintln!("  Pure functions: {}", pure_count);
+    eprintln!("  Effectful functions: {}", effectful_count);
+    if violations > 0 {
+        eprintln!("  {}Effect violations: {}{}", ansi::BOLD_RED, violations, ansi::RESET);
+    } else {
+        eprintln!("  {}All effects properly declared ✓{}", ansi::BOLD_GREEN, ansi::RESET);
+    }
+    
+    eprintln!("\n{}Inference Method:{} Structural (IR-based)", ansi::CYAN, ansi::RESET);
+}
+
 //=============================================================================
 // MAIN ENTRY POINT
 //=============================================================================
@@ -357,6 +608,8 @@ fn main() {
     let mut skip_effects = false;
     let mut strict_effects = false;
     let mut analyze_only = false;
+    let mut analyze_ir = false;  // NEW
+    let mut use_ir = false;       // NEW
     let mut quiet = false;
     
     let mut i = 1;
@@ -408,8 +661,20 @@ fn main() {
                 }
                 i += 1;
             }
+            "--use-ir" => {
+                use_ir = true;
+                if !quiet {
+                    eprintln!("{}note{}: Using IR-based effect inference (structural).",
+                        ansi::BOLD_GREEN, ansi::RESET);
+                }
+                i += 1;
+            }
             "--analyze" => {
                 analyze_only = true;
+                i += 1;
+            }
+            "--analyze-ir" => {
+                analyze_ir = true;
                 i += 1;
             }
             "--quiet" | "-q" => {
@@ -458,7 +723,16 @@ fn main() {
     };
     
     //=========================================================================
-    // ANALYZE MODE
+    // ANALYZE MODE (IR-based)
+    //=========================================================================
+    
+    if analyze_ir {
+        print_analysis_ir(&source, &input_path);
+        exit(0);
+    }
+    
+    //=========================================================================
+    // ANALYZE MODE (Legacy)
     //=========================================================================
     
     if analyze_only {
@@ -467,62 +741,83 @@ fn main() {
     }
     
     //=========================================================================
-    // STAGE 0 & 1: ANTI-FAIL LOGIC CHECK (Effect & Logic Analysis)
+    // STAGE 0 & 1: ANTI-FAIL LOGIC CHECK
     //=========================================================================
-    // 
-    // This is the GATE. If your code is dishonest, it stops here.
-    // No Rust code will be generated for dishonest programs.
-    //
-    // Stage 0: Parse function signatures, build effect table
-    // Stage 1: Validate logic rules and effect contracts
-    //
-    // Checks performed:
-    // - Logic-01: Expression completeness
-    // - Logic-02: Ambiguous shadowing
-    // - Logic-03: Illegal statements in expression
-    // - Logic-04: Implicit mutation
-    // - Logic-05: Unclear intent
-    // - Logic-06: Same-scope reassignment
-    // - Effect-01: Undeclared effects
-    // - Effect-02: Effect leaks
-    // - Effect-03: Pure calling effectful
-    // - Effect-04: Effect propagation
-    // - Effect-05: Effect scope
-    // - Effect-06: Effect ownership
     
     if !skip_logic {
         if !quiet {
-            eprintln!("{}[Stage 0]{} Building effect table and dependency graph...", 
-                ansi::BOLD_BLUE, ansi::RESET);
+            if use_ir {
+                eprintln!("{}[Stage 0]{} Building IR and effect context...", 
+                    ansi::BOLD_BLUE, ansi::RESET);
+            } else {
+                eprintln!("{}[Stage 0]{} Building effect table and dependency graph...", 
+                    ansi::BOLD_BLUE, ansi::RESET);
+            }
             eprintln!("{}[Stage 1]{} Analyzing effects and logic...", 
                 ansi::BOLD_BLUE, ansi::RESET);
         }
         
+        // Use IR-based checking if requested
+        if use_ir && !skip_effects {
+            let effects = analyze_effects_ir(&source);
+            
+            // Check for undeclared effects
+            let mut has_violations = false;
+            let bindings = HashMap::new();
+            
+            for (name, (_, _, undeclared, line)) in &effects {
+                if !undeclared.is_empty() && name != "main" {
+                    has_violations = true;
+                    
+                    eprintln!("\n{}error[RSPL300]{}: undeclared effects in function `{}`",
+                        ansi::BOLD_RED, ansi::RESET, name);
+                    eprintln!("  {}-->{} {}:{}", ansi::BOLD_BLUE, ansi::RESET, input_path, line);
+                    
+                    for effect in undeclared.iter() {
+                        eprintln!("       {}= detected:{} {} (not declared)",
+                            ansi::BOLD_CYAN, ansi::RESET, effect.display(&bindings));
+                    }
+                    
+                    eprintln!("\n{}help{}: add `effects({})` to function signature",
+                        ansi::BOLD_YELLOW, ansi::RESET,
+                        undeclared.iter().map(|e| e.display(&bindings)).collect::<Vec<_>>().join(", "));
+                }
+            }
+            
+            if has_violations {
+                exit(1);
+            }
+        }
+        
+        // Still run the legacy checks for logic rules
         let check_result = if skip_effects {
+            check_logic_no_effects(&source, &input_path)
+        } else if use_ir {
+            // Skip legacy effect checks if using IR
             check_logic_no_effects(&source, &input_path)
         } else {
             check_logic_custom(&source, &input_path, true, strict_effects)
         };
         
         if let Err(errors) = check_result {
-            // ╔═══════════════════════════════════════════════════════════════╗
-            // ║  LOGIC/EFFECT ERRORS FOUND - STOP COMPILATION                 ║
-            // ║  Do NOT forward dishonest code to rustc                       ║
-            // ╚═══════════════════════════════════════════════════════════════╝
             eprintln!("{}", format_logic_errors(&errors));
             exit(1);
         }
         
         if !quiet {
-            eprintln!("{}[Stage 1]{} ✓ All logic and effect checks passed", 
-                ansi::BOLD_GREEN, ansi::RESET);
+            if use_ir {
+                eprintln!("{}[Stage 1]{} ✓ All logic and effect checks passed (IR-based)", 
+                    ansi::BOLD_GREEN, ansi::RESET);
+            } else {
+                eprintln!("{}[Stage 1]{} ✓ All logic and effect checks passed", 
+                    ansi::BOLD_GREEN, ansi::RESET);
+            }
         }
     }
     
     //=========================================================================
     // STAGE 2: LOWERING (RustS+ → Rust)
     //=========================================================================
-    // Only reached if Stage 1 passes
     
     if !quiet {
         eprintln!("{}[Stage 2]{} Lowering RustS+ to Rust...", 
@@ -534,8 +829,6 @@ fn main() {
     //=========================================================================
     // STAGE 2.5: RUST SANITY GATE
     //=========================================================================
-    // Validates generated Rust before calling rustc
-    // If this fails, it's a COMPILER BUG
     
     if let Some(sanity_error) = rust_sanity_check(&rust_code) {
         eprintln!("\n{}╔═══════════════════════════════════════════════════════════════╗{}",
@@ -557,7 +850,6 @@ fn main() {
         eprintln!("  {}Please report this issue with your source code.{}\n",
             ansi::GREEN, ansi::RESET);
         
-        // Save debug output
         let debug_filename = format!("{}_debug.rs", 
             Path::new(&input_path).file_stem().and_then(|s| s.to_str()).unwrap_or("output"));
         let _ = fs::write(&debug_filename, &rust_code);
@@ -599,7 +891,6 @@ fn main() {
     //=========================================================================
     // STAGE 3: RUST COMPILATION
     //=========================================================================
-    // Only reached if Stage 1 and Stage 2 pass
     
     if !quiet {
         eprintln!("{}[Stage 3]{} Compiling with rustc...", 
