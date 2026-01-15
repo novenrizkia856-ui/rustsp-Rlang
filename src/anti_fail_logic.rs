@@ -1051,30 +1051,102 @@ impl EffectAnalyzer {
     }
     
     fn detect_param_mutation(&self, line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX: Skip struct field initialization
+        // ═══════════════════════════════════════════════════════════════════════
+        // 
+        // Pattern `from = from.address` inside struct literal is NOT mutation.
+        // It's field initialization where:
+        // - `from` (left side) is the FIELD NAME of the struct
+        // - `from.address` (right side) is reading from parameter
+        //
+        // We should ONLY detect mutation when:
+        // 1. `param.field = value` (direct field mutation)
+        // 2. `param = value` at TOP LEVEL (not inside struct literal)
+        // ═══════════════════════════════════════════════════════════════════════
+        
+        // Skip if line looks like struct field initialization (has comma at end or is indented field)
+        // Struct field init patterns: "fieldname = value" or "fieldname = value,"
+        // These are typically indented and may end with comma
+        
         // Check for parameter field mutation: `param.field = value`
         for (param, _ty) in &self.parameters {
-            // Pattern: `param.field = `
+            // Pattern 1: `param.field = ` (this IS mutation)
             let field_assign_pattern = format!("{}.", param);
-            if line.contains(&field_assign_pattern) {
-                // Find if there's an assignment to a field
-                let after_param = line.split(&field_assign_pattern).nth(1)?;
-                if after_param.contains('=') && 
-                   !after_param.contains("==") && 
-                   !after_param.contains("!=") &&
-                   !after_param.starts_with('=') {
-                    return Some(param.clone());
+            if trimmed.contains(&field_assign_pattern) {
+                // Check if there's assignment after the field access
+                if let Some(dot_pos) = trimmed.find(&field_assign_pattern) {
+                    let after_dot = &trimmed[dot_pos + field_assign_pattern.len()..];
+                    // Look for pattern: fieldname = value (but not ==)
+                    // This means: param.fieldname = value
+                    let mut found_field = false;
+                    let mut in_field_name = true;
+                    let mut chars_iter = after_dot.chars().peekable();
+                    
+                    while let Some(c) = chars_iter.next() {
+                        if in_field_name {
+                            if c.is_alphanumeric() || c == '_' {
+                                found_field = true;
+                                continue;
+                            }
+                            if c == ' ' && found_field {
+                                in_field_name = false;
+                                continue;
+                            }
+                            if c == '=' && found_field {
+                                // Check it's not ==
+                                if chars_iter.peek() != Some(&'=') {
+                                    return Some(param.clone());
+                                }
+                            }
+                            break;
+                        } else {
+                            // After field name, look for =
+                            if c == '=' {
+                                if chars_iter.peek() != Some(&'=') {
+                                    return Some(param.clone());
+                                }
+                            }
+                            if !c.is_whitespace() && c != '=' {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             
-            // Pattern: `param = ` (direct reassignment of param)
+            // Pattern 2: Direct reassignment `param = value` at TOP LEVEL ONLY
+            // This should NOT match struct field init like `from = from.address`
+            // 
+            // Key insight: In struct field init, the LEFT side of `=` is the FIELD name,
+            // which may happen to have the same name as a parameter. But this is NOT mutation.
+            //
+            // We only consider it mutation if:
+            // - Line STARTS with `param = ` (it's a standalone statement)
+            // - NOT inside a struct literal context
+            //
+            // Heuristic: If the line doesn't start with the param name, it's probably
+            // inside a struct literal as a field initializer.
+            
             let direct_pattern = format!("{} =", param);
             let direct_pattern2 = format!("{}=", param);
-            if (line.trim().starts_with(&direct_pattern) || line.contains(&format!(" {}", direct_pattern))) 
-               && !line.contains("==") && !line.contains("!=") {
-                return Some(param.clone());
+            
+            // Only match if line STARTS with the pattern (not inside struct literal)
+            if trimmed.starts_with(&direct_pattern) && 
+               !trimmed.contains("==") && !trimmed.contains("!=") {
+                // Make sure it's not a struct field init by checking context
+                // If line ends with comma or is inside braces, it's likely field init
+                if !trimmed.ends_with(',') {
+                    return Some(param.clone());
+                }
             }
-            if line.trim().starts_with(&direct_pattern2) && !line.contains("==") {
-                return Some(param.clone());
+            if trimmed.starts_with(&direct_pattern2) && 
+               !trimmed.contains("==") && !trimmed.contains("!=") {
+                if !trimmed.ends_with(',') {
+                    return Some(param.clone());
+                }
             }
         }
         None
@@ -1285,6 +1357,10 @@ pub struct AntiFailLogicChecker {
     // Expression context tracking (NEW - for fixing enum constructor bug)
     expression_context: ExpressionContextStack,
     
+    // Struct literal tracking - tracks when we're inside a struct literal
+    // This is critical for distinguishing `field = value` from `var = value`
+    in_struct_literal_depth: usize,
+    
     // Error collection
     errors: Vec<RsplError>,
     file_name: String,
@@ -1317,6 +1393,7 @@ impl AntiFailLogicChecker {
             brace_depth: 0,
             control_flow_stack: Vec::new(),
             expression_context: ExpressionContextStack::new(),
+            in_struct_literal_depth: 0,
             errors: Vec::new(),
             file_name: file_name.to_string(),
             source_lines: Vec::new(),
@@ -1484,18 +1561,16 @@ impl AntiFailLogicChecker {
         let closes = self.count_close_braces(trimmed);
         
         // ═══════════════════════════════════════════════════════════════════════
-        // FIX: Detect struct/enum literals to avoid creating scope for them
+        // FIX: Detect struct/enum literals (single-line and multi-line)
         // ═══════════════════════════════════════════════════════════════════════
-        // 
-        // Struct/enum literal patterns that should NOT create a new scope:
-        // - `mut x = Type { field = value }` (assignment with struct literal)
-        // - `Type::Variant { field = value }` (enum constructor)
-        // - `func(Type { field = value })` (struct as function arg)
-        //
-        // Key heuristic: If `{` and `}` are on same line AND there's content
-        // before `{` (like `= Type` or `Type::Variant`), it's likely a literal.
-        // ═══════════════════════════════════════════════════════════════════════
-        let is_struct_literal = self.is_struct_or_enum_literal(trimmed);
+        let is_struct_literal_start = self.is_struct_literal_start(trimmed);
+        let is_struct_literal_single = self.is_struct_or_enum_literal(trimmed);
+        
+        // Track struct literal depth for multiline struct literals
+        if is_struct_literal_start && !is_struct_literal_single {
+            // Multiline struct literal starting
+            self.in_struct_literal_depth += opens;
+        }
         
         // Function start detection
         if self.is_function_start(trimmed) {
@@ -1506,7 +1581,9 @@ impl AntiFailLogicChecker {
             
             if is_closure {
                 self.effect_analyzer.enter_closure(self.brace_depth + opens, line_num);
-            } else if !is_control_flow && !self.is_definition(trimmed) && !is_struct_literal {
+            } else if !is_control_flow && !self.is_definition(trimmed) && 
+                      !is_struct_literal_single && !is_struct_literal_start &&
+                      self.in_struct_literal_depth == 0 {
                 // Only create scope if NOT a struct/enum literal
                 for _ in 0..opens {
                     self.enter_scope(false, line_num);
@@ -1521,8 +1598,10 @@ impl AntiFailLogicChecker {
         self.check_illegal_statement(trimmed, line_num);
         
         // Logic-02 & Logic-04 & Logic-06: Check assignments
-        // NOW WITH EXPRESSION CONTEXT AWARENESS
-        self.check_assignment(trimmed, line_num);
+        // SKIP if we're inside a struct literal
+        if self.in_struct_literal_depth == 0 && !is_struct_literal_single {
+            self.check_assignment(trimmed, line_num);
+        }
         
         // Logic-05: Check unclear intent
         if self.strict_mode {
@@ -1531,38 +1610,47 @@ impl AntiFailLogicChecker {
         
         // Effect analysis (if in function)
         if self.in_function && self.effect_checking_enabled {
-            self.effect_analyzer.analyze_line(trimmed, line_num);
+            // Skip effect analysis for struct literal field initializations
+            if self.in_struct_literal_depth == 0 && !is_struct_literal_single {
+                self.effect_analyzer.analyze_line(trimmed, line_num);
+            }
         }
         
         // ═══════════════════════════════════════════════════════════════════════
         // FIX: Handle brace depth and scope for struct literals correctly
         // ═══════════════════════════════════════════════════════════════════════
         // 
-        // For struct literals on a single line like `x = Type { field = value }`:
-        // - The braces are balanced (opens == closes)
-        // - These braces should NOT affect scope tracking
-        // - But they may need to affect brace_depth for other purposes
+        // For struct literals:
+        // - Single-line: `x = Type { field = value }` - balanced braces, no scope change
+        // - Multi-line start: `x = Type {` - enter struct literal context
+        // - Multi-line end: `}` - exit struct literal context
         //
-        // Key insight: If braces are balanced AND it's a struct literal,
-        // the net effect on scope should be zero.
+        // We track struct_literal_depth to handle multiline cases
         // ═══════════════════════════════════════════════════════════════════════
         
+        // Handle closes first for struct literal depth tracking
+        if closes > 0 && self.in_struct_literal_depth > 0 {
+            self.in_struct_literal_depth = self.in_struct_literal_depth.saturating_sub(closes);
+        }
+        
         // Calculate net brace change for struct literals
-        let net_opens = if is_struct_literal && opens == closes {
-            // Balanced struct literal - don't affect brace_depth or scope
+        let in_struct_context = is_struct_literal_single || is_struct_literal_start || self.in_struct_literal_depth > 0;
+        
+        let net_opens = if is_struct_literal_single && opens == closes {
+            // Balanced struct literal on one line - don't affect brace_depth or scope
             0
-        } else if is_struct_literal {
-            // Unbalanced struct literal (rare) - handle carefully
-            // This would be like `x = Type {` on one line and `}` on another
-            if opens > closes { opens - closes } else { 0 }
+        } else if in_struct_context {
+            // Inside or starting struct literal - don't create scopes but track depth
+            0
         } else {
             opens
         };
         
-        let net_closes = if is_struct_literal && opens == closes {
+        let net_closes = if is_struct_literal_single && opens == closes {
             0
-        } else if is_struct_literal {
-            if closes > opens { closes - opens } else { 0 }
+        } else if in_struct_context && closes > 0 {
+            // Closing struct literal - don't pop scopes
+            0
         } else {
             closes
         };
@@ -2206,6 +2294,59 @@ impl AntiFailLogicChecker {
     //=========================================================================
     // HELPER FUNCTIONS
     //=========================================================================
+    
+    /// Detect if line STARTS a struct or enum literal (multiline case)
+    /// 
+    /// Pattern: `x = Type {` without closing brace on same line
+    fn is_struct_literal_start(&self, line: &str) -> bool {
+        let trimmed = line.trim();
+        
+        // Must contain `{` but NOT `}` (multiline start)
+        let has_open = trimmed.contains('{');
+        let has_close = trimmed.contains('}');
+        
+        if !has_open || has_close {
+            return false;
+        }
+        
+        // Find position of first `{`
+        let brace_pos = match trimmed.find('{') {
+            Some(p) => p,
+            None => return false,
+        };
+        
+        // If `{` is at the very start, it's likely a block, not a literal
+        if brace_pos == 0 {
+            return false;
+        }
+        
+        let before_brace = trimmed[..brace_pos].trim();
+        
+        // Check if there's a type name before `{`
+        if let Some(last_word) = before_brace.split_whitespace().last() {
+            let first_char = last_word.chars().next().unwrap_or('_');
+            
+            // If last word before `{` starts with uppercase, likely struct/enum
+            if first_char.is_uppercase() {
+                return true;
+            }
+            
+            // Also check for Type::Variant pattern
+            if last_word.contains("::") {
+                let parts: Vec<&str> = last_word.split("::").collect();
+                if parts.len() >= 2 {
+                    let type_part = parts[0];
+                    let variant_part = parts.last().unwrap_or(&"");
+                    if type_part.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) &&
+                       variant_part.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        false
+    }
     
     /// Detect if line contains a struct or enum literal (not a block scope)
     /// 
