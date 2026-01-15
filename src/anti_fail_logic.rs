@@ -2109,6 +2109,32 @@ impl AntiFailLogicChecker {
         }
         
         // ═══════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX: Skip struct field initialization
+        // ═══════════════════════════════════════════════════════════════════════
+        // 
+        // Pattern: `fieldname = value,` or `fieldname = value` inside struct literal
+        //
+        // Heuristics to detect struct field init:
+        // 1. Line ends with `,` (struct fields are comma-separated)
+        // 2. Line has `=` but not `==` or `!=`
+        // 3. NOT a regular assignment (no `outer`, `mut`, `let` prefix)
+        // 4. The left side of `=` is a simple identifier (field name)
+        // 5. Context: We're likely in a struct literal if indented and follows pattern
+        //
+        // Examples that should be SKIPPED:
+        //   `merkle_root = header.merkle_root,`  (struct field init)
+        //   `version = 1,`                        (struct field init)
+        //   `nonce = nonce`                       (struct field init - no comma but same pattern)
+        //
+        // Examples that should NOT be skipped:
+        //   `x = 10`                              (variable assignment)
+        //   `mut x = 10`                          (mutable declaration)
+        // ═══════════════════════════════════════════════════════════════════════
+        if self.looks_like_struct_field_init(trimmed) {
+            return;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
         // CRITICAL FIX: Skip macro calls
         // ═══════════════════════════════════════════════════════════════════════
         // Macro calls like `println!("x = 5")` contain `=` but are NOT assignments.
@@ -2419,6 +2445,93 @@ impl AntiFailLogicChecker {
                     return true;
                 }
             }
+        }
+        
+        false
+    }
+    
+    /// Detect if line looks like struct field initialization
+    /// 
+    /// Pattern: `fieldname = value,` or `fieldname = value` inside struct literal
+    /// 
+    /// Key heuristics:
+    /// - Line ends with `,` (strong indicator of struct field)
+    /// - Contains `=` but not `==` or `!=`
+    /// - NOT a regular assignment prefix (`outer`, `mut`, `let`)
+    /// - Left side of `=` is simple identifier (not complex expression)
+    fn looks_like_struct_field_init(&self, line: &str) -> bool {
+        let trimmed = line.trim();
+        
+        // Skip if it's a regular assignment pattern
+        if trimmed.starts_with("outer ") || 
+           trimmed.starts_with("mut ") || 
+           trimmed.starts_with("let ") {
+            return false;
+        }
+        
+        // Must contain `=` but not comparison operators
+        if !trimmed.contains('=') || trimmed.contains("==") || trimmed.contains("!=") {
+            return false;
+        }
+        
+        // Strong indicator: ends with comma (struct fields are comma-separated)
+        let ends_with_comma = trimmed.ends_with(',');
+        
+        // Find the `=` position
+        let eq_pos = match trimmed.find('=') {
+            Some(p) => p,
+            None => return false,
+        };
+        
+        // Make sure it's not `<=` or `>=`
+        if eq_pos > 0 {
+            let before_eq = trimmed.chars().nth(eq_pos - 1);
+            if before_eq == Some('<') || before_eq == Some('>') || before_eq == Some('!') {
+                return false;
+            }
+        }
+        
+        let left_side = trimmed[..eq_pos].trim();
+        let right_side = trimmed[eq_pos + 1..].trim().trim_end_matches(',');
+        
+        // Left side should be simple identifier (struct field name)
+        // - Single word
+        // - No dots (not field access like `obj.field`)
+        // - No colons (not type annotation)
+        // - No parentheses (not function call)
+        if left_side.contains('.') || 
+           left_side.contains(':') || 
+           left_side.contains('(') ||
+           left_side.contains(' ') {
+            return false;
+        }
+        
+        // Check if left side is valid identifier
+        let is_valid_identifier = !left_side.is_empty() && 
+            left_side.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) &&
+            left_side.chars().all(|c| c.is_alphanumeric() || c == '_');
+        
+        if !is_valid_identifier {
+            return false;
+        }
+        
+        // If ends with comma, very likely struct field init
+        if ends_with_comma {
+            return true;
+        }
+        
+        // Additional heuristic: If right side references same field pattern (like `field = other.field`)
+        // and we're likely inside a struct literal (based on depth tracking)
+        if self.in_struct_literal_depth > 0 {
+            return true;
+        }
+        
+        // Heuristic: If right side looks like field access or method call, probably struct init
+        // e.g., `version = header.version` or `nonce = nonce`
+        if right_side.contains('.') || left_side == right_side {
+            // Could be struct field init like `nonce = nonce` (shorthand would be just `nonce,`)
+            // Being conservative here - only if we have other evidence
+            return false;
         }
         
         false
