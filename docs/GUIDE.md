@@ -1,4 +1,4 @@
-# RustS+ Language Specification v0.8
+# RustS+ Language Specification v0.9
 
 > **RustS+** adalah superset Rust yang dirancang untuk mencegah **bug logika** dengan tingkat keseriusan yang sama seperti Rust mencegah **bug memori**. Dokumen ini adalah **spesifikasi normatif** — setiap aturan di sini di-enforce oleh compiler.
 
@@ -47,6 +47,40 @@ RustS+ menerapkan filosofi **"Honest Code Only"**:
 - Jika modifikasi variabel outer scope → **WAJIB** menggunakan `outer`
 
 Kode yang melanggar aturan ini **TIDAK AKAN** diteruskan ke Rust compiler.
+
+### 1.3 Semantic Compiler, Bukan Text Transformer
+
+RustS+ **bukan** sekadar "bahasa dengan sintaks baru" yang ditransform via regex. RustS+ adalah **sistem formal untuk menjamin kebenaran makna program**.
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│  MISCONCEPTION: RustS+ adalah regex/text transformer               │
+│  ─────────────────────────────────────────────────────────────    │
+│  ❌ Source → Regex Replace → Rust                                  │
+│                                                                    │
+│  REALITY: RustS+ adalah semantic compiler                          │
+│  ─────────────────────────────────────────────────────────────    │
+│  ✅ Source → AST → HIR → EIR → Validated Rust                      │
+│              ↑      ↑     ↑                                        │
+│           struktur makna effect                                    │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+**Mengapa ini penting?**
+
+| Approach | Problem |
+|----------|---------|
+| Regex-based | Tidak memahami context, mudah salah parse |
+| AST-only | Tidak memahami scope dan binding resolution |
+| **HIR + EIR** | Memahami **makna** dan **effect** secara formal |
+
+RustS+ membangun **tiga layer IR**:
+
+1. **AST (Abstract Syntax Tree)** - Struktur sintaks
+2. **HIR (High-level IR)** - Resolved bindings, scope, mutability  
+3. **EIR (Effect IR)** - Effect inference, propagation, ownership
+
+Dengan arsitektur ini, RustS+ dapat mendeteksi kesalahan **semantik** (bukan hanya sintaks) sebelum satu baris Rust pun dihasilkan.
 
 ---
 
@@ -471,6 +505,183 @@ Fungsi `main()` **diizinkan** memiliki implicit `io` effect untuk kenyamanan.
 ```rust
 fn main() {
     println("Hello")    // OK - main() memiliki implicit io
+}
+```
+
+### 5.8 Effect Inference: Bagaimana Compiler Mendeteksi Effect
+
+RustS+ menggunakan **Effect Inference Algorithm** yang berjalan di atas HIR (High-level IR). Ini **bukan regex/text matching** — compiler memahami struktur program secara formal.
+
+#### Aturan Inferensi Effect
+
+| Ekspresi | Effect yang Diinfer | Penjelasan |
+|----------|--------------------|-----------| 
+| `42`, `"hello"`, `true` | ∅ (kosong) | Literal tidak punya efek |
+| `x` (baca variabel) | `read(x)` | Membaca binding |
+| `param.field` | `read(param)` | Akses field = baca owner |
+| `param.field = value` | `write(param)` | **Mutasi field = mutasi owner** |
+| `param = new_value` | ∅ (kosong) | Rebinding ≠ mutasi isi |
+| `println!(...)` | `io` | I/O operation |
+| `Vec::new()`, `Box::new()` | `alloc` | Memory allocation |
+| `.unwrap()`, `panic!()` | `panic` | May panic |
+| `f(args)` | `effects(f) ∪ effects(args)` | Union caller + callee |
+| `if c { a } else { b }` | `effects(c) ∪ effects(a) ∪ effects(b)` | Union semua branch |
+
+#### Key Insight: Field Mutation = Owner Mutation
+
+**PENTING:** Mutasi terhadap **field** dianggap sebagai mutasi terhadap **owner object**.
+
+```rust
+struct Account {
+    id u64
+    balance i64
+}
+
+fn deposit(acc Account, amount i64) effects(write acc) Account {
+    // acc.balance = ... ← compiler infer sebagai write(acc)
+    // karena mengubah field = mengubah state keseluruhan object
+    acc.balance = acc.balance + amount
+    acc
+}
+```
+
+#### Rebinding vs Mutation
+
+```rust
+fn rebind_example(w Wallet) Wallet {
+    // Ini adalah REBINDING, bukan mutation
+    // w = new_wallet TIDAK menghasilkan write(w)
+    // karena kita mengganti binding, bukan mengubah isi
+    w = Wallet { id = 1, balance = 0 }
+    w
+}
+
+fn mutation_example(w Wallet) effects(write w) Wallet {
+    // Ini adalah MUTATION
+    // w.balance = ... MENGHASILKAN write(w)
+    // karena kita mengubah isi object yang existing
+    w.balance = w.balance + 100
+    w
+}
+```
+
+### 5.9 Best Practices: Menulis Kode dengan Effect System
+
+#### ✅ DO: Deklarasikan Semua Effect Secara Eksplisit
+
+```rust
+// BAIK: Effect dideklarasi dengan jelas
+fn save_to_disk(data String) effects(io) {
+    write_file("data.txt", data)
+}
+
+fn process_and_log(item Item) effects(io, alloc) {
+    results = Vec::new()        // alloc
+    results.push(transform(item))
+    println("Processed: {}", item.id)  // io
+}
+```
+
+#### ✅ DO: Pisahkan Pure dan Effectful Functions
+
+```rust
+// BAIK: Pure function terpisah
+fn calculate_total(items [Item]) i64 {
+    items.iter().map(|i| i.price).sum()
+}
+
+// BAIK: Effectful function terpisah
+fn display_total(items [Item]) effects(io) {
+    total = calculate_total(items)  // Call pure function
+    println("Total: {}", total)      // Effect hanya di sini
+}
+```
+
+#### ✅ DO: Propagasi Effect dari Callee
+
+```rust
+fn helper() effects(io) {
+    println("helper called")
+}
+
+// BAIK: main() mempropagasi io dari helper()
+fn process() effects(io) {
+    helper()  // Caller harus declare effect dari callee
+}
+```
+
+#### ❌ DON'T: Menyembunyikan Effect
+
+```rust
+// BURUK: Effect tersembunyi
+fn sneaky_function(x i32) i32 {
+    println("called with {}", x)  // ERROR! io tidak dideklarasi
+    x * 2
+}
+```
+
+#### ❌ DON'T: Pure Function Memanggil Effectful Function
+
+```rust
+fn effectful() effects(io) {
+    println("effect!")
+}
+
+// BURUK: Pure function memanggil effectful
+fn supposedly_pure() i32 {
+    effectful()  // ERROR! RSPL302
+    42
+}
+```
+
+#### ✅ DO: Gunakan write(param) untuk Mutasi Parameter
+
+```rust
+struct State {
+    counter i32
+    data String
+}
+
+// BAIK: write(state) menunjukkan state akan dimutasi
+fn increment(state State) effects(write state) State {
+    state.counter = state.counter + 1
+    state
+}
+
+// BAIK: Multiple writes jelas
+fn transfer(from Account, to Account, amount i64) 
+    effects(write from, write to) 
+    (Account, Account) 
+{
+    from.balance = from.balance - amount
+    to.balance = to.balance + amount
+    (from, to)
+}
+```
+
+#### Pattern: Functional Core, Effectful Shell
+
+```rust
+// PURE CORE - semua logic di sini
+fn apply_transaction(wallet Wallet, tx Transaction) Wallet {
+    match tx {
+        Transaction::Deposit { amount } {
+            Wallet { id = wallet.id, balance = wallet.balance + amount }
+        }
+        Transaction::Withdraw { amount } {
+            Wallet { id = wallet.id, balance = wallet.balance - amount }
+        }
+    }
+}
+
+// EFFECTFUL SHELL - I/O dan interaksi dunia luar
+fn main() effects(io) {
+    wallet = Wallet { id = 1, balance = 100 }
+    tx = read_transaction_from_user()  // io
+    
+    new_wallet = apply_transaction(wallet, tx)  // pure!
+    
+    println("New balance: {}", new_wallet.balance)  // io
 }
 ```
 
@@ -1003,6 +1214,83 @@ Sebelum compile, pastikan:
 
 ---
 
-**RustS+ Language Specification v0.8**
+## Appendix D: Formal Effect Type Signatures
+
+### Function Type dalam RustS+
+
+Setiap fungsi di RustS+ secara formal memiliki tipe:
+
+```
+(parameter types) → return type + capability set
+```
+
+### Contoh Type Signatures
+
+```rust
+// Type: (i32, i32) → i32 + ∅
+fn add(a i32, b i32) i32 { a + b }
+
+// Type: (String) → () + {io}
+fn log(msg String) effects(io) { println("{}", msg) }
+
+// Type: (Account, i64) → Account + {write(acc)}
+fn deposit(acc Account, amount i64) effects(write acc) Account {
+    acc.balance = acc.balance + amount
+    acc
+}
+
+// Type: (Account, Account, i64) → (Account, Account) + {write(from), write(to)}
+fn transfer(from Account, to Account, amount i64) 
+    effects(write from, write to) 
+    (Account, Account) 
+{
+    from.balance = from.balance - amount
+    to.balance = to.balance + amount
+    (from, to)
+}
+```
+
+### write(x) sebagai Linear Resource
+
+Capability `write(x)` diperlakukan seperti `&mut T` di Rust:
+
+| Property | &mut T (Rust) | write(x) (RustS+) |
+|----------|---------------|-------------------|
+| Exclusive | ✅ Satu &mut per waktu | ✅ Satu write per waktu |
+| Must transfer | ✅ Harus dipinjam/dikembalikan | ✅ Harus dipropagasi |
+| Compile-time | ✅ Checked saat compile | ✅ Checked saat compile |
+
+### Effect Propagation Rules
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  RULE: Jika A memanggil B, maka:                                   │
+│        effects(A) ⊇ propagatable_effects(B)                        │
+│                                                                    │
+│  propagatable_effects = {io, alloc, panic}                         │
+│  (read/write adalah parameter-bound, tidak dipropagasi)            │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+```rust
+fn inner() effects(io, alloc) {
+    println("hello")
+    data = Vec::new()
+}
+
+// WAJIB: outer harus declare io DAN alloc
+fn outer() effects(io, alloc) {
+    inner()  // propagates io, alloc
+}
+
+// ERROR: missing alloc propagation
+fn wrong() effects(io) {
+    inner()  // RSPL301: missing alloc propagation
+}
+```
+
+---
+
+**RustS+ Language Specification v0.9**
 
 *"Jika Rust mencegah segmentation fault, RustS+ mencegah logical fault."*
