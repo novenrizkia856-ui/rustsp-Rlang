@@ -53,13 +53,19 @@ pub enum FunctionParseResult {
 /// Bare slice types [T] are unsized and cannot be function parameters.
 /// They must be transformed to &[T] (borrowed slice).
 /// 
+/// L-05: Also strips any effect annotations from parameter types!
+/// Effect annotations MUST NOT appear in Rust output.
+/// 
 /// Examples:
 /// - `[Tx]` → `&[Tx]`
 /// - `[u8]` → `&[u8]`
 /// - `Vec<T>` → `Vec<T>` (unchanged, already sized)
 /// - `&[T]` → `&[T]` (already borrowed, unchanged)
+/// - `effects(read x) T` → `T` (effects stripped)
 fn transform_param_type(type_str: &str) -> String {
-    let trimmed = type_str.trim();
+    // L-05 CRITICAL: Strip effects clause FIRST before any other transformation
+    let stripped = strip_effects_clause(type_str);
+    let trimmed = stripped.trim();
     
     // If it's already a reference, leave it alone
     if trimmed.starts_with('&') {

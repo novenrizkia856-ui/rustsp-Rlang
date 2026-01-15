@@ -2165,7 +2165,26 @@ pub fn parse_rusts(source: &str) -> String {
         .map(|line| transform_macro_calls(&line))
         .collect();
     
-    let result = transformed_lines.join("\n");
+    //==========================================================================
+    // L-01 POST-PROCESSING FIX: Catch any remaining bare `mut x = value`
+    // This is a safety net for cases that slipped through the main processing.
+    // Convert `mut x = value` to `let mut x = value;`
+    //==========================================================================
+    let fixed_lines: Vec<String> = transformed_lines
+        .into_iter()
+        .map(|line| fix_bare_mut_declaration(&line))
+        .collect();
+    
+    //==========================================================================
+    // L-05 POST-PROCESSING FIX: Strip any remaining effect annotations
+    // This catches effect annotations that may have leaked through other paths.
+    //==========================================================================
+    let final_lines: Vec<String> = fixed_lines
+        .into_iter()
+        .map(|line| strip_effects_from_line(&line))
+        .collect();
+    
+    let result = final_lines.join("\n");
     
     //==========================================================================
     // L-05: RUST SANITY CHECK
@@ -2303,6 +2322,161 @@ fn transform_single_literal_field(field: &str) -> String {
     }
     
     trimmed.to_string()
+}
+
+//=============================================================================
+// L-01 POST-PROCESSING: Fix bare `mut x = value` declarations
+// This is a safety net that catches any bare mut that slipped through.
+//=============================================================================
+
+/// Fix bare `mut x = value` declarations that weren't properly transformed.
+/// Converts them to `let mut x = value;`
+/// 
+/// This function is a safety net - ideally the main processing should handle
+/// all cases, but this ensures no bare mut slips through to the output.
+fn fix_bare_mut_declaration(line: &str) -> String {
+    let trimmed = line.trim();
+    let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+    
+    // Skip comments
+    if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+        return line.to_string();
+    }
+    
+    // Check for bare `mut x = value` pattern
+    // Must start with "mut " and contain "=" but not "==" 
+    // Must NOT already have "let mut" or "&mut"
+    if trimmed.starts_with("mut ") && trimmed.contains('=') && !trimmed.contains("==") 
+       && !line.contains("let mut") && !line.contains("&mut") {
+        // Parse the declaration
+        let rest = trimmed.strip_prefix("mut ").unwrap().trim();
+        
+        if let Some(eq_pos) = rest.find('=') {
+            let var_part = rest[..eq_pos].trim();
+            let val_part = rest[eq_pos + 1..].trim();
+            
+            // Handle type annotation if present
+            let (var_name, type_annotation) = if var_part.contains(':') {
+                let parts: Vec<&str> = var_part.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    (parts[0].trim(), format!(": {}", parts[1].trim()))
+                } else {
+                    (var_part, String::new())
+                }
+            } else {
+                (var_part, String::new())
+            };
+            
+            // Validate var_name is a valid identifier
+            if !var_name.is_empty() && 
+               var_name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) &&
+               var_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                // Ensure semicolon at end
+                let val_clean = val_part.trim_end_matches(';');
+                return format!("{}let mut {}{} = {};", leading_ws, var_name, type_annotation, val_clean);
+            }
+        }
+    }
+    
+    line.to_string()
+}
+
+//=============================================================================
+// L-05 POST-PROCESSING: Strip effect annotations from output lines
+// This catches any effect annotations that leaked through other paths.
+//=============================================================================
+
+/// Strip effect annotations from a line of output.
+/// Effect annotations like `effects(...)` must not appear in Rust output.
+fn strip_effects_from_line(line: &str) -> String {
+    // Quick check - if no "effects(" present, return early
+    if !line.contains("effects(") {
+        return line.to_string();
+    }
+    
+    // Check if it's a comment - don't modify comments
+    let trimmed = line.trim();
+    if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with("*") {
+        return line.to_string();
+    }
+    
+    // Check if "effects(" is inside a string literal
+    let mut in_string = false;
+    let mut escape_next = false;
+    let chars: Vec<char> = line.chars().collect();
+    let mut effects_positions: Vec<usize> = Vec::new();
+    
+    for (i, &c) in chars.iter().enumerate() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        
+        if c == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+        
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        
+        // Look for "effects(" outside string
+        if !in_string && i + 8 <= chars.len() {
+            let slice: String = chars[i..i+8].iter().collect();
+            if slice == "effects(" {
+                effects_positions.push(i);
+            }
+        }
+    }
+    
+    if effects_positions.is_empty() {
+        return line.to_string();
+    }
+    
+    // Strip all effect annotations found
+    let mut result = line.to_string();
+    for pos in effects_positions.iter().rev() {
+        // Find the matching closing paren
+        let start = *pos;
+        let substring = &result[start..];
+        
+        let mut paren_depth = 0;
+        let mut end = start;
+        
+        for (i, c) in substring.char_indices() {
+            match c {
+                '(' => paren_depth += 1,
+                ')' => {
+                    paren_depth -= 1;
+                    if paren_depth == 0 {
+                        end = start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        if end > start {
+            // Remove the effects(...) clause and any trailing space
+            let before = &result[..start];
+            let after = &result[end..];
+            let after_trimmed = after.trim_start();
+            
+            // Reconstruct with proper spacing
+            if before.ends_with(' ') && !after_trimmed.is_empty() {
+                result = format!("{}{}", before, after_trimmed);
+            } else if !before.ends_with(' ') && !after_trimmed.is_empty() && !after_trimmed.starts_with('{') {
+                result = format!("{} {}", before.trim_end(), after_trimmed);
+            } else {
+                result = format!("{}{}", before.trim_end(), if after_trimmed.is_empty() { "" } else { " " }.to_string() + after_trimmed);
+            }
+        }
+    }
+    
+    result
 }
 
 #[cfg(test)]
