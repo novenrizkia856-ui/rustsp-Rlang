@@ -238,6 +238,125 @@ fn main() effects(io) {
 
 ---
 
+## 🧠 Formal IR Pipeline
+
+RustS+ bukan sekadar "bahasa dengan sintaks baru" — ini adalah **sistem formal untuk menjamin kebenaran makna program**. Arsitekturnya dibangun di atas rangkaian **Intermediate Representation (IR)** formal:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    FORMAL IR PIPELINE                                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  SOURCE (.rss)                                                       │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  AST (Abstract Syntax Tree)                                  │    │
+│  │    → Structure: expressions, statements, items               │    │
+│  │    → NO semantic meaning yet                                 │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  HIR (High-level IR)                                         │    │
+│  │    → Resolved bindings (names → binding IDs)                 │    │
+│  │    → Scope information                                       │    │
+│  │    → Mutability tracking                                     │    │
+│  │    → `outer` keyword resolution                              │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │  EIR (Effect IR)                                             │    │
+│  │    → Effect inference (structural, not heuristic)            │    │
+│  │    → Effect propagation checking                             │    │
+│  │    → Effect ownership validation                             │    │
+│  │    → Effect Graph construction                               │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│       │                                                              │
+│       ▼                                                              │
+│  OUTPUT (.rs) ──▶ rustc ──▶ Binary                                  │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Mengapa IR Formal?
+
+Dengan arsitektur ini, RustS+ menjadi **semantic compiler** yang memahami apa yang dilakukan program secara formal, bukan sekadar **text transformer**:
+
+| Approach | Problem |
+|----------|---------|
+| Regex/Text-based | Tidak memahami context, mudah salah |
+| AST-only | Tidak memahami scope dan binding |
+| **HIR + EIR** | Memahami makna dan effect secara formal |
+
+---
+
+## 🎭 Two-Layer Type System
+
+RustS+ memiliki **Type System dua-lapis**:
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│  LAYER 2: EFFECT CAPABILITY SYSTEM                            │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  read(x)  │  write(x)  │  io  │  alloc  │  panic        │  │
+│  │                                                         │  │
+│  │  "Setiap nilai tidak hanya memiliki tipe data,          │  │
+│  │   tetapi juga HAK atas realitas"                        │  │
+│  └─────────────────────────────────────────────────────────┘  │
+├───────────────────────────────────────────────────────────────┤
+│  LAYER 1: RUST TYPE SYSTEM                                    │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  i32, String, struct, enum, borrow, generics, lifetimes │  │
+│  └─────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Effect as Linear Resource
+
+**Capability `write(x)` diperlakukan sebagai linear resource** — sama seperti `&mut T` di Rust:
+
+- **Tidak boleh diduplikasi** — hanya satu pihak yang boleh memiliki `write(x)` pada satu waktu
+- **Harus dipropagasi** — jika fungsi memiliki write capability, caller harus declare atau propagate
+- **Exclusive ownership** — dua fungsi tidak boleh sama-sama menulis state yang sama tanpa koordinasi
+
+```rust
+// write(acc) adalah "exclusive write token" untuk acc
+fn deposit(acc Account, amount i64) effects(write acc) Account {
+    acc.balance = acc.balance + amount  // OK - memiliki write token
+    acc
+}
+
+fn withdraw(acc Account, amount i64) effects(write acc) Account {
+    acc.balance = acc.balance - amount  // OK - memiliki write token
+    acc
+}
+
+// ERROR: Dua write token untuk acc di jalur eksekusi yang sama
+// akan terdeteksi sebagai RSPL315: Effect ownership violation
+```
+
+### Function Type Signature
+
+Setiap fungsi di RustS+ secara formal bertipe:
+
+```
+(parameter types) → return type + capability set
+```
+
+Contoh:
+```rust
+fn transfer(from Account, to Account, amount i64) 
+    effects(write from, write to) 
+    (Account, Account)
+    
+// Type signature formal:
+// (Account, Account, i64) → (Account, Account) + {write(from), write(to)}
+```
+
+---
+
 ## ⚙️ Compilation Pipeline
 
 RustS+ menggunakan **4-stage compilation pipeline**:
@@ -550,6 +669,34 @@ Sama seperti Rust memiliki borrow checker untuk memory, RustS+ memiliki **effect
 │     Effect is compile-time only contract                             │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
+```
+
+### Effect Inference Algorithm
+
+RustS+ menggunakan **Effect Inference Algorithm** yang berjalan di atas HIR. Setiap ekspresi dan statement menghasilkan **jejak efek** yang dihitung secara **struktural**, bukan berbasis teks/regex:
+
+| Expression/Statement | Inferred Effect | Reasoning |
+|---------------------|-----------------|-----------|
+| `42`, `"hello"`, `true` | ∅ (none) | Literal tidak menghasilkan efek |
+| `x` (read variable) | `read(x)` | Membaca binding menghasilkan read |
+| `w.field` | `read(w)` | Akses field = read owner object |
+| `w.field = 3` | `write(w)` | Mutasi field = mutasi owner |
+| `w = new_w` | ∅ (none) | Rebinding ≠ mutasi isi |
+| `println!(...)` | `io` | I/O operation (AST-level pattern) |
+| `Vec::new()` | `alloc` | Memory allocation |
+| `.unwrap()` | `panic` | May panic |
+| `f(args...)` | `effects(f) ∪ effects(args)` | Gabungan caller + callee |
+| `if c { a } else { b }` | `effects(c) ∪ effects(a) ∪ effects(b)` | Union semua branch |
+
+**Key Insight:** Mutasi terhadap **field** (`w.x = 3`) dianggap sebagai mutasi terhadap **owner object** (`write(w)`). Ini karena perubahan field mengubah *state* keseluruhan object.
+
+```rust
+fn update_balance(acc Account, delta i64) effects(write acc) Account {
+    // acc.balance = ... menghasilkan write(acc)
+    // karena field mutation = owner mutation
+    acc.balance = acc.balance + delta
+    acc
+}
 ```
 
 ### Effect Dependency Graph

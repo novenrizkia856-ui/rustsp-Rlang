@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn test_scope_resolver_basic() {
         let mut resolver = ScopeResolver::new();
-        let span = Span { start: 0, end: 0, line: 1, col: 1 };
+        let span = Span { start_line: 1, start_col: 1, end_line: 1, end_col: 1 };
         
         let x = resolver.declare("x", None, false, span);
         assert!(resolver.lookup("x").is_some());
@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn test_scope_resolver_nested() {
         let mut resolver = ScopeResolver::new();
-        let span = Span { start: 0, end: 0, line: 1, col: 1 };
+        let span = Span { start_line: 1, start_col: 1, end_line: 1, end_col: 1 };
         
         let x = resolver.declare("x", None, false, span);
         
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn test_scope_resolver_shadowing() {
         let mut resolver = ScopeResolver::new();
-        let span = Span { start: 0, end: 0, line: 1, col: 1 };
+        let span = Span { start_line: 1, start_col: 1, end_line: 1, end_col: 1 };
         
         let x1 = resolver.declare("x", None, false, span);
         

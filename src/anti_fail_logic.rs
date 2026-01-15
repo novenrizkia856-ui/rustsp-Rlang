@@ -472,9 +472,25 @@ impl Effect {
             return Some(Effect::Read(inner.trim().to_string()));
         }
         
+        // Also support `read param` syntax (without parentheses)
+        if s.starts_with("read ") {
+            let inner = &s[5..];
+            if !inner.is_empty() {
+                return Some(Effect::Read(inner.trim().to_string()));
+            }
+        }
+        
         if s.starts_with("write(") && s.ends_with(')') {
             let inner = &s[6..s.len()-1];
             return Some(Effect::Write(inner.trim().to_string()));
+        }
+        
+        // Also support `write param` syntax (without parentheses)
+        if s.starts_with("write ") {
+            let inner = &s[6..];
+            if !inner.is_empty() {
+                return Some(Effect::Write(inner.trim().to_string()));
+            }
         }
         
         if s.starts_with("calls(") && s.ends_with(')') {
@@ -1467,6 +1483,20 @@ impl AntiFailLogicChecker {
         let opens = self.count_open_braces(trimmed);
         let closes = self.count_close_braces(trimmed);
         
+        // ═══════════════════════════════════════════════════════════════════════
+        // FIX: Detect struct/enum literals to avoid creating scope for them
+        // ═══════════════════════════════════════════════════════════════════════
+        // 
+        // Struct/enum literal patterns that should NOT create a new scope:
+        // - `mut x = Type { field = value }` (assignment with struct literal)
+        // - `Type::Variant { field = value }` (enum constructor)
+        // - `func(Type { field = value })` (struct as function arg)
+        //
+        // Key heuristic: If `{` and `}` are on same line AND there's content
+        // before `{` (like `= Type` or `Type::Variant`), it's likely a literal.
+        // ═══════════════════════════════════════════════════════════════════════
+        let is_struct_literal = self.is_struct_or_enum_literal(trimmed);
+        
         // Function start detection
         if self.is_function_start(trimmed) {
             self.enter_function(line_num, opens, trimmed);
@@ -1476,7 +1506,8 @@ impl AntiFailLogicChecker {
             
             if is_closure {
                 self.effect_analyzer.enter_closure(self.brace_depth + opens, line_num);
-            } else if !is_control_flow && !self.is_definition(trimmed) {
+            } else if !is_control_flow && !self.is_definition(trimmed) && !is_struct_literal {
+                // Only create scope if NOT a struct/enum literal
                 for _ in 0..opens {
                     self.enter_scope(false, line_num);
                     self.effect_analyzer.enter_block(self.brace_depth + 1, line_num);
@@ -1503,12 +1534,45 @@ impl AntiFailLogicChecker {
             self.effect_analyzer.analyze_line(trimmed, line_num);
         }
         
-        // Update brace depth
-        for _ in 0..opens {
+        // ═══════════════════════════════════════════════════════════════════════
+        // FIX: Handle brace depth and scope for struct literals correctly
+        // ═══════════════════════════════════════════════════════════════════════
+        // 
+        // For struct literals on a single line like `x = Type { field = value }`:
+        // - The braces are balanced (opens == closes)
+        // - These braces should NOT affect scope tracking
+        // - But they may need to affect brace_depth for other purposes
+        //
+        // Key insight: If braces are balanced AND it's a struct literal,
+        // the net effect on scope should be zero.
+        // ═══════════════════════════════════════════════════════════════════════
+        
+        // Calculate net brace change for struct literals
+        let net_opens = if is_struct_literal && opens == closes {
+            // Balanced struct literal - don't affect brace_depth or scope
+            0
+        } else if is_struct_literal {
+            // Unbalanced struct literal (rare) - handle carefully
+            // This would be like `x = Type {` on one line and `}` on another
+            if opens > closes { opens - closes } else { 0 }
+        } else {
+            opens
+        };
+        
+        let net_closes = if is_struct_literal && opens == closes {
+            0
+        } else if is_struct_literal {
+            if closes > opens { closes - opens } else { 0 }
+        } else {
+            closes
+        };
+        
+        // Update brace depth with net values
+        for _ in 0..net_opens {
             self.brace_depth += 1;
         }
         
-        for _ in 0..closes {
+        for _ in 0..net_closes {
             self.handle_close_brace();
         }
         
@@ -1765,6 +1829,7 @@ impl AntiFailLogicChecker {
     
     fn check_control_flow_start(&mut self, trimmed: &str, line_num: usize) -> bool {
         // Check for control flow as expression (if/match assigned to variable)
+        // PATTERN 1: `if condition { ... }` (standalone if)
         if trimmed.starts_with("if ") && !trimmed.contains("if let") {
             // Check if it's an assignment
             if let Some(assigned_to) = self.detect_assignment_to_control_flow(trimmed) {
@@ -1780,7 +1845,53 @@ impl AntiFailLogicChecker {
             }
         }
         
+        // PATTERN 2: `var = if condition { ... }` (if as expression assigned to var)
+        // This is the CRITICAL fix for test_logic01_if_without_else
+        if !trimmed.starts_with("if ") && trimmed.contains(" = if ") && !trimmed.contains("if let") {
+            if let Some(assigned_to) = self.detect_assignment_to_control_flow(trimmed) {
+                self.control_flow_stack.push(ControlFlowExpr {
+                    start_line: line_num,
+                    is_value_context: true,
+                    has_else: false,
+                    kind: ControlFlowKind::If,
+                    assigned_to: Some(assigned_to),
+                    start_depth: self.brace_depth,
+                });
+                return true;
+            }
+        }
+        
+        // Also check `= if` without space before (e.g., `x=if`)
+        if !trimmed.starts_with("if ") && trimmed.contains("=if ") && !trimmed.contains("if let") {
+            if let Some(assigned_to) = self.detect_assignment_to_control_flow(trimmed) {
+                self.control_flow_stack.push(ControlFlowExpr {
+                    start_line: line_num,
+                    is_value_context: true,
+                    has_else: false,
+                    kind: ControlFlowKind::If,
+                    assigned_to: Some(assigned_to),
+                    start_depth: self.brace_depth,
+                });
+                return true;
+            }
+        }
+        
         if trimmed.starts_with("match ") {
+            if let Some(assigned_to) = self.detect_assignment_to_control_flow(trimmed) {
+                self.control_flow_stack.push(ControlFlowExpr {
+                    start_line: line_num,
+                    is_value_context: true,
+                    has_else: true, // match always has arms
+                    kind: ControlFlowKind::Match,
+                    assigned_to: Some(assigned_to),
+                    start_depth: self.brace_depth,
+                });
+                return true;
+            }
+        }
+        
+        // PATTERN 3: `var = match expr { ... }` (match as expression)
+        if !trimmed.starts_with("match ") && (trimmed.contains(" = match ") || trimmed.contains("=match ")) {
             if let Some(assigned_to) = self.detect_assignment_to_control_flow(trimmed) {
                 self.control_flow_stack.push(ControlFlowExpr {
                     start_line: line_num,
@@ -1955,27 +2066,48 @@ impl AntiFailLogicChecker {
         
         let is_mut_decl = trimmed.starts_with("mut ");
         
-        // Check for same-scope reassignment (Logic-06)
-        if self.function_vars.contains_key(&var_name) && !is_mut_decl {
-            // Check if already marked as mutable
-            let is_known_mutable = self.scopes.iter().any(|s| s.is_mutable(&var_name));
-            
+        // ═══════════════════════════════════════════════════════════════════════
+        // FIX: Proper scope-aware checking for reassignment vs shadowing
+        // ═══════════════════════════════════════════════════════════════════════
+        // 
+        // Logic:
+        // 1. If variable exists in CURRENT scope → same-scope reassignment (RSPL071)
+        // 2. If variable exists in OUTER scope → shadowing (RSPL081)
+        // 3. Otherwise → new declaration
+        // ═══════════════════════════════════════════════════════════════════════
+        
+        // First, check if variable exists in CURRENT scope (top of scope stack)
+        let in_current_scope = self.scopes.last()
+            .map(|s| s.has(&var_name))
+            .unwrap_or(false);
+        
+        // Check if variable exists in any outer scope (not current)
+        let in_outer_scope = self.scopes.iter().rev().skip(1)
+            .any(|s| s.has(&var_name));
+        
+        // Also check function_vars for first-level declarations
+        let in_function_vars = self.function_vars.contains_key(&var_name);
+        
+        // Check if already marked as mutable in ANY scope
+        let is_known_mutable = self.scopes.iter().any(|s| s.is_mutable(&var_name));
+        
+        if in_current_scope && !is_mut_decl {
+            // CASE 1: Same-scope reassignment (RSPL071)
             if !is_known_mutable && !self.reassigned_vars.contains(&var_name) {
-                // First reassignment - this should have been `mut`
                 self.emit_logic06_error(&var_name, line_num, trimmed);
             }
-            
             self.reassigned_vars.insert(var_name.clone());
             return;
         }
         
-        // Check shadowing (Logic-02)
-        if self.is_defined_in_outer_scope(&var_name) && !is_mut_decl {
-            self.check_shadowing(&var_name, line_num, trimmed);
+        if (in_outer_scope || (in_function_vars && !in_current_scope)) && !is_mut_decl {
+            // CASE 2: Shadowing from outer scope (RSPL081)
+            // Variable exists in outer scope but not current scope
+            self.emit_logic02_error(&var_name, line_num, trimmed);
             return;
         }
         
-        // New declaration
+        // CASE 3: New declaration
         if is_mut_decl {
             self.function_vars.insert(var_name.clone(), line_num);
             if let Some(scope) = self.scopes.last_mut() {
@@ -2074,6 +2206,82 @@ impl AntiFailLogicChecker {
     //=========================================================================
     // HELPER FUNCTIONS
     //=========================================================================
+    
+    /// Detect if line contains a struct or enum literal (not a block scope)
+    /// 
+    /// Struct/enum literals have patterns like:
+    /// - `x = Type { field = value }` (assignment with struct literal)
+    /// - `Type::Variant { field = value }` (enum constructor)
+    /// - `func(Type { field = value })` (struct as function arg)
+    /// - `[Type { field = value }, ...]` (struct in array)
+    ///
+    /// These should NOT create new scope for variable tracking.
+    fn is_struct_or_enum_literal(&self, line: &str) -> bool {
+        let trimmed = line.trim();
+        
+        // Must contain both `{` and `}` to be a complete literal on one line
+        let has_open = trimmed.contains('{');
+        let has_close = trimmed.contains('}');
+        
+        if !has_open {
+            return false;
+        }
+        
+        // Find position of first `{`
+        let brace_pos = match trimmed.find('{') {
+            Some(p) => p,
+            None => return false,
+        };
+        
+        // If `{` is at the very start, it's likely a block, not a literal
+        if brace_pos == 0 {
+            return false;
+        }
+        
+        let before_brace = &trimmed[..brace_pos].trim();
+        
+        // Pattern 1: `= Type {` or `= SomeType {` (assignment with struct literal)
+        // The part before `{` should end with a type name (uppercase)
+        if let Some(last_word) = before_brace.split_whitespace().last() {
+            let first_char = last_word.chars().next().unwrap_or('_');
+            
+            // If last word before `{` starts with uppercase, likely struct/enum
+            if first_char.is_uppercase() {
+                return true;
+            }
+            
+            // Also check for Type::Variant pattern
+            if last_word.contains("::") {
+                let parts: Vec<&str> = last_word.split("::").collect();
+                if parts.len() >= 2 {
+                    let type_part = parts[0];
+                    let variant_part = parts.last().unwrap_or(&"");
+                    if type_part.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) &&
+                       variant_part.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        // Pattern 2: Complete literal on one line with matching braces
+        // If both `{` and `}` exist and they're balanced, likely a literal
+        if has_close {
+            let open_count = trimmed.chars().filter(|c| *c == '{').count();
+            let close_count = trimmed.chars().filter(|c| *c == '}').count();
+            
+            // If perfectly balanced on one line, it's a literal
+            if open_count == close_count && open_count > 0 {
+                // Extra check: make sure there's something before `{`
+                // and it's not just whitespace
+                if !before_brace.is_empty() {
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
     
     fn is_function_start(&self, trimmed: &str) -> bool {
         (trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ") ||
