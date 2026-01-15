@@ -518,6 +518,32 @@ pub fn parse_function_line(line: &str) -> FunctionParseResult {
 }
 
 fn is_rust_syntax(line: &str) -> bool {
+    // L-05 CRITICAL FIX: If the line contains "effects(" outside of strings/comments,
+    // it's NOT pure Rust syntax - it needs transformation to strip effects!
+    // Check for effects BEFORE determining if it's Rust syntax
+    if line.contains("effects(") {
+        // Quick check: make sure it's not in a string or comment
+        let mut in_string = false;
+        let mut prev_char = ' ';
+        let chars: Vec<char> = line.chars().collect();
+        
+        for (i, &c) in chars.iter().enumerate() {
+            if c == '"' && prev_char != '\\' {
+                in_string = !in_string;
+            }
+            prev_char = c;
+            
+            // Check for "effects(" pattern outside of strings
+            if !in_string && i + 8 <= chars.len() {
+                let slice: String = chars[i..i+8].iter().collect();
+                if slice == "effects(" {
+                    // Found effects annotation outside string - NOT pure Rust
+                    return false;
+                }
+            }
+        }
+    }
+    
     // Check parameter syntax - if params contain ": " it's Rust syntax
     if let Some(paren_start) = line.find('(') {
         if let Some(paren_end) = find_matching_paren(line, paren_start) {
@@ -1013,6 +1039,42 @@ mod tests {
                     "L-05: Expression body must be preserved: {}", rust);
             }
             _ => panic!("Expected RustSPlusSignature"),
+        }
+    }
+    
+    /// L-05 CRITICAL: Rust-style params with effects must NOT be classified as passthrough
+    #[test]
+    fn test_l05_rust_params_with_effects_not_passthrough() {
+        // This function has Rust-style params (colon syntax) BUT has RustS+ effects
+        // It must NOT be classified as RustPassthrough!
+        let line = "fn log(msg: String) effects(io) {";
+        match parse_function_line(line) {
+            FunctionParseResult::RustPassthrough => {
+                panic!("L-05: Function with effects must NOT be RustPassthrough even with Rust-style params");
+            }
+            FunctionParseResult::RustSPlusSignature(sig) => {
+                let rust = signature_to_rust(&sig);
+                // MUST NOT have effects clause in output
+                assert!(!rust.contains("effects("),
+                    "L-05: effects clause must NOT appear: {}", rust);
+            }
+            _ => {} // Other results are also acceptable as long as it's not passthrough
+        }
+    }
+    
+    /// L-05: is_rust_syntax must return false for lines with effects
+    #[test]
+    fn test_is_rust_syntax_with_effects() {
+        // This function has Rust-style params but RustS+ effects
+        let line = "fn foo(a: i32, b: i32) effects(io) {";
+        // is_rust_syntax should return false because of effects
+        // (We can't directly test is_rust_syntax since it's private, 
+        //  but we can verify the behavior through parse_function_line)
+        match parse_function_line(line) {
+            FunctionParseResult::RustPassthrough => {
+                panic!("L-05: Line with effects() should NOT be treated as Rust passthrough");
+            }
+            _ => {} // Any other result is fine
         }
     }
 }

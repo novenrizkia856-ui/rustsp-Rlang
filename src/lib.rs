@@ -1554,6 +1554,43 @@ pub fn parse_rusts(source: &str) -> String {
             // Not an assignment - apply transformations
             let mut transformed = trimmed.to_string();
             
+            //=================================================================
+            // L-01 CRITICAL FIX: Handle bare `mut x = value` in match arm body
+            // If parse_rusts_assignment_ext failed but line starts with `mut `,
+            // this is a bug - we should force proper transformation
+            //=================================================================
+            if trimmed.starts_with("mut ") && trimmed.contains('=') && !trimmed.contains("==") {
+                // This is a bare `mut x = value` that should have been transformed!
+                let rest = trimmed.strip_prefix("mut ").unwrap().trim();
+                if let Some(eq_pos) = rest.find('=') {
+                    let var_part = rest[..eq_pos].trim();
+                    let val_part = rest[eq_pos + 1..].trim().trim_end_matches(';');
+                    
+                    let (var_name, type_annotation) = if var_part.contains(':') {
+                        let parts: Vec<&str> = var_part.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            (parts[0].trim(), format!(": {}", parts[1].trim()))
+                        } else {
+                            (var_part, String::new())
+                        }
+                    } else {
+                        (var_part, String::new())
+                    };
+                    
+                    let mut expanded_value = expand_value(val_part, None);
+                    expanded_value = transform_array_access_clone(&expanded_value);
+                    if current_fn_ctx.is_inside() {
+                        expanded_value = transform_string_concat(&expanded_value, &current_fn_ctx);
+                    }
+                    expanded_value = transform_call_args(&expanded_value, &fn_registry);
+                    
+                    let output = format!("{}let mut {}{} = {};", 
+                        leading_ws, var_name, type_annotation, expanded_value);
+                    output_lines.push(output);
+                    continue;
+                }
+            }
+            
             // Apply function context transformations
             if current_fn_ctx.is_inside() {
                 transformed = transform_string_concat(&transformed, &current_fn_ctx);
@@ -1796,10 +1833,48 @@ pub fn parse_rusts(source: &str) -> String {
                     continue;
                 }
                 FunctionParseResult::RustPassthrough => {
+                    // L-05 CRITICAL FIX: Even for Rust passthrough, strip effects clause
+                    // User may write: fn foo(a: i32) effects(io) { }
+                    // which has Rust-style params but RustS+ effects
+                    let mut output = clean_line.clone();
+                    
+                    // Strip effects annotation if present
+                    if output.contains("effects(") {
+                        // Find and remove effects(...) clause
+                        // Pattern: "effects(" ... ")" followed by optional whitespace and then rest
+                        if let Some(effects_start) = output.find("effects(") {
+                            // Find the matching closing paren
+                            let mut paren_depth = 0;
+                            let mut effects_end = effects_start;
+                            for (i, c) in output[effects_start..].char_indices() {
+                                match c {
+                                    '(' => paren_depth += 1,
+                                    ')' => {
+                                        paren_depth -= 1;
+                                        if paren_depth == 0 {
+                                            effects_end = effects_start + i + 1;
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            // Remove the effects clause
+                            let before = &output[..effects_start];
+                            let after = output[effects_end..].trim_start();
+                            output = format!("{}{}", before.trim_end(), 
+                                if after.is_empty() || after.starts_with('{') { 
+                                    format!(" {}", after) 
+                                } else { 
+                                    format!(" {}", after) 
+                                });
+                        }
+                    }
+                    
                     // Extract return type for tail return handling
-                    if trimmed.contains(" -> ") {
-                        if let Some(arrow_pos) = trimmed.find(" -> ") {
-                            let after_arrow = &trimmed[arrow_pos + 4..];
+                    if output.contains(" -> ") {
+                        if let Some(arrow_pos) = output.find(" -> ") {
+                            let after_arrow = &output[arrow_pos + 4..];
                             let ret_end = after_arrow.find(|c: char| c == '{' || c.is_whitespace())
                                 .unwrap_or(after_arrow.len());
                             let ret_type = after_arrow[..ret_end].trim();
@@ -1809,7 +1884,6 @@ pub fn parse_rusts(source: &str) -> String {
                             }
                         }
                     }
-                    let mut output = clean_line.clone();
                     if needs_semicolon(trimmed) {
                         output = format!("{};", output);
                     }
@@ -2013,6 +2087,48 @@ pub fn parse_rusts(source: &str) -> String {
         } else {
             // Not an assignment - transform and pass through
             let mut transformed = trimmed.to_string();
+            
+            //=================================================================
+            // L-01 CRITICAL FIX: Handle bare `mut x = value` that wasn't parsed
+            // If parse_rusts_assignment_ext failed but line starts with `mut `,
+            // this is a bug - we should force proper transformation
+            //=================================================================
+            if trimmed.starts_with("mut ") && trimmed.contains('=') && !trimmed.contains("==") {
+                // This is a bare `mut x = value` that should have been transformed!
+                // Try to manually parse and transform it
+                let rest = trimmed.strip_prefix("mut ").unwrap().trim();
+                if let Some(eq_pos) = rest.find('=') {
+                    let var_part = rest[..eq_pos].trim();
+                    let val_part = rest[eq_pos + 1..].trim().trim_end_matches(';');
+                    
+                    // Check for type annotation
+                    let (var_name, type_annotation) = if var_part.contains(':') {
+                        let parts: Vec<&str> = var_part.splitn(2, ':').collect();
+                        if parts.len() == 2 {
+                            (parts[0].trim(), format!(": {}", parts[1].trim()))
+                        } else {
+                            (var_part, String::new())
+                        }
+                    } else {
+                        (var_part, String::new())
+                    };
+                    
+                    // Transform the value
+                    let mut expanded_value = expand_value(val_part, None);
+                    expanded_value = transform_array_access_clone(&expanded_value);
+                    if current_fn_ctx.is_inside() {
+                        expanded_value = transform_string_concat(&expanded_value, &current_fn_ctx);
+                    }
+                    expanded_value = transform_call_args(&expanded_value, &fn_registry);
+                    
+                    // Output as `let mut var = value;`
+                    let output = format!("{}let mut {}{} = {};", 
+                        leading_ws, var_name, type_annotation, expanded_value);
+                    output_lines.push(output);
+                    continue;
+                }
+            }
+            
             if current_fn_ctx.is_inside() {
                 transformed = transform_string_concat(&transformed, &current_fn_ctx);
             }
@@ -2534,6 +2650,74 @@ mod tests {
                 panic!("L-05: Found bare 'mut' token: {}", line);
             }
         }
+    }
+    
+    /// L-05: Effect annotations must NOT appear in Rust output
+    #[test]
+    fn test_l05_no_effect_leakage_rustsplus_syntax() {
+        // RustS+ syntax function with effects
+        let input = r#"fn apply_tx(w Wallet, tx Tx) effects(write w) Wallet {
+    w
+}"#;
+        let output = parse_rusts(input);
+        // MUST NOT have effects clause in output
+        assert!(!output.contains("effects("), 
+            "L-05: effects() must NOT appear in Rust output: {}", output);
+        // MUST have return type
+        assert!(output.contains("-> Wallet"), 
+            "L-05: Return type 'Wallet' must be present: {}", output);
+    }
+    
+    /// L-05: Effect annotations must be stripped from Rust-style params too
+    #[test]
+    fn test_l05_no_effect_leakage_rust_syntax() {
+        // Rust-style params BUT with RustS+ effects
+        let input = r#"fn log(msg: String) effects(io) {
+    println!("{}", msg)
+}"#;
+        let output = parse_rusts(input);
+        // MUST NOT have effects clause in output
+        assert!(!output.contains("effects("), 
+            "L-05: effects() must NOT appear in Rust output even with Rust-style params: {}", output);
+    }
+    
+    /// L-05: Effect annotations with multiple effects must be stripped
+    #[test]
+    fn test_l05_no_effect_leakage_multiple_effects() {
+        let input = r#"fn transfer(from Account, to Account) effects(read from, write to) Account {
+    to
+}"#;
+        let output = parse_rusts(input);
+        assert!(!output.contains("effects("), 
+            "L-05: Multiple effects must be stripped: {}", output);
+        assert!(output.contains("-> Account"), 
+            "L-05: Return type must be preserved: {}", output);
+    }
+    
+    /// L-01: mut with function call value must work
+    #[test]
+    fn test_l01_mut_with_function_call() {
+        let input = "mut wallet = create_wallet(seed)";
+        let output = parse_rusts(input);
+        assert!(output.contains("let mut wallet = create_wallet(seed)"), 
+            "L-01: 'mut wallet = create_wallet(seed)' must have 'let mut': {}", output);
+        // MUST NOT have bare `mut`
+        assert!(!output.lines().any(|l| {
+            let t = l.trim();
+            t.starts_with("mut ") && !l.contains("let mut") && !l.contains("&mut")
+        }), "L-01: Found bare 'mut' without 'let': {}", output);
+    }
+    
+    /// L-01: mut with array access must work
+    #[test]
+    fn test_l01_mut_with_array_access() {
+        let input = "mut root = tx_hashes[0]";
+        let output = parse_rusts(input);
+        assert!(output.contains("let mut root"), 
+            "L-01: 'mut root = tx_hashes[0]' must have 'let mut': {}", output);
+        // Should also have .clone() due to L-04
+        assert!(output.contains(".clone()"), 
+            "L-04: Array access should have .clone(): {}", output);
     }
     
     /// Integration test: Complete function with all patterns
