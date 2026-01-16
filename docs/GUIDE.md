@@ -1028,82 +1028,604 @@ match ev {
 
 ---
 
+---
+
 ## 10. Cargo Integration
 
-### 10.1 Instalasi cargo-rustsp
+### 10.1 Apa itu cargo-rustsp?
 
-`cargo-rustsp` adalah tool untuk mengintegrasikan RustS+ dengan Cargo workflow.
+`cargo-rustsp` adalah **build tool** yang mengintegrasikan RustS+ compiler dengan ekosistem Cargo. Tool ini memungkinkan kamu menggunakan workflow Cargo yang familiar untuk project RustS+.
+
+**Mengapa perlu cargo-rustsp?**
+
+| Tanpa cargo-rustsp | Dengan cargo-rustsp |
+|--------------------|---------------------|
+| Manual compile setiap `.rss` | Otomatis compile semua |
+| Manual track dependencies | Otomatis resolve modules |
+| Tidak ada caching | Incremental compilation |
+| Tidak support workspace | Full workspace support |
+
+### 10.2 Instalasi
 
 ```bash
-# Build cargo-rustsp
-rustc cargo-rustsp.rs -o cargo-rustsp
+# Clone repository
+git clone https://github.com/novenrizkia856-ui/rustsp-Rlang
+cd rustsp-Rlang-main
+
+# Build compiler dan cargo-rustsp
+cargo build --release
 
 # Install ke PATH
-cp cargo-rustsp ~/.cargo/bin/
+cp target/release/rustsp ~/.cargo/bin/
+cp target/release/cargo-rustsp ~/.cargo/bin/
+
+# Verifikasi
+rustsp --version
+cargo rustsp --version
 ```
 
-### 10.2 Project Structure
+**Verifikasi instalasi:**
+```bash
+$ cargo rustsp --version
+cargo-rustsp 0.9.0
+```
+
+### 10.3 Commands Reference
+
+| Command | Deskripsi | Contoh |
+|---------|-----------|--------|
+| `build` | Compile project | `cargo rustsp build` |
+| `run` | Build dan run | `cargo rustsp run` |
+| `test` | Run tests | `cargo rustsp test` |
+| `check` | Check tanpa compile binary | `cargo rustsp check` |
+| `clean` | Clean artifacts | `cargo rustsp clean` |
+| `bench` | Run benchmarks | `cargo rustsp bench` |
+| `doc` | Generate docs | `cargo rustsp doc` |
+
+### 10.4 Options Reference
+
+```bash
+cargo rustsp <COMMAND> [OPTIONS]
+
+OPTIONS:
+    -r, --release              Build optimized release binary
+    -q, --quiet                Suppress output messages
+    -f, --force                Force rebuild (ignore cache)
+    -p, --package <SPEC>       Build specific package dalam workspace
+    -j, --jobs <N>             Jumlah parallel jobs
+    -F, --features <FEATURES>  Activate features (comma-separated)
+    --all-features             Activate all available features
+    --no-default-features      Disable default features
+```
+
+**Contoh penggunaan:**
+
+```bash
+# Release build
+cargo rustsp build --release
+
+# Build dengan features
+cargo rustsp build --features="async,serde"
+
+# Build package tertentu di workspace
+cargo rustsp build -p my-core-lib
+
+# Force rebuild semua
+cargo rustsp build --force
+
+# Quiet mode untuk CI/CD
+cargo rustsp build -q --release
+
+# Run dengan arguments
+cargo rustsp run -- --config config.toml
+```
+
+### 10.5 Project Structures yang Didukung
+
+#### 10.5.1 Single File Project
+
+Struktur paling sederhana:
 
 ```
 my_project/
 ├── Cargo.toml
 └── src/
-    ├── main.rss      # RustS+ source (bukan .rs)
-    ├── lib.rss       # Library module
-    └── utils.rss     # Other modules
+    └── main.rss
 ```
 
-### 10.3 Commands
-
-| Command | Deskripsi |
-|---------|-----------|
-| `cargo rustsp build` | Compile project |
-| `cargo rustsp run` | Build dan run |
-| `cargo rustsp test` | Run tests |
-| `cargo rustsp check` | Check tanpa compile |
-| `cargo rustsp clean` | Clean artifacts |
-
-### 10.4 Options
-
-```bash
-cargo rustsp build --release     # Release build
-cargo rustsp run -- arg1 arg2    # Pass arguments
+**Cargo.toml:**
+```toml
+[package]
+name = "my_project"
+version = "0.1.0"
+edition = "2021"
 ```
 
-### 10.5 Workflow
-
-```
-cargo rustsp build
-    │
-    ├─→ Scan src/ untuk .rss files
-    │
-    ├─→ Compile setiap .rss ke .rs (via rustsp)
-    │   └─→ Stage 0: Effect Analysis
-    │   └─→ Stage 1: Anti-Fail Logic ← ERROR STOPS HERE
-    │   └─→ Stage 2: Lowering
-    │
-    ├─→ Copy .rs files ke shadow directory
-    │
-    ├─→ Generate Cargo.toml
-    │
-    └─→ Run cargo build di shadow directory
+**src/main.rss:**
+```rust
+fn main() effects(io) {
+    println("Hello from RustS+!")
+}
 ```
 
-### 10.6 Shadow Directory
+#### 10.5.2 Multi-Module Project
 
-cargo-rustsp menggunakan **shadow directory** di TEMP untuk mengisolasi build:
+Project dengan nested modules:
 
 ```
-/tmp/rustsp_shadow_<project_name>/
-├── Cargo.toml           # Generated
+my_project/
+├── Cargo.toml
 └── src/
-    ├── main.rs          # Compiled dari main.rss
-    └── lib.rs           # Compiled dari lib.rss
+    ├── main.rss           # Entry point
+    ├── utils.rss          # mod utils; → flat module
+    └── parser/
+        ├── mod.rss        # mod parser; → directory module
+        ├── lexer.rss      # mod lexer; dalam parser/mod.rss
+        └── tokens.rss     # mod tokens; dalam parser/mod.rss
 ```
 
-Target artifacts tetap di `target/rustsp_build/` dalam project directory.
+**src/main.rss:**
+```rust
+mod utils;
+mod parser;
 
----
+fn main() effects(io) {
+    result = parser::parse("input")
+    utils::log(result)
+}
+```
+
+**src/parser/mod.rss:**
+```rust
+mod lexer;
+mod tokens;
+
+pub fn parse(input &str) effects(alloc) -> Vec<Token> {
+    lexer::tokenize(input)
+}
+```
+
+#### 10.5.3 Library + Binary
+
+Project dengan library dan executable:
+
+```
+my_project/
+├── Cargo.toml
+└── src/
+    ├── lib.rss            # Library entry
+    ├── main.rss           # Binary entry
+    ├── core.rss           # Library module
+    └── api.rss            # Library module
+```
+
+**src/lib.rss:**
+```rust
+pub mod core;
+pub mod api;
+
+pub fn version() -> &'static str {
+    "0.1.0"
+}
+```
+
+**src/main.rss:**
+```rust
+use my_project::{core, api};
+
+fn main() effects(io) {
+    api::run()
+}
+```
+
+#### 10.5.4 Mixed .rs/.rss Project
+
+Kombinasi pure Rust dan RustS+:
+
+```
+my_project/
+├── Cargo.toml
+└── src/
+    ├── main.rss           # RustS+ (dengan effects)
+    ├── pure_math.rs       # Pure Rust (tanpa effects)
+    └── io_handler.rss     # RustS+ (dengan effects)
+```
+
+**Kapan pakai .rs vs .rss?**
+
+| File Type | Gunakan Ketika |
+|-----------|----------------|
+| `.rss` | Kode butuh effect tracking (I/O, mutation, allocation) |
+| `.rs` | Kode pure computation, atau legacy Rust code |
+
+cargo-rustsp akan:
+- Compile `.rss` → `.rs` via rustsp compiler
+- Copy `.rs` langsung tanpa perubahan
+
+#### 10.5.5 Workspace Project
+
+Multiple crates dalam satu repository:
+
+```
+my_workspace/
+├── Cargo.toml             # Workspace root
+├── core/
+│   ├── Cargo.toml
+│   └── src/
+│       └── lib.rss
+├── cli/
+│   ├── Cargo.toml
+│   └── src/
+│       └── main.rss
+└── utils/
+    ├── Cargo.toml
+    └── src/
+        └── lib.rs         # Pure Rust crate
+```
+
+**Workspace Cargo.toml:**
+```toml
+[workspace]
+members = [
+    "core",
+    "cli",
+    "utils",
+]
+resolver = "2"
+```
+
+**cli/Cargo.toml:**
+```toml
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core = { path = "../core" }
+utils = { path = "../utils" }
+```
+
+**Build workspace:**
+```bash
+# Build semua members yang punya .rss
+cargo rustsp build
+
+# Build specific member
+cargo rustsp build -p cli
+
+# Build only release
+cargo rustsp build --release
+```
+
+#### 10.5.6 Deeply Nested Modules
+
+cargo-rustsp mendukung nested modules tanpa batas:
+
+```
+src/
+└── lib.rss
+    └── level1/
+        └── mod.rss
+            └── level2/
+                └── mod.rss
+                    └── level3/
+                        └── mod.rss
+                            └── level4.rss
+```
+
+### 10.6 Module Resolution Rules
+
+cargo-rustsp mengikuti aturan resolusi module Rust:
+
+```
+mod foo;  →  Mencari dalam urutan:
+             ┌─────────────────────────────────┐
+             │ 1. foo.rss      (RustS+ file)   │ ← Prioritas tertinggi
+             │ 2. foo/mod.rss  (RustS+ dir)    │
+             │ 3. foo.rs       (Rust file)     │
+             │ 4. foo/mod.rs   (Rust dir)      │ ← Prioritas terendah
+             └─────────────────────────────────┘
+```
+
+**Custom path attribute:**
+```rust
+#[path = "custom/location.rss"]
+mod my_module;
+```
+
+**Contoh resolusi:**
+
+| Declaration | Location | Resolves To |
+|-------------|----------|-------------|
+| `mod utils;` di `main.rss` | `src/` | `src/utils.rss` atau `src/utils/mod.rss` |
+| `mod lexer;` di `parser/mod.rss` | `src/parser/` | `src/parser/lexer.rss` |
+| `mod helpers;` di `utils.rss` | `src/` | `src/utils/helpers.rss` |
+
+### 10.7 Build Process Detail
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      cargo rustsp build                              │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PHASE 1: Analysis                                                   │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ • Detect project type (single crate / workspace)               │ │
+│  │ • Parse mod declarations dari semua .rss files                 │ │
+│  │ • Build module dependency graph                                │ │
+│  │ • Identify entry points (main.rss / lib.rss)                   │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PHASE 2: Cache Check                                                │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ • Hash setiap source file                                      │ │
+│  │ • Compare dengan cache (.rustsp_cache)                         │ │
+│  │ • Determine files yang perlu recompile                         │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PHASE 3: RustS+ Compilation                                         │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ For each changed .rss file:                                    │ │
+│  │   rustsp file.rss --emit-rs -o output.rs --quiet               │ │
+│  │                                                                │ │
+│  │   ┌─────────────────────────────────────────────────────────┐  │ │
+│  │   │ Stage 0: IR Construction & Effect Analysis              │  │ │
+│  │   │ Stage 1: Anti-Fail Logic Check ← ERROR = STOP HERE      │  │ │
+│  │   │ Stage 2: Lowering (RustS+ → Rust)                       │  │ │
+│  │   └─────────────────────────────────────────────────────────┘  │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PHASE 4: Shadow Directory Setup                                     │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ • Create /tmp/rustsp_shadow_<project>/                         │ │
+│  │ • Copy compiled .rs files                                      │ │
+│  │ • Copy existing .rs files (unchanged)                          │ │
+│  │ • Generate Cargo.toml                                          │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PHASE 5: Cargo Build                                                │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │ cargo build --target-dir target/rustsp_build/                  │ │
+│  │                                                                │ │
+│  │ Output: target/rustsp_build/debug/   (atau release/)           │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.8 Incremental Compilation
+
+cargo-rustsp menggunakan **hash-based caching** untuk mempercepat rebuild:
+
+```
+target/rustsp_build/
+├── .rustsp_cache          # Cache file
+├── debug/                 # Debug artifacts
+│   └── my_project         # Binary
+└── release/               # Release artifacts
+    └── my_project         # Optimized binary
+```
+
+**Cache format:**
+```
+src/main.rss    <hash>    <timestamp>    src/main.rs
+src/utils.rss   <hash>    <timestamp>    src/utils.rs
+```
+
+**Cara kerja:**
+1. Hash content setiap `.rss` file
+2. Bandingkan dengan hash di cache
+3. Jika sama → skip compilation
+4. Jika beda → recompile dan update cache
+
+**Force rebuild:**
+```bash
+cargo rustsp build --force
+```
+
+### 10.9 Shadow Directory Isolation
+
+cargo-rustsp menggunakan **TEMP directory** untuk menghindari konflik:
+
+```
+┌──────────────────────────────┐    ┌──────────────────────────────┐
+│     Original Project         │    │    Shadow Project (TEMP)     │
+├──────────────────────────────┤    ├──────────────────────────────┤
+│ my_project/                  │    │ /tmp/rustsp_shadow_my_proj/  │
+│ ├── Cargo.toml               │    │ ├── Cargo.toml (generated)   │
+│ └── src/                     │    │ └── src/                     │
+│     ├── main.rss             │───▶│     ├── main.rs (compiled)   │
+│     ├── utils.rss            │───▶│     ├── utils.rs (compiled)  │
+│     └── helper.rs            │───▶│     └── helper.rs (copied)   │
+└──────────────────────────────┘    └──────────────────────────────┘
+```
+
+**Mengapa shadow directory?**
+- Menghindari konflik dengan parent `Cargo.toml`
+- Isolasi generated code dari source code
+- Memudahkan debugging (bisa inspect generated Rust)
+
+### 10.10 Feature Flags
+
+cargo-rustsp mendukung Cargo features:
+
+**Cargo.toml:**
+```toml
+[package]
+name = "my_project"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["std"]
+std = []
+async = ["tokio"]
+full = ["std", "async", "serde"]
+
+[dependencies]
+tokio = { version = "1.0", optional = true }
+serde = { version = "1.0", optional = true }
+```
+
+**Build dengan features:**
+```bash
+# Default features
+cargo rustsp build
+
+# Specific features
+cargo rustsp build --features="async,serde"
+
+# All features
+cargo rustsp build --all-features
+
+# No default features
+cargo rustsp build --no-default-features --features="minimal"
+```
+
+**Conditional compilation di RustS+:**
+```rust
+#[cfg(feature = "async")]
+pub mod async_support;
+
+#[cfg(feature = "serde")]
+use serde::{Serialize, Deserialize};
+```
+
+### 10.11 Troubleshooting
+
+#### "Could not find Cargo.toml"
+
+**Problem:** cargo-rustsp tidak menemukan project root.
+
+**Solution:**
+```bash
+# Pastikan di directory yang benar
+pwd
+ls Cargo.toml
+
+# Atau navigate ke project root
+cd /path/to/my_project
+cargo rustsp build
+```
+
+#### "No .rss files found"
+
+**Problem:** Tidak ada file `.rss` di `src/`.
+
+**Behavior:** cargo-rustsp akan fallback ke plain `cargo build`.
+
+**Note:** Ini bukan error - project pure Rust tetap bisa di-build.
+
+#### "rustsp: command not found"
+
+**Problem:** Compiler `rustsp` tidak ada di PATH.
+
+**Solution:**
+```bash
+# Check if installed
+which rustsp
+
+# If not found, install
+cp /path/to/target/release/rustsp ~/.cargo/bin/
+
+# Verify
+rustsp --version
+```
+
+#### Module Not Found
+
+**Problem:** `mod foo;` tapi `foo.rss` tidak ditemukan.
+
+**Solution:**
+```bash
+# Check file exists
+ls src/foo.rss
+ls src/foo/mod.rss
+
+# Check naming (case-sensitive!)
+# foo.rss ✓
+# Foo.rss ✗
+```
+
+#### Cache Issues (Stale Build)
+
+**Problem:** Perubahan tidak ter-reflect di build.
+
+**Solution:**
+```bash
+# Force rebuild
+cargo rustsp build --force
+
+# Or clean and rebuild
+cargo rustsp clean
+cargo rustsp build
+```
+
+#### Workspace Member Not Building
+
+**Problem:** Member di workspace tidak ter-build.
+
+**Solution:**
+```bash
+# Check member has .rss files
+ls my_member/src/*.rss
+
+# Build specific member
+cargo rustsp build -p my_member
+
+# Check Cargo.toml workspace config
+cat Cargo.toml | grep -A5 '\[workspace\]'
+```
+
+### 10.12 CI/CD Integration
+
+**GitHub Actions example:**
+
+```yaml
+name: Build RustS+ Project
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          
+      - name: Build RustS+ compiler
+        run: |
+          git clone https://github.com/novenrizkia856-ui/rustsp-Rlang
+          cd rustsp-Rlang-main
+          cargo build --release
+          cp target/release/rustsp ~/.cargo/bin/
+          cp target/release/cargo-rustsp ~/.cargo/bin/
+          
+      - name: Build project
+        run: cargo rustsp build --release -q
+        
+      - name: Run tests
+        run: cargo rustsp test
+```
+
 
 ## 11. Lowering ke Rust
 

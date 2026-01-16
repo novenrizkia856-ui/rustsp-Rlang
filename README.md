@@ -1051,18 +1051,62 @@ pub struct SourceLocation {
 
 ## 🛠️ Cargo Integration
 
-### cargo-rustsp
+### Apa itu cargo-rustsp?
 
-`cargo-rustsp` adalah tool untuk integrasi seamless dengan Cargo workflow.
+`cargo-rustsp` adalah **build tool** yang mengintegrasikan RustS+ compiler dengan ekosistem Cargo. Dengan cargo-rustsp, kamu bisa menggunakan workflow Cargo yang familiar (`cargo build`, `cargo run`, dll) untuk project RustS+.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        cargo-rustsp v0.9.0                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐             │
+│  │  .rss files │───▶│   rustsp    │───▶│  .rs files  │───▶ cargo   │
+│  │  (RustS+)   │    │  compiler   │    │  (Rust)     │    build    │
+│  └─────────────┘    └─────────────┘    └─────────────┘             │
+│         ▲                                                           │
+│         │                                                           │
+│  ┌──────┴──────────────────────────────────────────────────────┐   │
+│  │  Features:                                                   │   │
+│  │  • Multi-module resolution (nested modules, mod.rss)         │   │
+│  │  • Workspace support (multiple crates)                       │   │
+│  │  • Incremental compilation (hash-based caching)              │   │
+│  │  • Mixed .rs/.rss projects                                   │   │
+│  │  • Feature flags support                                     │   │
+│  │  • Source-mapped error reporting                             │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Fitur Utama
+
+| Fitur | Deskripsi |
+|-------|-----------|
+| **Multi-Module** | Full support untuk nested modules (`mod foo;` resolves ke `foo.rss` atau `foo/mod.rss`) |
+| **Workspace** | Build multiple crates dalam satu workspace |
+| **Incremental** | Hash-based caching - hanya recompile file yang berubah |
+| **Mixed Projects** | Gabungkan `.rs` (pure Rust) dan `.rss` (RustS+) dalam satu project |
+| **Features** | Full `--features` support seperti cargo biasa |
+| **Error Mapping** | Error messages menunjuk ke lokasi di file `.rss` asli |
 
 ### Installation
 
 ```bash
-# Build
-rustc cargo-rustsp.rs -o cargo-rustsp
+# Clone repository
+git clone https://github.com/novenrizkia856-ui/rustsp-Rlang
+cd rustsp-Rlang-main
 
-# Install
-cp cargo-rustsp ~/.cargo/bin/
+# Build compiler dan cargo-rustsp
+cargo build --release
+
+# Install ke PATH
+cp target/release/rustsp ~/.cargo/bin/
+cp target/release/cargo-rustsp ~/.cargo/bin/
+
+# Verifikasi instalasi
+cargo rustsp --version
+# Output: cargo-rustsp 0.9.0
 ```
 
 ### Commands
@@ -1072,19 +1116,106 @@ cp cargo-rustsp ~/.cargo/bin/
 | `cargo rustsp build` | Compile RustS+ project |
 | `cargo rustsp run` | Build and run |
 | `cargo rustsp test` | Run tests |
-| `cargo rustsp check` | Type check without compiling |
+| `cargo rustsp check` | Check tanpa compile binary |
 | `cargo rustsp clean` | Clean build artifacts |
+| `cargo rustsp bench` | Run benchmarks |
+| `cargo rustsp doc` | Generate documentation |
 
-### Project Structure
+### Options
+
+```bash
+cargo rustsp build [OPTIONS]
+
+OPTIONS:
+    -r, --release              Build in release mode
+    -q, --quiet                Suppress output
+    -f, --force                Force rebuild (ignore cache)
+    -p, --package <SPEC>       Build specific package (workspace)
+    -j, --jobs <N>             Number of parallel jobs
+    -F, --features <FEATURES>  Features to activate
+    --all-features             Activate all features
+    --no-default-features      Disable default features
+```
+
+### Project Structures
+
+#### Single File Project
 
 ```
 my_project/
 ├── Cargo.toml
 └── src/
-    ├── main.rss      # Entry point
-    ├── lib.rss       # Library code
-    └── utils/
-        └── mod.rss   # Module
+    └── main.rss
+```
+
+#### Multi-Module Project
+
+```
+my_project/
+├── Cargo.toml
+└── src/
+    ├── main.rss           # mod utils; mod parser;
+    ├── utils.rss          # Flat module
+    └── parser/
+        ├── mod.rss        # pub mod lexer; pub mod tokens;
+        ├── lexer.rss
+        └── tokens.rss
+```
+
+#### Library + Binary
+
+```
+my_project/
+├── Cargo.toml
+└── src/
+    ├── lib.rss            # Library entry point
+    ├── main.rss           # Binary entry point  
+    ├── core.rss           # Library module
+    └── api.rss            # Library module
+```
+
+#### Mixed .rs/.rss Project
+
+```
+my_project/
+├── Cargo.toml
+└── src/
+    ├── main.rss           # RustS+ dengan effects
+    ├── pure_rust.rs       # Pure Rust (tanpa effects)
+    └── with_effects.rss   # RustS+ dengan effects
+```
+
+#### Workspace
+
+```
+my_workspace/
+├── Cargo.toml             # [workspace] members = ["core", "cli"]
+├── core/
+│   ├── Cargo.toml
+│   └── src/
+│       └── lib.rss
+└── cli/
+    ├── Cargo.toml
+    └── src/
+        └── main.rss
+```
+
+### Module Resolution
+
+cargo-rustsp mengikuti aturan module resolution Rust:
+
+```
+mod foo;  →  Mencari dalam urutan:
+             1. foo.rss      (RustS+ file)
+             2. foo/mod.rss  (RustS+ directory module)
+             3. foo.rs       (Rust file)
+             4. foo/mod.rs   (Rust directory module)
+```
+
+Custom path dengan attribute:
+```rust
+#[path = "custom/location.rss"]
+mod my_module;
 ```
 
 ### Build Process
@@ -1094,49 +1225,129 @@ cargo rustsp build
         │
         ▼
 ┌───────────────────────────────────────┐
-│ 1. Scan src/ for .rss files           │
+│ 1. Analyze module graph               │
+│    - Parse mod declarations           │
+│    - Resolve all dependencies         │
 └───────────────┬───────────────────────┘
                 │
                 ▼
 ┌───────────────────────────────────────┐
-│ 2. For each .rss file:                │
+│ 2. Check cache                        │
+│    - Hash-based change detection      │
+│    - Skip unchanged files             │
+└───────────────┬───────────────────────┘
+                │
+                ▼
+┌───────────────────────────────────────┐
+│ 3. Compile .rss files                 │
 │    rustsp file.rss --emit-rs          │
 │    (Stage 0 → Stage 1 → Stage 2)      │
+│                                       │
+│    ⚠️ ERROR? STOPS HERE               │
 └───────────────┬───────────────────────┘
                 │
                 ▼
 ┌───────────────────────────────────────┐
-│ 3. Copy generated .rs to shadow dir   │
+│ 4. Copy to shadow directory           │
 │    /tmp/rustsp_shadow_<project>/      │
+│    - .rs files (compiled dari .rss)   │
+│    - .rs files (copy dari .rs asli)   │
 └───────────────┬───────────────────────┘
                 │
                 ▼
 ┌───────────────────────────────────────┐
-│ 4. Generate Cargo.toml                │
+│ 5. Generate Cargo.toml                │
 └───────────────┬───────────────────────┘
                 │
                 ▼
 ┌───────────────────────────────────────┐
-│ 5. cargo build in shadow directory    │
+│ 6. cargo build                        │
 │    Output: target/rustsp_build/       │
 └───────────────────────────────────────┘
 ```
 
+### Incremental Compilation
+
+cargo-rustsp menyimpan cache untuk mempercepat rebuild:
+
+```
+target/
+└── rustsp_build/
+    ├── .rustsp_cache      # Hash-based cache file
+    ├── debug/             # Debug build artifacts
+    └── release/           # Release build artifacts
+```
+
+Cara kerja:
+- Setiap file `.rss` di-hash berdasarkan content
+- Jika hash sama dengan cache → skip compilation
+- Force rebuild dengan `--force`
+
 ### Shadow Directory Isolation
 
-cargo-rustsp menggunakan temp directory untuk menghindari konflik:
+cargo-rustsp menggunakan TEMP directory untuk menghindari konflik dengan parent Cargo.toml:
 
 ```
-Original Project         Shadow Project (TEMP)
-────────────────         ─────────────────────
-my_project/              /tmp/rustsp_shadow_my_project/
-├── Cargo.toml           ├── Cargo.toml (generated)
-└── src/                 └── src/
-    ├── main.rss             ├── main.rs (compiled)
-    └── lib.rss              └── lib.rs (compiled)
+Original Project              Shadow Project (TEMP)
+────────────────              ─────────────────────
+my_project/                   /tmp/rustsp_shadow_my_project/
+├── Cargo.toml                ├── Cargo.toml (generated)
+└── src/                      └── src/
+    ├── main.rss                  ├── main.rs (compiled)
+    ├── utils.rss                 ├── utils.rs (compiled)
+    └── helper.rs                 └── helper.rs (copied)
 ```
 
----
+### Workspace Build
+
+Untuk workspace dengan multiple crates:
+
+```bash
+# Build semua members yang punya .rss files
+cargo rustsp build
+
+# Build specific package
+cargo rustsp build -p core
+
+# Build all packages (termasuk pure Rust)
+cargo rustsp build --workspace
+```
+
+### Feature Flags
+
+```bash
+# Enable specific features
+cargo rustsp build --features="async,serde"
+
+# Enable all features
+cargo rustsp build --all-features
+
+# Disable default features
+cargo rustsp build --no-default-features --features="minimal"
+```
+
+### Troubleshooting
+
+#### "Could not find Cargo.toml"
+Pastikan kamu di directory yang berisi `Cargo.toml` atau subdirectory-nya.
+
+#### "No .rss files found"
+cargo-rustsp akan fallback ke plain `cargo` jika tidak ada file `.rss`.
+
+#### "rustsp: command not found"
+Pastikan `rustsp` compiler ada di PATH atau di directory yang sama dengan `cargo-rustsp`.
+
+#### Cache Issues
+Jika build terasa stale:
+```bash
+cargo rustsp clean
+cargo rustsp build --force
+```
+
+#### Module Not Found
+Pastikan struktur folder mengikuti konvensi:
+- `mod foo;` → butuh `foo.rss` ATAU `foo/mod.rss`
+
 
 ## 🔬 Technical Deep Dive
 
