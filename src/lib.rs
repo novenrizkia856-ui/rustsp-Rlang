@@ -79,6 +79,84 @@ fn strip_inline_comment(line: &str) -> String {
     result.trim_end().to_string()
 }
 
+/// Transform RustS+ generic syntax to Rust generic syntax
+/// RustS+ uses square brackets for generics: `Vec[String]`, `HashMap[K, V]`
+/// Rust uses angle brackets: `Vec<String>`, `HashMap<K, V>`
+/// 
+/// Examples:
+/// - `Vec[String]` → `Vec<String>`
+/// - `HashMap[String, i32]` → `HashMap<String, i32>`
+/// - `Option[T]` → `Option<T>`
+/// - `Result[T, E]` → `Result<T, E>`
+/// - `&[u8]` → `&[u8]` (unchanged - this is a slice, not a generic)
+/// - `[T]` → `[T]` (unchanged - bare slice)
+fn transform_generic_brackets(type_str: &str) -> String {
+    let trimmed = type_str.trim();
+    
+    // List of known generic types that use Type[T] syntax
+    const GENERIC_TYPES: &[&str] = &[
+        "Vec", "HashMap", "HashSet", "BTreeMap", "BTreeSet",
+        "Option", "Result", "Box", "Rc", "Arc", "RefCell", "Cell",
+        "Mutex", "RwLock", "Cow", "PhantomData",
+        "VecDeque", "LinkedList", "BinaryHeap",
+    ];
+    
+    let mut result = trimmed.to_string();
+    
+    for generic_type in GENERIC_TYPES {
+        // Pattern: `GenericType[` (not preceded by another identifier char)
+        let pattern = format!("{}[", generic_type);
+        
+        if let Some(pos) = result.find(&pattern) {
+            // Make sure it's not part of a larger identifier
+            let is_word_boundary = pos == 0 || {
+                let prev_char = result.chars().nth(pos - 1).unwrap_or(' ');
+                !prev_char.is_alphanumeric() && prev_char != '_'
+            };
+            
+            if is_word_boundary {
+                // Find matching closing bracket
+                let bracket_start = pos + generic_type.len();
+                if let Some(bracket_end) = find_matching_bracket(&result[bracket_start..]) {
+                    let inner = &result[bracket_start + 1..bracket_start + bracket_end];
+                    // Recursively transform inner types
+                    let transformed_inner = transform_generic_brackets(inner);
+                    
+                    let before = &result[..pos];
+                    let after = &result[bracket_start + bracket_end + 1..];
+                    
+                    result = format!("{}{}<{}>{}", before, generic_type, transformed_inner, after);
+                }
+            }
+        }
+    }
+    
+    result
+}
+
+/// Find the position of the matching closing bracket for a string starting with `[`
+/// Returns the index of `]` relative to the start of the string
+fn find_matching_bracket(s: &str) -> Option<usize> {
+    if !s.starts_with('[') {
+        return None;
+    }
+    
+    let mut depth = 0;
+    for (i, c) in s.chars().enumerate() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Check if a line ends with a binary continuation operator
 /// These lines are incomplete - the expression continues on the next line
 fn ends_with_continuation_operator(line: &str) -> bool {
@@ -2912,7 +2990,17 @@ pub fn parse_rusts(source: &str) -> String {
         .map(|line| strip_outer_keyword(&line))
         .collect();
     
-    let result = outer_stripped.join("\n");
+    //==========================================================================
+    // CRITICAL POST-PROCESSING: Transform RustS+ generic syntax to Rust
+    // `Vec[String]` → `Vec<String>`, `HashMap[K, V]` → `HashMap<K, V>`
+    // This handles generic type annotations throughout the code
+    //==========================================================================
+    let generic_transformed: Vec<String> = outer_stripped
+        .into_iter()
+        .map(|line| transform_generic_brackets(&line))
+        .collect();
+    
+    let result = generic_transformed.join("\n");
     
     //==========================================================================
     // L-05: RUST SANITY CHECK

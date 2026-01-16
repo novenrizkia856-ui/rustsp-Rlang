@@ -48,6 +48,70 @@ pub enum FunctionParseResult {
 // PARAMETER TYPE TRANSFORMATION
 // ============================================================================
 
+/// Transform RustS+ generic syntax to Rust generic syntax
+/// RustS+ uses square brackets for generics: `Vec[String]`, `HashMap[K, V]`
+/// Rust uses angle brackets: `Vec<String>`, `HashMap<K, V>`
+fn transform_generic_brackets(type_str: &str) -> String {
+    let trimmed = type_str.trim();
+    
+    // List of known generic types that use Type[T] syntax
+    const GENERIC_TYPES: &[&str] = &[
+        "Vec", "HashMap", "HashSet", "BTreeMap", "BTreeSet",
+        "Option", "Result", "Box", "Rc", "Arc", "RefCell", "Cell",
+        "Mutex", "RwLock", "Cow", "PhantomData",
+        "VecDeque", "LinkedList", "BinaryHeap",
+    ];
+    
+    let mut result = trimmed.to_string();
+    
+    for generic_type in GENERIC_TYPES {
+        let pattern = format!("{}[", generic_type);
+        
+        if let Some(pos) = result.find(&pattern) {
+            let is_word_boundary = pos == 0 || {
+                let prev_char = result.chars().nth(pos - 1).unwrap_or(' ');
+                !prev_char.is_alphanumeric() && prev_char != '_'
+            };
+            
+            if is_word_boundary {
+                let bracket_start = pos + generic_type.len();
+                if let Some(bracket_end) = find_matching_bracket(&result[bracket_start..]) {
+                    let inner = &result[bracket_start + 1..bracket_start + bracket_end];
+                    let transformed_inner = transform_generic_brackets(inner);
+                    
+                    let before = &result[..pos];
+                    let after = &result[bracket_start + bracket_end + 1..];
+                    
+                    result = format!("{}{}<{}>{}", before, generic_type, transformed_inner, after);
+                }
+            }
+        }
+    }
+    
+    result
+}
+
+fn find_matching_bracket(s: &str) -> Option<usize> {
+    if !s.starts_with('[') {
+        return None;
+    }
+    
+    let mut depth = 0;
+    for (i, c) in s.chars().enumerate() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// L-06: Transform parameter type for valid Rust
 /// 
 /// Bare slice types [T] are unsized and cannot be function parameters.
@@ -56,16 +120,23 @@ pub enum FunctionParseResult {
 /// L-05: Also strips any effect annotations from parameter types!
 /// Effect annotations MUST NOT appear in Rust output.
 /// 
+/// Also transforms RustS+ generic syntax: Vec[T] → Vec<T>
+/// 
 /// Examples:
 /// - `[Tx]` → `&[Tx]`
 /// - `[u8]` → `&[u8]`
-/// - `Vec<T>` → `Vec<T>` (unchanged, already sized)
+/// - `Vec[T]` → `Vec<T>` (generic transformation)
+/// - `Vec<T>` → `Vec<T>` (unchanged, already Rust syntax)
 /// - `&[T]` → `&[T]` (already borrowed, unchanged)
 /// - `effects(read x) T` → `T` (effects stripped)
 fn transform_param_type(type_str: &str) -> String {
     // L-05 CRITICAL: Strip effects clause FIRST before any other transformation
     let stripped = strip_effects_clause(type_str);
     let trimmed = stripped.trim();
+    
+    // CRITICAL: Transform generic brackets Vec[T] → Vec<T>
+    let generic_transformed = transform_generic_brackets(trimmed);
+    let trimmed = generic_transformed.as_str();
     
     // If it's already a reference, leave it alone
     if trimmed.starts_with('&') {
@@ -1068,7 +1139,9 @@ pub fn signature_to_rust(sig: &FunctionSignature) -> String {
     
     if let Some(ref ret) = sig.return_type {
         // CRITICAL FIX: Don't add arrow if return type already has it
-        let ret_trimmed = ret.trim();
+        // Also transform generic brackets: Vec[T] → Vec<T>
+        let ret_transformed = transform_generic_brackets(ret);
+        let ret_trimmed = ret_transformed.trim();
         if !ret_trimmed.is_empty() {
             if ret_trimmed.starts_with("->") {
                 result.push(' ');
