@@ -1,5 +1,5 @@
 //! cargo-rustsp - Robust Cargo Integration for RustS+
-//! v1.0.0 - Full multi-module, workspace, and incremental compilation support
+//! v0.9.0 - Full multi-module, workspace, and incremental compilation support
 //!
 //! Features:
 //! - Multi-module resolution (nested modules, mod.rss)
@@ -1111,6 +1111,18 @@ fn build_single_crate(ctx: &mut BuildContext, crate_root: &Path) -> Result<(), S
 }
 
 fn run_plain_cargo(crate_root: &Path, config: &BuildConfig) -> Result<(), String> {
+    // Safety check: verify that at least one target exists
+    let src_dir = crate_root.join("src");
+    let has_main_rs = src_dir.join("main.rs").exists();
+    let has_lib_rs = src_dir.join("lib.rs").exists();
+    
+    if !has_main_rs && !has_lib_rs {
+        return Err(format!(
+            "Cannot run plain cargo: no src/main.rs or src/lib.rs found.\n\
+             If you have .rss files, make sure you have a main.rss or lib.rss entry point."
+        ));
+    }
+    
     let mut cmd = Command::new("cargo");
     cmd.current_dir(crate_root)
         .arg(&config.subcommand);
@@ -1266,7 +1278,7 @@ fn clean_rustsp_artifacts(project_root: &Path, quiet: bool) {
 //=============================================================================
 
 fn print_usage() {
-    eprintln!("{}cargo-rustsp{} v1.0.0 - Robust Cargo Integration for RustS+", 
+    eprintln!("{}cargo-rustsp{} v0.9.0 - Robust Cargo Integration for RustS+", 
         ansi::BOLD_CYAN, ansi::RESET);
     eprintln!();
     eprintln!("{}USAGE:{}", ansi::BOLD, ansi::RESET);
@@ -1326,7 +1338,7 @@ fn main() {
     }
     
     if action == "-V" || action == "--version" {
-        println!("cargo-rustsp 1.0.0");
+        println!("cargo-rustsp 0.9.0");
         exit(0);
     }
     
@@ -1354,14 +1366,27 @@ fn main() {
         let quiet = args.iter().any(|a| a == "-q" || a == "--quiet");
         clean_rustsp_artifacts(&project_root, quiet);
         
-        // Also run cargo clean
-        let status = Command::new("cargo")
-            .current_dir(&project_root)
-            .arg("clean")
-            .status()
-            .expect("Failed to run cargo clean");
+        // Also clean standard target/ if it exists (for mixed projects)
+        // We do this manually instead of `cargo clean` because:
+        // - Original project may only have .rss files, no .rs files
+        // - Cargo would fail with "no targets specified" error
+        let standard_target = project_root.join("target");
+        if standard_target.exists() {
+            // Only clean if it's NOT the rustsp_build directory itself
+            let rustsp_build = standard_target.join("rustsp_build");
+            if !rustsp_build.exists() || standard_target.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false) {
+                if !quiet {
+                    eprintln!("{}   Cleaning{} {}", ansi::BOLD_CYAN, ansi::RESET, standard_target.display());
+                }
+                let _ = fs::remove_dir_all(&standard_target);
+            }
+        }
         
-        exit(if status.success() { 0 } else { 1 });
+        if !quiet {
+            eprintln!("{}   Cleaned{} RustS+ build artifacts", ansi::BOLD_GREEN, ansi::RESET);
+        }
+        
+        exit(0);
     }
     
     // Parse config
