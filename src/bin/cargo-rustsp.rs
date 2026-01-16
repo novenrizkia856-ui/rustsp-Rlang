@@ -1,5 +1,5 @@
 //! cargo-rustsp - Robust Cargo Integration for RustS+
-//! v0.9.0 - Full multi-module, workspace, and incremental compilation support
+//! v1.0.0 - Full multi-module, workspace, and incremental compilation support
 //!
 //! Features:
 //! - Multi-module resolution (nested modules, mod.rss)
@@ -1266,7 +1266,7 @@ fn clean_rustsp_artifacts(project_root: &Path, quiet: bool) {
 //=============================================================================
 
 fn print_usage() {
-    eprintln!("{}cargo-rustsp{} v0.9.0 - Robust Cargo Integration for RustS+", 
+    eprintln!("{}cargo-rustsp{} v1.0.0 - Robust Cargo Integration for RustS+", 
         ansi::BOLD_CYAN, ansi::RESET);
     eprintln!();
     eprintln!("{}USAGE:{}", ansi::BOLD, ansi::RESET);
@@ -1326,7 +1326,7 @@ fn main() {
     }
     
     if action == "-V" || action == "--version" {
-        println!("cargo-rustsp 0.9.0");
+        println!("cargo-rustsp 1.0.0");
         exit(0);
     }
     

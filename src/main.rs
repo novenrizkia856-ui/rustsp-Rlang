@@ -320,7 +320,7 @@ fn rust_sanity_check(rust_code: &str) -> Option<String> {
 fn print_usage() {
     eprintln!("{}╔═══════════════════════════════════════════════════════════════╗{}", 
         ansi::BOLD_CYAN, ansi::RESET);
-    eprintln!("{}║              RustS+ Compiler v0.8.0 (IR Edition)              ║{}",
+    eprintln!("{}║              RustS+ Compiler v1.0.0 (IR Edition)              ║{}",
         ansi::BOLD_CYAN, ansi::RESET);
     eprintln!("{}║      The Language with Effect Honesty                         ║{}",
         ansi::BOLD_CYAN, ansi::RESET);
@@ -384,7 +384,7 @@ fn print_usage() {
 }
 
 fn print_version() {
-    println!("RustS+ Compiler v0.8.0 (IR Edition)");
+    println!("RustS+ Compiler v1.0.0 (Stable version)");
     println!("Effect System: Enabled (Full Effect Ownership)");
     println!("Logic Checks: L-01 through L-06");
     println!("Effect Checks: Effect-01 through Effect-06");

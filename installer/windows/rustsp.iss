@@ -1,6 +1,6 @@
 [Setup]
 AppName=RustS+
-AppVersion=0.1.0
+AppVersion=1.0.0
 DefaultDirName=C:\RustS+
 DefaultGroupName=RustS+
 UninstallDisplayIcon={app}\bin\rustsp.exe
