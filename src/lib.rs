@@ -107,11 +107,10 @@ fn needs_semicolon(trimmed: &str) -> bool {
     if trimmed.ends_with('{') || trimmed.ends_with('}') { return false; }
     if trimmed.ends_with(',') { return false; }
     
-    // CRITICAL FIX: Lines starting with `.` are method chain CONTINUATIONS
-    // They should NOT get semicolons as they continue from previous line
-    if trimmed.starts_with('.') {
-        return false;
-    }
+    // NOTE: Lines starting with `.` (method chains) are handled by `next_line_is_method_chain`
+    // check in the main loop. We REMOVED the unconditional skip here because the LAST line
+    // of a method chain DOES need a semicolon when followed by a new statement.
+    // Example: `.collect()` followed by `let x = ...` needs semicolon!
     
     // CRITICAL: Lines ending with binary operators are CONTINUATIONS
     // They should NOT get semicolons as the expression continues on the next line
@@ -148,7 +147,9 @@ fn needs_semicolon(trimmed: &str) -> bool {
     }
     
     if trimmed.starts_with('#') { return false; }
-    if trimmed == ")" || trimmed == ");" { return false; }
+    // NOTE: Removed check for standalone `)` - multiline expression tracking handles this
+    // Standalone `)` closing a statement NEEDS semicolon!
+    if trimmed == ");" { return false; }  // Already has semicolon
     
     true
 }
@@ -241,9 +242,14 @@ fn transform_macro_calls(line: &str) -> String {
                 
                 if remaining.starts_with(&search_pattern) {
                     // Check that it's not part of another identifier
-                    let is_word_start = i == 0 || !chars[i-1].is_alphanumeric() && chars[i-1] != '_';
+                    // AND not a method call (preceded by `.`)
+                    let is_word_start = i == 0 || (!chars[i-1].is_alphanumeric() && chars[i-1] != '_');
                     
-                    if is_word_start {
+                    // CRITICAL FIX: If preceded by `.`, it's a method call, NOT a macro!
+                    // e.g., `block.format()` should stay as method call
+                    let is_method_call = i > 0 && chars[i-1] == '.';
+                    
+                    if is_word_start && !is_method_call {
                         // Check it's not already `macro_name!(`
                         let before_paren: String = chars[i..i+macro_name.len()].iter().collect();
                         if before_paren == *macro_name {
@@ -1655,8 +1661,11 @@ pub fn parse_rusts(source: &str) -> String {
             }
         }
         
-        // If we were inside a multiline expression BEFORE this line, skip semicolons
-        let inside_multiline_expr = multiline_depth_before > 0;
+        // CRITICAL FIX: Skip semicolon ONLY if we're STILL inside a multiline expression
+        // after processing this line. This ensures CLOSING lines (like `)`) get semicolons!
+        // - Lines INSIDE: depth_before > 0 AND depth_after > 0 → skip semicolon
+        // - CLOSING line: depth_before > 0 AND depth_after == 0 → ADD semicolon!
+        let inside_multiline_expr = multiline_depth_before > 0 && multiline_expr_depth > 0;
         
         // LOOK-AHEAD: Check if next line starts with `.` (method chain continuation)
         // If so, don't add semicolon to current line
