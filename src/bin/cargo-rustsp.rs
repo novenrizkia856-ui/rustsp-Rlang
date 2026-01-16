@@ -1,21 +1,701 @@
-//! cargo-rustsp - Cargo Integration for RustS+
-//! v0.8.0 - Use TEMP directory to completely isolate from parent Cargo.toml
+//! cargo-rustsp - Robust Cargo Integration for RustS+
+//! v0.9.0 - Full multi-module, workspace, and incremental compilation support
+//!
+//! Features:
+//! - Multi-module resolution (nested modules, mod.rss)
+//! - Workspace support (multiple crates)
+//! - Incremental compilation (hash-based caching)
+//! - Proper module graph building
+//! - Enhanced error reporting
+//! - Mixed .rs/.rss projects
 
+use std::collections::{HashMap, HashSet, BTreeMap};
 use std::env;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{self, Read, Write, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, exit};
-use std::io::{self, Write};
+use std::process::{Command, exit, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+
+//=============================================================================
+// ANSI Color Codes
+//=============================================================================
 
 mod ansi {
     pub const RESET: &str = "\x1b[0m";
+    pub const BOLD: &str = "\x1b[1m";
+    pub const DIM: &str = "\x1b[2m";
+    
+    pub const RED: &str = "\x1b[31m";
+    pub const GREEN: &str = "\x1b[32m";
+    pub const YELLOW: &str = "\x1b[33m";
+    pub const BLUE: &str = "\x1b[34m";
+    pub const MAGENTA: &str = "\x1b[35m";
+    pub const CYAN: &str = "\x1b[36m";
+    
     pub const BOLD_RED: &str = "\x1b[1;31m";
     pub const BOLD_GREEN: &str = "\x1b[1;32m";
+    pub const BOLD_YELLOW: &str = "\x1b[1;33m";
+    pub const BOLD_BLUE: &str = "\x1b[1;34m";
     pub const BOLD_CYAN: &str = "\x1b[1;36m";
-    pub const CYAN: &str = "\x1b[36m";
-    pub const DIM: &str = "\x1b[2m";
 }
+
+//=============================================================================
+// Build Cache for Incremental Compilation
+//=============================================================================
+
+#[derive(Debug, Clone)]
+struct FileCache {
+    entries: HashMap<PathBuf, CacheEntry>,
+    cache_file: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    source_hash: u64,
+    modified_time: u64,
+    output_path: PathBuf,
+}
+
+impl FileCache {
+    fn new(cache_dir: &Path) -> Self {
+        let cache_file = cache_dir.join(".rustsp_cache");
+        let entries = Self::load_cache(&cache_file).unwrap_or_default();
+        FileCache { entries, cache_file }
+    }
+    
+    fn load_cache(path: &Path) -> Option<HashMap<PathBuf, CacheEntry>> {
+        let content = fs::read_to_string(path).ok()?;
+        let mut entries = HashMap::new();
+        
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() >= 4 {
+                let source = PathBuf::from(parts[0]);
+                let hash: u64 = parts[1].parse().ok()?;
+                let mtime: u64 = parts[2].parse().ok()?;
+                let output = PathBuf::from(parts[3]);
+                
+                entries.insert(source, CacheEntry {
+                    source_hash: hash,
+                    modified_time: mtime,
+                    output_path: output,
+                });
+            }
+        }
+        Some(entries)
+    }
+    
+    fn save(&self) -> io::Result<()> {
+        if let Some(parent) = self.cache_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        
+        let mut content = String::new();
+        for (source, entry) in &self.entries {
+            content.push_str(&format!(
+                "{}\t{}\t{}\t{}\n",
+                source.display(),
+                entry.source_hash,
+                entry.modified_time,
+                entry.output_path.display()
+            ));
+        }
+        fs::write(&self.cache_file, content)
+    }
+    
+    fn needs_rebuild(&self, source: &Path, content_hash: u64) -> bool {
+        match self.entries.get(source) {
+            Some(entry) => entry.source_hash != content_hash,
+            None => true,
+        }
+    }
+    
+    fn update(&mut self, source: PathBuf, hash: u64, output: PathBuf) {
+        let mtime = get_modified_time(&source);
+        self.entries.insert(source, CacheEntry {
+            source_hash: hash,
+            modified_time: mtime,
+            output_path: output,
+        });
+    }
+}
+
+fn hash_content(content: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn get_modified_time(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).map_err(|e| io::Error::new(io::ErrorKind::Other, e)))
+        .unwrap_or(0)
+}
+
+//=============================================================================
+// Module Graph - Tracks module dependencies and structure
+//=============================================================================
+
+#[derive(Debug, Clone)]
+struct ModuleNode {
+    /// Original source file path (.rss or .rs)
+    source_path: PathBuf,
+    /// Module name (e.g., "parser", "parser::lexer")
+    module_name: String,
+    /// Is this a .rss file that needs compilation?
+    is_rustsp: bool,
+    /// Child modules declared via `mod foo;`
+    children: Vec<String>,
+    /// Output path in shadow directory
+    output_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ModuleGraph {
+    /// All modules indexed by their path relative to src/
+    nodes: BTreeMap<String, ModuleNode>,
+    /// Root modules (main.rs/lib.rs)
+    roots: Vec<String>,
+}
+
+impl ModuleGraph {
+    fn new() -> Self {
+        ModuleGraph {
+            nodes: BTreeMap::new(),
+            roots: Vec::new(),
+        }
+    }
+    
+    fn add_node(&mut self, rel_path: String, node: ModuleNode) {
+        self.nodes.insert(rel_path, node);
+    }
+    
+    fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+    
+    fn rss_count(&self) -> usize {
+        self.nodes.values().filter(|n| n.is_rustsp).count()
+    }
+    
+    fn rs_count(&self) -> usize {
+        self.nodes.values().filter(|n| !n.is_rustsp).count()
+    }
+}
+
+//=============================================================================
+// Module Resolution - Handles Rust's module system
+//=============================================================================
+
+/// Parse a file to extract `mod` declarations
+fn extract_mod_declarations(content: &str) -> Vec<(String, Option<String>)> {
+    let mut mods = Vec::new();
+    
+    for line in content.lines() {
+        let trimmed = line.trim();
+        
+        // Skip comments
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+        
+        // Match: mod foo; or pub mod foo; or #[path = "..."] mod foo;
+        let line_without_pub = if trimmed.starts_with("pub ") {
+            &trimmed[4..]
+        } else {
+            trimmed
+        };
+        
+        // Check for #[path = "..."] attribute on previous lines
+        // For simplicity, we'll handle inline path attributes
+        let path_attr = extract_path_attribute(trimmed);
+        
+        if line_without_pub.starts_with("mod ") {
+            // Extract module name
+            let rest = line_without_pub[4..].trim();
+            
+            // mod foo; (declaration) vs mod foo { } (inline)
+            if let Some(semicolon) = rest.find(';') {
+                let mod_name = rest[..semicolon].trim().to_string();
+                if is_valid_module_name(&mod_name) {
+                    mods.push((mod_name, path_attr));
+                }
+            }
+            // Inline modules (mod foo { ... }) are not external files
+        }
+    }
+    
+    mods
+}
+
+fn extract_path_attribute(line: &str) -> Option<String> {
+    // Simple extraction of #[path = "..."]
+    if line.contains("#[path") {
+        if let Some(start) = line.find('"') {
+            if let Some(end) = line[start+1..].find('"') {
+                return Some(line[start+1..start+1+end].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn is_valid_module_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let first = name.chars().next().unwrap();
+    if !first.is_ascii_lowercase() && first != '_' {
+        return false;
+    }
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Resolve module path following Rust's module resolution rules
+/// Returns (source_path, is_rustsp)
+fn resolve_module_path(
+    parent_dir: &Path,
+    mod_name: &str,
+    custom_path: Option<&str>,
+) -> Option<(PathBuf, bool)> {
+    // If custom path specified, use it
+    if let Some(path) = custom_path {
+        let full_path = parent_dir.join(path);
+        if full_path.exists() {
+            let is_rss = path.ends_with(".rss");
+            return Some((full_path, is_rss));
+        }
+    }
+    
+    // Standard resolution order:
+    // 1. mod_name.rss (RustS+ file)
+    // 2. mod_name/mod.rss (RustS+ directory module)
+    // 3. mod_name.rs (Rust file)
+    // 4. mod_name/mod.rs (Rust directory module)
+    
+    let candidates = [
+        (parent_dir.join(format!("{}.rss", mod_name)), true),
+        (parent_dir.join(mod_name).join("mod.rss"), true),
+        (parent_dir.join(format!("{}.rs", mod_name)), false),
+        (parent_dir.join(mod_name).join("mod.rs"), false),
+    ];
+    
+    for (path, is_rss) in candidates {
+        if path.exists() {
+            return Some((path, is_rss));
+        }
+    }
+    
+    None
+}
+
+/// Build complete module graph starting from entry points
+fn build_module_graph(
+    src_dir: &Path,
+    shadow_src: &Path,
+) -> Result<ModuleGraph, String> {
+    let mut graph = ModuleGraph::new();
+    let mut to_process: Vec<(PathBuf, String, PathBuf)> = Vec::new(); // (source, module_path, output)
+    
+    // Find root modules
+    let roots = [
+        ("main.rss", "main", true),
+        ("main.rs", "main", false),
+        ("lib.rss", "lib", true),
+        ("lib.rs", "lib", false),
+    ];
+    
+    for (filename, mod_name, is_rss) in roots {
+        let source_path = src_dir.join(filename);
+        if source_path.exists() {
+            let output_name = if is_rss { 
+                format!("{}.rs", mod_name) 
+            } else { 
+                filename.to_string() 
+            };
+            let output_path = shadow_src.join(&output_name);
+            
+            graph.roots.push(mod_name.to_string());
+            to_process.push((source_path, mod_name.to_string(), output_path));
+        }
+    }
+    
+    // Process modules recursively
+    let mut processed: HashSet<PathBuf> = HashSet::new();
+    
+    while let Some((source_path, module_path, output_path)) = to_process.pop() {
+        if processed.contains(&source_path) {
+            continue;
+        }
+        processed.insert(source_path.clone());
+        
+        let is_rustsp = source_path.extension()
+            .map(|e| e == "rss")
+            .unwrap_or(false);
+        
+        // Read file content
+        let content = fs::read_to_string(&source_path)
+            .map_err(|e| format!("Failed to read {}: {}", source_path.display(), e))?;
+        
+        // Extract mod declarations
+        let mods = extract_mod_declarations(&content);
+        let mut children = Vec::new();
+        
+        // Determine parent directory for resolving child modules
+        let parent_dir = if source_path.file_name().map(|n| n == "mod.rss" || n == "mod.rs").unwrap_or(false) {
+            source_path.parent().unwrap().to_path_buf()
+        } else {
+            // For main.rss/lib.rss, look for modules in same directory
+            // For foo.rss, look in foo/ directory
+            let stem = source_path.file_stem().unwrap().to_string_lossy();
+            if stem == "main" || stem == "lib" {
+                source_path.parent().unwrap().to_path_buf()
+            } else {
+                // foo.rss -> look in foo/
+                source_path.parent().unwrap().join(stem.as_ref())
+            }
+        };
+        
+        // Also check sibling directory for non-mod files
+        let sibling_check_dir = source_path.parent().unwrap();
+        
+        for (mod_name, custom_path) in mods {
+            children.push(mod_name.clone());
+            
+            // Try parent_dir first, then sibling check dir
+            let resolved = resolve_module_path(&parent_dir, &mod_name, custom_path.as_deref())
+                .or_else(|| resolve_module_path(sibling_check_dir, &mod_name, custom_path.as_deref()));
+            
+            if let Some((child_source, child_is_rss)) = resolved {
+                let child_module_path = if module_path == "main" || module_path == "lib" {
+                    mod_name.clone()
+                } else {
+                    format!("{}::{}", module_path, mod_name)
+                };
+                
+                // Calculate output path
+                let rel_source = child_source.strip_prefix(src_dir)
+                    .unwrap_or(&child_source);
+                let output_rel = if child_is_rss {
+                    rel_source.with_extension("rs")
+                } else {
+                    rel_source.to_path_buf()
+                };
+                let child_output = shadow_src.join(output_rel);
+                
+                to_process.push((child_source, child_module_path, child_output));
+            }
+        }
+        
+        // Calculate relative path for graph key
+        let rel_path = source_path.strip_prefix(src_dir)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| source_path.to_string_lossy().to_string());
+        
+        graph.add_node(rel_path, ModuleNode {
+            source_path,
+            module_name: module_path,
+            is_rustsp,
+            children,
+            output_path,
+        });
+    }
+    
+    Ok(graph)
+}
+
+//=============================================================================
+// Workspace Support
+//=============================================================================
+
+#[derive(Debug, Clone)]
+struct WorkspaceMember {
+    name: String,
+    path: PathBuf,
+    has_rustsp: bool,
+}
+
+#[derive(Debug, Clone)]
+enum ProjectKind {
+    SingleCrate,
+    Workspace(Vec<WorkspaceMember>),
+}
+
+fn detect_project_kind(root: &Path) -> Result<ProjectKind, String> {
+    let cargo_toml = root.join("Cargo.toml");
+    let content = fs::read_to_string(&cargo_toml)
+        .map_err(|e| format!("Failed to read Cargo.toml: {}", e))?;
+    
+    // Check for workspace section
+    if content.contains("[workspace]") {
+        let members = parse_workspace_members(&content, root)?;
+        if members.is_empty() {
+            return Err("Workspace has no members".to_string());
+        }
+        return Ok(ProjectKind::Workspace(members));
+    }
+    
+    Ok(ProjectKind::SingleCrate)
+}
+
+fn parse_workspace_members(content: &str, root: &Path) -> Result<Vec<WorkspaceMember>, String> {
+    let mut members = Vec::new();
+    let mut in_workspace = false;
+    let mut in_members = false;
+    
+    for line in content.lines() {
+        let trimmed = line.trim();
+        
+        if trimmed == "[workspace]" {
+            in_workspace = true;
+            continue;
+        }
+        
+        if trimmed.starts_with('[') && trimmed != "[workspace]" {
+            if in_workspace && !trimmed.starts_with("[workspace.") {
+                in_workspace = false;
+                in_members = false;
+            }
+            continue;
+        }
+        
+        if in_workspace && trimmed.starts_with("members") {
+            in_members = true;
+            // Check for inline array
+            if let Some(start) = trimmed.find('[') {
+                if let Some(end) = trimmed.find(']') {
+                    // Inline: members = ["foo", "bar"]
+                    let array_content = &trimmed[start+1..end];
+                    for part in array_content.split(',') {
+                        let member_path = part.trim().trim_matches('"');
+                        if !member_path.is_empty() {
+                            add_workspace_member(&mut members, root, member_path)?;
+                        }
+                    }
+                    in_members = false;
+                }
+            }
+            continue;
+        }
+        
+        if in_members {
+            if trimmed == "]" {
+                in_members = false;
+                continue;
+            }
+            
+            let member_path = trimmed.trim_matches(|c| c == '"' || c == ',' || c == ' ');
+            if !member_path.is_empty() && !member_path.starts_with('#') {
+                add_workspace_member(&mut members, root, member_path)?;
+            }
+        }
+    }
+    
+    // Handle glob patterns like "crates/*"
+    members = expand_glob_members(members, root);
+    
+    Ok(members)
+}
+
+fn add_workspace_member(
+    members: &mut Vec<WorkspaceMember>,
+    root: &Path,
+    member_path: &str,
+) -> Result<(), String> {
+    // Skip glob patterns for now (handled separately)
+    if member_path.contains('*') {
+        // Store as placeholder
+        members.push(WorkspaceMember {
+            name: member_path.to_string(),
+            path: root.join(member_path),
+            has_rustsp: false,
+        });
+        return Ok(());
+    }
+    
+    let full_path = root.join(member_path);
+    if !full_path.exists() {
+        return Err(format!("Workspace member not found: {}", member_path));
+    }
+    
+    let name = full_path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(member_path)
+        .to_string();
+    
+    let has_rustsp = has_rss_files(&full_path.join("src"));
+    
+    members.push(WorkspaceMember {
+        name,
+        path: full_path,
+        has_rustsp,
+    });
+    
+    Ok(())
+}
+
+fn expand_glob_members(members: Vec<WorkspaceMember>, root: &Path) -> Vec<WorkspaceMember> {
+    let mut expanded = Vec::new();
+    
+    for member in members {
+        if member.name.contains('*') {
+            // Expand glob
+            let pattern_parts: Vec<&str> = member.name.split('*').collect();
+            if pattern_parts.len() == 2 {
+                let prefix = pattern_parts[0].trim_end_matches('/');
+                let base_dir = root.join(prefix);
+                
+                if let Ok(entries) = fs::read_dir(&base_dir) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        if path.is_dir() && path.join("Cargo.toml").exists() {
+                            let name = path.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let has_rustsp = has_rss_files(&path.join("src"));
+                            
+                            expanded.push(WorkspaceMember {
+                                name,
+                                path,
+                                has_rustsp,
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            expanded.push(member);
+        }
+    }
+    
+    expanded
+}
+
+fn has_rss_files(dir: &Path) -> bool {
+    if !dir.exists() {
+        return false;
+    }
+    
+    fn check_recursive(path: &Path) -> bool {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let p = entry.path();
+                if p.is_file() && p.extension().map(|e| e == "rss").unwrap_or(false) {
+                    return true;
+                }
+                if p.is_dir() && p.file_name().map(|n| n != "target").unwrap_or(true) {
+                    if check_recursive(&p) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    
+    check_recursive(dir)
+}
+
+//=============================================================================
+// Build Configuration
+//=============================================================================
+
+#[derive(Debug, Clone)]
+struct BuildConfig {
+    /// Project root directory
+    project_root: PathBuf,
+    /// Subcommand: build, run, test, check
+    subcommand: String,
+    /// Extra arguments passed to cargo
+    extra_args: Vec<String>,
+    /// Build in release mode
+    release: bool,
+    /// Quiet mode
+    quiet: bool,
+    /// Skip cache (force rebuild)
+    force_rebuild: bool,
+    /// Number of parallel jobs
+    jobs: Option<usize>,
+    /// Specific package to build (for workspaces)
+    package: Option<String>,
+    /// Features to enable
+    features: Vec<String>,
+    /// All features
+    all_features: bool,
+    /// No default features
+    no_default_features: bool,
+}
+
+impl BuildConfig {
+    fn from_args(args: &[String], project_root: PathBuf) -> Result<Self, String> {
+        let mut config = BuildConfig {
+            project_root,
+            subcommand: String::new(),
+            extra_args: Vec::new(),
+            release: false,
+            quiet: false,
+            force_rebuild: false,
+            jobs: None,
+            package: None,
+            features: Vec::new(),
+            all_features: false,
+            no_default_features: false,
+        };
+        
+        let start_idx = if args.len() > 1 && args[1] == "rustsp" { 2 } else { 1 };
+        
+        if args.len() <= start_idx {
+            return Err("No command specified".to_string());
+        }
+        
+        config.subcommand = args[start_idx].clone();
+        
+        let mut i = start_idx + 1;
+        while i < args.len() {
+            let arg = &args[i];
+            match arg.as_str() {
+                "--release" | "-r" => config.release = true,
+                "--quiet" | "-q" => config.quiet = true,
+                "--force" | "-f" => config.force_rebuild = true,
+                "--all-features" => config.all_features = true,
+                "--no-default-features" => config.no_default_features = true,
+                "-p" | "--package" => {
+                    i += 1;
+                    if i < args.len() {
+                        config.package = Some(args[i].clone());
+                    }
+                }
+                "-j" | "--jobs" => {
+                    i += 1;
+                    if i < args.len() {
+                        config.jobs = args[i].parse().ok();
+                    }
+                }
+                "--features" | "-F" => {
+                    i += 1;
+                    if i < args.len() {
+                        config.features.extend(
+                            args[i].split(',').map(|s| s.trim().to_string())
+                        );
+                    }
+                }
+                _ => config.extra_args.push(arg.clone()),
+            }
+            i += 1;
+        }
+        
+        Ok(config)
+    }
+}
+
+//=============================================================================
+// Path Utilities
+//=============================================================================
 
 fn normalize_path(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
@@ -32,10 +712,14 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
     Ok(normalize_path(&abs))
 }
 
+//=============================================================================
+// Cargo.toml Generation
+//=============================================================================
+
 fn parse_toml_value(content: &str, key: &str) -> Option<String> {
     for line in content.lines() {
         let line = line.trim();
-        if line.starts_with(key) {
+        if line.starts_with(key) && line.contains('=') {
             if let Some(eq_pos) = line.find('=') {
                 let value = line[eq_pos + 1..].trim();
                 if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
@@ -49,38 +733,74 @@ fn parse_toml_value(content: &str, key: &str) -> Option<String> {
 }
 
 fn extract_dependencies(content: &str) -> String {
-    let mut in_deps = false;
-    let mut deps = String::new();
+    let mut result = String::new();
+    let mut in_section = false;
+    let mut current_section = String::new();
+    
+    let dep_sections = [
+        "[dependencies]",
+        "[dev-dependencies]", 
+        "[build-dependencies]",
+    ];
     
     for line in content.lines() {
         let trimmed = line.trim();
         
+        // Check for section headers
         if trimmed.starts_with('[') {
-            if trimmed == "[dependencies]" {
-                in_deps = true;
-                deps.push_str("[dependencies]\n");
-                continue;
-            } else if trimmed == "[dev-dependencies]" {
-                in_deps = true;
-                deps.push_str("\n[dev-dependencies]\n");
-                continue;
-            } else if trimmed == "[build-dependencies]" {
-                in_deps = true;
-                deps.push_str("\n[build-dependencies]\n");
-                continue;
-            } else {
-                in_deps = false;
-                continue;
+            in_section = false;
+            for section in &dep_sections {
+                if trimmed == *section || trimmed.starts_with(&format!("{}.", section.trim_end_matches(']'))) {
+                    in_section = true;
+                    if trimmed != current_section {
+                        if !result.is_empty() {
+                            result.push('\n');
+                        }
+                        result.push_str(trimmed);
+                        result.push('\n');
+                        current_section = trimmed.to_string();
+                    }
+                    break;
+                }
             }
+            continue;
         }
         
-        if in_deps && !trimmed.is_empty() && !trimmed.starts_with('#') {
-            deps.push_str(line);
-            deps.push('\n');
+        if in_section && !trimmed.is_empty() && !trimmed.starts_with('#') {
+            result.push_str(line);
+            result.push('\n');
         }
     }
     
-    deps
+    result
+}
+
+fn extract_features_section(content: &str) -> String {
+    let mut result = String::new();
+    let mut in_features = false;
+    let mut brace_depth = 0;
+    
+    for line in content.lines() {
+        let trimmed = line.trim();
+        
+        if trimmed == "[features]" {
+            in_features = true;
+            result.push_str("[features]\n");
+            continue;
+        }
+        
+        if in_features {
+            if trimmed.starts_with('[') && trimmed != "[features]" {
+                break;
+            }
+            if !trimmed.is_empty() {
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+    }
+    
+    result
 }
 
 fn generate_cargo_toml(
@@ -98,296 +818,68 @@ fn generate_cargo_toml(
     
     let mut toml = String::new();
     
+    // Package section
     toml.push_str("[package]\n");
     toml.push_str(&format!("name = \"{}\"\n", name));
     toml.push_str(&format!("version = \"{}\"\n", version));
     toml.push_str(&format!("edition = \"{}\"\n", edition));
+    
+    // Copy other package fields
+    for field in ["authors", "description", "license", "repository", "readme", "keywords", "categories"] {
+        if let Some(value) = parse_toml_value(original_toml, field) {
+            toml.push_str(&format!("{} = \"{}\"\n", field, value));
+        }
+    }
     toml.push('\n');
     
+    // Binary target
     if has_main {
         toml.push_str("[[bin]]\n");
         toml.push_str(&format!("name = \"{}\"\n", name));
-        toml.push_str("path = \"src/main.rs\"\n");
-        toml.push('\n');
+        toml.push_str("path = \"src/main.rs\"\n\n");
     }
     
+    // Library target
     if has_lib {
         toml.push_str("[lib]\n");
-        toml.push_str("path = \"src/lib.rs\"\n");
-        toml.push('\n');
+        toml.push_str("path = \"src/lib.rs\"\n\n");
     }
     
+    // Dependencies
     let deps = extract_dependencies(original_toml);
     if !deps.is_empty() {
         toml.push_str(&deps);
+        toml.push('\n');
+    }
+    
+    // Features
+    let features = extract_features_section(original_toml);
+    if !features.is_empty() {
+        toml.push_str(&features);
     }
     
     toml
 }
 
-/// Get a unique temp directory for the shadow project
-fn get_shadow_dir(project_name: &str) -> PathBuf {
-    let temp_base = env::temp_dir();
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    
-    // Use a consistent name so rebuilds use the same dir (for caching)
-    // But also include a way to identify it
-    temp_base.join(format!("rustsp_shadow_{}", project_name))
-}
-
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let start_idx = if args.len() > 1 && args[1] == "rustsp" { 2 } else { 1 };
-    
-    if args.len() <= start_idx {
-        print_usage();
-        exit(1);
-    }
-    
-    let action = &args[start_idx];
-    
-    if action == "-h" || action == "--help" || action == "help" {
-        print_usage();
-        exit(0);
-    }
-    
-    if action == "-V" || action == "--version" {
-        println!("cargo-rustsp 0.8.0");
-        exit(0);
-    }
-    
-    let valid_commands = ["build", "run", "test", "check", "clean"];
-    if !valid_commands.contains(&action.as_str()) {
-        eprintln!("{}error{}: unsupported command '{}'", ansi::BOLD_RED, ansi::RESET, action);
-        exit(1);
-    }
-    
-    if action == "clean" {
-        clean_rustsp_artifacts();
-        let status = Command::new("cargo").arg("clean").status().expect("Failed");
-        exit(if status.success() { 0 } else { 1 });
-    }
-    
-    let extra_args: Vec<String> = args[start_idx + 1..].iter().cloned().collect();
-    let subcommand = action.clone();
-    
-    let project_root = find_project_root().unwrap_or_else(|| {
-        eprintln!("{}error{}: Could not find Cargo.toml", ansi::BOLD_RED, ansi::RESET);
-        exit(1);
-    });
-    
-    if let Err(e) = run_rustsp_pipeline(&project_root, &subcommand, &extra_args) {
-        eprintln!("{}error{}: {}", ansi::BOLD_RED, ansi::RESET, e);
-        exit(1);
-    }
-}
-
-fn print_usage() {
-    eprintln!("{}cargo-rustsp{} - Cargo Integration for RustS+", ansi::BOLD_CYAN, ansi::RESET);
-    eprintln!("\nUSAGE: cargo rustsp <COMMAND> [OPTIONS]");
-    eprintln!("\nCOMMANDS: build, run, test, check, clean");
-    eprintln!("OPTIONS:  --release, -p <SPEC>");
-}
-
-fn find_project_root() -> Option<PathBuf> {
-    let mut current = env::current_dir().ok()?;
-    loop {
-        if current.join("Cargo.toml").exists() {
-            return Some(current);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
-}
-
-fn clean_rustsp_artifacts() {
-    // Clean local artifacts
-    for dir in &["target/rustsp", "target/rustsp_build"] {
-        let path = Path::new(dir);
-        if path.exists() {
-            eprintln!("{}Cleaning{} {}", ansi::BOLD_CYAN, ansi::RESET, dir);
-            let _ = fs::remove_dir_all(path);
-        }
-    }
-    
-    // Also try to clean temp shadow directories
-    if let Some(root) = find_project_root() {
-        if let Some(name) = root.file_name().and_then(|n| n.to_str()) {
-            let shadow = get_shadow_dir(name);
-            if shadow.exists() {
-                eprintln!("{}Cleaning{} {}", ansi::BOLD_CYAN, ansi::RESET, shadow.display());
-                let _ = fs::remove_dir_all(&shadow);
-            }
-        }
-    }
-}
-
-fn run_rustsp_pipeline(project_root: &Path, subcommand: &str, extra_args: &[String]) -> Result<(), String> {
-    let project_root = absolute_path(project_root)?;
-    
-    let project_name = project_root.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("rustsp_project")
-        .to_string();
-    
-    // CRITICAL: Use TEMP directory, NOT a subdirectory of the project
-    // This completely isolates from parent Cargo.toml
-    let shadow_dir = get_shadow_dir(&project_name);
-    let shadow_src = shadow_dir.join("src");
-    
-    // Clean and recreate shadow directory
-    if shadow_dir.exists() {
-        fs::remove_dir_all(&shadow_dir)
-            .map_err(|e| format!("Failed to clean {}: {}", shadow_dir.display(), e))?;
-    }
-    fs::create_dir_all(&shadow_src)
-        .map_err(|e| format!("Failed to create {}: {}", shadow_src.display(), e))?;
-    
-    let src_dir = project_root.join("src");
-    if !src_dir.exists() {
-        return Err("No src/ directory found".to_string());
-    }
-    
-    eprintln!("{}Preprocessing{} RustS+ files...", ansi::BOLD_CYAN, ansi::RESET);
-    
-    let mut rss_files: Vec<PathBuf> = Vec::new();
-    let mut rs_files: Vec<PathBuf> = Vec::new();
-    collect_source_files(&src_dir, &mut rss_files, &mut rs_files)?;
-    
-    if rss_files.is_empty() && rs_files.is_empty() {
-        return Err("No source files found in src/".to_string());
-    }
-    
-    if rss_files.is_empty() {
-        eprintln!("{}note{}: No .rss files, running plain cargo...", ansi::CYAN, ansi::RESET);
-        return run_plain_cargo(&project_root, subcommand, extra_args);
-    }
-    
-    // Compile .rss files
-    let mut any_error = false;
-    for rss_path in &rss_files {
-        let rel_path = rss_path.strip_prefix(&src_dir).unwrap();
-        let mut rs_rel_path = rel_path.to_path_buf();
-        rs_rel_path.set_extension("rs");
-        
-        let output_path = shadow_src.join(&rs_rel_path);
-        
-        if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent).ok();
-        }
-        
-        eprintln!("  {}{} -> {}{}", ansi::DIM, rel_path.display(), rs_rel_path.display(), ansi::RESET);
-        
-        if !compile_rss_to_rs(rss_path, &output_path)? {
-            any_error = true;
-        }
-    }
-    
-    if any_error {
-        return Err("RustS+ preprocessing failed".to_string());
-    }
-    
-    // Copy .rs files
-    for rs_path in &rs_files {
-        let rel_path = rs_path.strip_prefix(&src_dir).unwrap();
-        let output_path = shadow_src.join(rel_path);
-        
-        if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent).ok();
-        }
-        fs::copy(rs_path, &output_path)
-            .map_err(|e| format!("Failed to copy {}: {}", rs_path.display(), e))?;
-    }
-    
-    // Check what entry points we have
-    let has_main = shadow_src.join("main.rs").exists();
-    let has_lib = shadow_src.join("lib.rs").exists();
-    
-    if !has_main && !has_lib {
-        let files: Vec<_> = fs::read_dir(&shadow_src)
-            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect())
-            .unwrap_or_default();
-        return Err(format!("No main.rs or lib.rs generated. Files: {:?}", files));
-    }
-    
-    // Read original Cargo.toml for metadata
-    let original_toml = fs::read_to_string(project_root.join("Cargo.toml"))
-        .map_err(|e| format!("Failed to read Cargo.toml: {}", e))?;
-    
-    // Generate new Cargo.toml
-    let new_toml = generate_cargo_toml(&original_toml, has_main, has_lib, &project_name);
-    
-    eprintln!("  {}Generating Cargo.toml...{}", ansi::DIM, ansi::RESET);
-    
-    fs::write(shadow_dir.join("Cargo.toml"), &new_toml)
-        .map_err(|e| format!("Failed to write Cargo.toml: {}", e))?;
-    
-    eprintln!("{}Running{} cargo {}...", ansi::BOLD_CYAN, ansi::RESET, subcommand);
-    
-    // Target dir stays in original project for convenience
-    let target_dir = project_root.join("target").join("rustsp_build");
-    
-    run_cargo_in_shadow(&shadow_dir, &target_dir, subcommand, extra_args)
-}
-
-fn collect_source_files(dir: &Path, rss_files: &mut Vec<PathBuf>, rs_files: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = fs::read_dir(dir).map_err(|e| format!("Failed to read {}: {}", dir.display(), e))?;
-    
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        
-        if path.is_dir() {
-            if path.file_name().map(|n| n == "target").unwrap_or(false) {
-                continue;
-            }
-            collect_source_files(&path, rss_files, rs_files)?;
-        } else if path.is_file() {
-            match path.extension().and_then(|e| e.to_str()) {
-                Some("rss") => rss_files.push(path),
-                Some("rs") => rs_files.push(path),
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-fn compile_rss_to_rs(input: &Path, output: &Path) -> Result<bool, String> {
-    let rustsp_cmd = find_rustsp_binary();
-    
-    let result = Command::new(&rustsp_cmd)
-        .arg(input)
-        .arg("--emit-rs")
-        .arg("-o")
-        .arg(output)
-        .arg("--quiet")
-        .output()
-        .map_err(|e| format!("Failed to run {}: {}", rustsp_cmd, e))?;
-    
-    if !result.status.success() {
-        io::stderr().write_all(&result.stderr).ok();
-        io::stderr().write_all(&result.stdout).ok();
-        return Ok(false);
-    }
-    
-    if !output.exists() {
-        return Err(format!("rustsp did not create: {}", output.display()));
-    }
-    
-    Ok(true)
-}
+//=============================================================================
+// RustS+ Compilation
+//=============================================================================
 
 fn find_rustsp_binary() -> String {
+    // Check common names in PATH
     for cmd in &["rustsp", "rusts_plus", "rustsp.exe", "rusts_plus.exe"] {
-        if Command::new(cmd).arg("--version").output().is_ok() {
+        if Command::new(cmd)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+        {
             return cmd.to_string();
         }
     }
     
+    // Check next to cargo-rustsp executable
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
             for name in &["rustsp", "rusts_plus", "rustsp.exe", "rusts_plus.exe"] {
@@ -402,12 +894,234 @@ fn find_rustsp_binary() -> String {
     "rustsp".to_string()
 }
 
-fn run_plain_cargo(project_root: &Path, subcommand: &str, extra_args: &[String]) -> Result<(), String> {
-    let status = Command::new("cargo")
-        .current_dir(project_root)
-        .arg(subcommand)
-        .args(extra_args)
-        .status()
+fn compile_rss_file(
+    rustsp_cmd: &str,
+    input: &Path,
+    output: &Path,
+    quiet: bool,
+) -> Result<bool, String> {
+    // Ensure output directory exists
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+    
+    let mut cmd = Command::new(rustsp_cmd);
+    cmd.arg(input)
+        .arg("--emit-rs")
+        .arg("-o")
+        .arg(output);
+    
+    if quiet {
+        cmd.arg("--quiet");
+    }
+    
+    let result = cmd.output()
+        .map_err(|e| format!("Failed to run {}: {}", rustsp_cmd, e))?;
+    
+    if !result.status.success() {
+        // Print errors with source context
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        
+        if !stderr.is_empty() {
+            eprintln!("{}", stderr);
+        }
+        if !stdout.is_empty() {
+            eprintln!("{}", stdout);
+        }
+        
+        return Ok(false);
+    }
+    
+    if !output.exists() {
+        return Err(format!("Compiler did not create output: {}", output.display()));
+    }
+    
+    Ok(true)
+}
+
+//=============================================================================
+// Build Pipeline
+//=============================================================================
+
+fn get_shadow_dir(project_name: &str) -> PathBuf {
+    let temp_base = env::temp_dir();
+    temp_base.join(format!("rustsp_shadow_{}", project_name))
+}
+
+struct BuildContext {
+    config: BuildConfig,
+    cache: FileCache,
+    shadow_dir: PathBuf,
+    target_dir: PathBuf,
+    rustsp_cmd: String,
+}
+
+impl BuildContext {
+    fn new(config: BuildConfig) -> Result<Self, String> {
+        let project_name = config.project_root.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("rustsp_project")
+            .to_string();
+        
+        let shadow_dir = get_shadow_dir(&project_name);
+        let target_dir = config.project_root.join("target").join("rustsp_build");
+        let cache = FileCache::new(&target_dir);
+        let rustsp_cmd = find_rustsp_binary();
+        
+        Ok(BuildContext {
+            config,
+            cache,
+            shadow_dir,
+            target_dir,
+            rustsp_cmd,
+        })
+    }
+    
+    fn log(&self, prefix: &str, msg: &str) {
+        if !self.config.quiet {
+            eprintln!("{}{:>12}{} {}", ansi::BOLD_CYAN, prefix, ansi::RESET, msg);
+        }
+    }
+    
+    fn log_dim(&self, msg: &str) {
+        if !self.config.quiet {
+            eprintln!("  {}{}{}", ansi::DIM, msg, ansi::RESET);
+        }
+    }
+}
+
+fn build_single_crate(ctx: &mut BuildContext, crate_root: &Path) -> Result<(), String> {
+    let crate_root = absolute_path(crate_root)?;
+    let src_dir = crate_root.join("src");
+    
+    if !src_dir.exists() {
+        return Err(format!("No src/ directory found in {}", crate_root.display()));
+    }
+    
+    // Build module graph
+    ctx.log("Analyzing", &format!("{}", crate_root.display()));
+    let shadow_src = ctx.shadow_dir.join("src");
+    let graph = build_module_graph(&src_dir, &shadow_src)?;
+    
+    if graph.is_empty() {
+        return Err("No source files found".to_string());
+    }
+    
+    // Check if any .rss files exist
+    if graph.rss_count() == 0 {
+        ctx.log("Skipping", "No .rss files found, running plain cargo");
+        return run_plain_cargo(&crate_root, &ctx.config);
+    }
+    
+    // Clean and recreate shadow directory
+    if ctx.shadow_dir.exists() {
+        fs::remove_dir_all(&ctx.shadow_dir)
+            .map_err(|e| format!("Failed to clean {}: {}", ctx.shadow_dir.display(), e))?;
+    }
+    fs::create_dir_all(&shadow_src)
+        .map_err(|e| format!("Failed to create {}: {}", shadow_src.display(), e))?;
+    
+    // Compile/copy files
+    ctx.log("Compiling", &format!("{} .rss + {} .rs files", graph.rss_count(), graph.rs_count()));
+    
+    let mut any_error = false;
+    let mut compiled_count = 0;
+    let mut cached_count = 0;
+    
+    for (rel_path, node) in &graph.nodes {
+        // Ensure output directory exists
+        if let Some(parent) = node.output_path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        
+        if node.is_rustsp {
+            // Check cache
+            let content = fs::read_to_string(&node.source_path)
+                .map_err(|e| format!("Failed to read {}: {}", node.source_path.display(), e))?;
+            let content_hash = hash_content(&content);
+            
+            let needs_compile = ctx.config.force_rebuild || 
+                                ctx.cache.needs_rebuild(&node.source_path, content_hash);
+            
+            if needs_compile {
+                let rel_display = node.source_path.strip_prefix(&src_dir)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| rel_path.clone());
+                ctx.log_dim(&format!("{} -> {}", rel_display, 
+                    node.output_path.file_name().unwrap().to_string_lossy()));
+                
+                if !compile_rss_file(&ctx.rustsp_cmd, &node.source_path, &node.output_path, ctx.config.quiet)? {
+                    any_error = true;
+                } else {
+                    ctx.cache.update(node.source_path.clone(), content_hash, node.output_path.clone());
+                    compiled_count += 1;
+                }
+            } else {
+                // Use cached version - still need to copy to shadow
+                if let Some(cached) = ctx.cache.entries.get(&node.source_path) {
+                    if cached.output_path.exists() {
+                        fs::copy(&cached.output_path, &node.output_path).ok();
+                    }
+                }
+                cached_count += 1;
+            }
+        } else {
+            // Copy .rs file as-is
+            fs::copy(&node.source_path, &node.output_path)
+                .map_err(|e| format!("Failed to copy {}: {}", node.source_path.display(), e))?;
+        }
+    }
+    
+    if any_error {
+        return Err("RustS+ compilation failed".to_string());
+    }
+    
+    if compiled_count > 0 || cached_count > 0 {
+        ctx.log("Preprocessed", &format!("{} compiled, {} cached", compiled_count, cached_count));
+    }
+    
+    // Save cache
+    ctx.cache.save().ok();
+    
+    // Check entry points
+    let has_main = shadow_src.join("main.rs").exists();
+    let has_lib = shadow_src.join("lib.rs").exists();
+    
+    if !has_main && !has_lib {
+        return Err("No main.rs or lib.rs generated".to_string());
+    }
+    
+    // Generate Cargo.toml
+    let original_toml = fs::read_to_string(crate_root.join("Cargo.toml"))
+        .map_err(|e| format!("Failed to read Cargo.toml: {}", e))?;
+    
+    let project_name = crate_root.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("rustsp_project");
+    
+    let new_toml = generate_cargo_toml(&original_toml, has_main, has_lib, project_name);
+    fs::write(ctx.shadow_dir.join("Cargo.toml"), &new_toml)
+        .map_err(|e| format!("Failed to write Cargo.toml: {}", e))?;
+    
+    // Run cargo
+    ctx.log("Building", &format!("cargo {}", ctx.config.subcommand));
+    run_cargo_in_shadow(ctx)
+}
+
+fn run_plain_cargo(crate_root: &Path, config: &BuildConfig) -> Result<(), String> {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(crate_root)
+        .arg(&config.subcommand);
+    
+    if config.release {
+        cmd.arg("--release");
+    }
+    
+    cmd.args(&config.extra_args);
+    
+    let status = cmd.status()
         .map_err(|e| format!("Failed to run cargo: {}", e))?;
     
     if !status.success() {
@@ -416,33 +1130,330 @@ fn run_plain_cargo(project_root: &Path, subcommand: &str, extra_args: &[String])
     Ok(())
 }
 
-fn run_cargo_in_shadow(shadow_dir: &Path, target_dir: &Path, subcommand: &str, extra_args: &[String]) -> Result<(), String> {
-    let shadow_dir = normalize_path(shadow_dir);
+fn run_cargo_in_shadow(ctx: &BuildContext) -> Result<(), String> {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&ctx.shadow_dir)
+        .arg(&ctx.config.subcommand)
+        .arg("--target-dir")
+        .arg(&ctx.target_dir);
     
-    eprintln!("  {}Shadow: {}{}", ansi::DIM, shadow_dir.display(), ansi::RESET);
-    eprintln!("  {}Target: {}{}", ansi::DIM, target_dir.display(), ansi::RESET);
-    
-    // Verify Cargo.toml exists
-    let manifest = shadow_dir.join("Cargo.toml");
-    if !manifest.exists() {
-        return Err(format!("Cargo.toml not found: {}", manifest.display()));
+    if ctx.config.release {
+        cmd.arg("--release");
     }
     
-    // Run cargo from the shadow directory
-    // Since shadow_dir is in TEMP (not under project), there's NO parent Cargo.toml to find!
-    let status = Command::new("cargo")
-        .current_dir(&shadow_dir)
-        .arg(subcommand)
-        .arg("--target-dir")
-        .arg(target_dir)
-        .args(extra_args)
-        .status()
+    if let Some(jobs) = ctx.config.jobs {
+        cmd.arg("-j").arg(jobs.to_string());
+    }
+    
+    if ctx.config.all_features {
+        cmd.arg("--all-features");
+    }
+    
+    if ctx.config.no_default_features {
+        cmd.arg("--no-default-features");
+    }
+    
+    if !ctx.config.features.is_empty() {
+        cmd.arg("--features").arg(ctx.config.features.join(","));
+    }
+    
+    cmd.args(&ctx.config.extra_args);
+    
+    let status = cmd.status()
         .map_err(|e| format!("Failed to run cargo: {}", e))?;
     
     if !status.success() {
         return Err("Cargo build failed".to_string());
     }
     
-    eprintln!("{}Build artifacts:{} {}", ansi::BOLD_GREEN, ansi::RESET, target_dir.display());
+    // Report output location
+    let profile = if ctx.config.release { "release" } else { "debug" };
+    let output_dir = ctx.target_dir.join(profile);
+    
+    if !ctx.config.quiet {
+        eprintln!("{}    Finished{} {} [{}]", 
+            ansi::BOLD_GREEN, ansi::RESET,
+            ctx.config.subcommand,
+            output_dir.display());
+    }
+    
     Ok(())
+}
+
+//=============================================================================
+// Workspace Build
+//=============================================================================
+
+fn build_workspace(ctx: &mut BuildContext, members: &[WorkspaceMember]) -> Result<(), String> {
+    ctx.log("Workspace", &format!("{} members", members.len()));
+    
+    // Filter to members with .rss files (or all if --package specified)
+    let to_build: Vec<&WorkspaceMember> = if let Some(ref pkg) = ctx.config.package {
+        members.iter().filter(|m| m.name == *pkg).collect()
+    } else {
+        members.iter().filter(|m| m.has_rustsp).collect()
+    };
+    
+    if to_build.is_empty() {
+        if ctx.config.package.is_some() {
+            return Err(format!("Package '{}' not found", ctx.config.package.as_ref().unwrap()));
+        }
+        ctx.log("Skipping", "No workspace members have .rss files");
+        return Ok(());
+    }
+    
+    // Build each member
+    let mut failed = Vec::new();
+    
+    for member in to_build {
+        ctx.log("Building", &format!("member: {}", member.name));
+        
+        // Create member-specific shadow dir
+        let member_shadow = ctx.shadow_dir.join(&member.name);
+        let original_shadow = ctx.shadow_dir.clone();
+        ctx.shadow_dir = member_shadow;
+        
+        match build_single_crate(ctx, &member.path) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("{}error{}: {} failed: {}", ansi::BOLD_RED, ansi::RESET, member.name, e);
+                failed.push(member.name.clone());
+            }
+        }
+        
+        ctx.shadow_dir = original_shadow;
+    }
+    
+    if !failed.is_empty() {
+        return Err(format!("Failed to build: {}", failed.join(", ")));
+    }
+    
+    Ok(())
+}
+
+//=============================================================================
+// Clean Command
+//=============================================================================
+
+fn clean_rustsp_artifacts(project_root: &Path, quiet: bool) {
+    let artifacts = [
+        project_root.join("target/rustsp_build"),
+    ];
+    
+    for path in &artifacts {
+        if path.exists() {
+            if !quiet {
+                eprintln!("{}   Cleaning{} {}", ansi::BOLD_CYAN, ansi::RESET, path.display());
+            }
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+    
+    // Clean shadow directory
+    if let Some(name) = project_root.file_name().and_then(|n| n.to_str()) {
+        let shadow = get_shadow_dir(name);
+        if shadow.exists() {
+            if !quiet {
+                eprintln!("{}   Cleaning{} {}", ansi::BOLD_CYAN, ansi::RESET, shadow.display());
+            }
+            let _ = fs::remove_dir_all(&shadow);
+        }
+    }
+}
+
+//=============================================================================
+// Main Entry Point
+//=============================================================================
+
+fn print_usage() {
+    eprintln!("{}cargo-rustsp{} v0.9.0 - Robust Cargo Integration for RustS+", 
+        ansi::BOLD_CYAN, ansi::RESET);
+    eprintln!();
+    eprintln!("{}USAGE:{}", ansi::BOLD, ansi::RESET);
+    eprintln!("    cargo rustsp <COMMAND> [OPTIONS]");
+    eprintln!();
+    eprintln!("{}COMMANDS:{}", ansi::BOLD, ansi::RESET);
+    eprintln!("    build      Compile the current package");
+    eprintln!("    run        Run the main binary");
+    eprintln!("    test       Run tests");
+    eprintln!("    check      Check for errors without building");
+    eprintln!("    clean      Remove build artifacts");
+    eprintln!();
+    eprintln!("{}OPTIONS:{}", ansi::BOLD, ansi::RESET);
+    eprintln!("    -r, --release           Build in release mode");
+    eprintln!("    -q, --quiet             Suppress output");
+    eprintln!("    -f, --force             Force rebuild (ignore cache)");
+    eprintln!("    -p, --package <SPEC>    Build specific package");
+    eprintln!("    -j, --jobs <N>          Number of parallel jobs");
+    eprintln!("    -F, --features <F>      Features to activate");
+    eprintln!("    --all-features          Activate all features");
+    eprintln!("    --no-default-features   Disable default features");
+    eprintln!();
+    eprintln!("{}EXAMPLES:{}", ansi::BOLD, ansi::RESET);
+    eprintln!("    cargo rustsp build");
+    eprintln!("    cargo rustsp run --release");
+    eprintln!("    cargo rustsp test -p my-crate");
+    eprintln!("    cargo rustsp build --features=async");
+}
+
+fn find_project_root() -> Option<PathBuf> {
+    let mut current = env::current_dir().ok()?;
+    loop {
+        if current.join("Cargo.toml").exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let start_idx = if args.len() > 1 && args[1] == "rustsp" { 2 } else { 1 };
+    
+    // Handle help/version
+    if args.len() <= start_idx {
+        print_usage();
+        exit(1);
+    }
+    
+    let action = &args[start_idx];
+    
+    if action == "-h" || action == "--help" || action == "help" {
+        print_usage();
+        exit(0);
+    }
+    
+    if action == "-V" || action == "--version" {
+        println!("cargo-rustsp 0.9.0");
+        exit(0);
+    }
+    
+    // Validate command
+    let valid_commands = ["build", "run", "test", "check", "clean", "bench", "doc"];
+    if !valid_commands.contains(&action.as_str()) {
+        eprintln!("{}error{}: unsupported command '{}'", ansi::BOLD_RED, ansi::RESET, action);
+        eprintln!("\nRun 'cargo rustsp --help' for usage");
+        exit(1);
+    }
+    
+    // Find project root
+    let project_root = match find_project_root() {
+        Some(root) => root,
+        None => {
+            eprintln!("{}error{}: could not find Cargo.toml in {} or any parent directory",
+                ansi::BOLD_RED, ansi::RESET,
+                env::current_dir().map(|p| p.display().to_string()).unwrap_or_default());
+            exit(1);
+        }
+    };
+    
+    // Handle clean specially
+    if action == "clean" {
+        let quiet = args.iter().any(|a| a == "-q" || a == "--quiet");
+        clean_rustsp_artifacts(&project_root, quiet);
+        
+        // Also run cargo clean
+        let status = Command::new("cargo")
+            .current_dir(&project_root)
+            .arg("clean")
+            .status()
+            .expect("Failed to run cargo clean");
+        
+        exit(if status.success() { 0 } else { 1 });
+    }
+    
+    // Parse config
+    let config = match BuildConfig::from_args(&args, project_root.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}error{}: {}", ansi::BOLD_RED, ansi::RESET, e);
+            exit(1);
+        }
+    };
+    
+    // Create build context
+    let mut ctx = match BuildContext::new(config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}error{}: {}", ansi::BOLD_RED, ansi::RESET, e);
+            exit(1);
+        }
+    };
+    
+    // Detect project kind
+    let project_kind = match detect_project_kind(&project_root) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("{}error{}: {}", ansi::BOLD_RED, ansi::RESET, e);
+            exit(1);
+        }
+    };
+    
+    // Run build
+    let result = match project_kind {
+        ProjectKind::SingleCrate => build_single_crate(&mut ctx, &project_root),
+        ProjectKind::Workspace(members) => build_workspace(&mut ctx, &members),
+    };
+    
+    if let Err(e) = result {
+        eprintln!("{}error{}: {}", ansi::BOLD_RED, ansi::RESET, e);
+        exit(1);
+    }
+}
+
+//=============================================================================
+// Tests
+//=============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_mod_extraction() {
+        let source = r#"
+            mod foo;
+            pub mod bar;
+            // mod commented;
+            mod baz;
+        "#;
+        
+        let mods = extract_mod_declarations(source);
+        assert_eq!(mods.len(), 3);
+        assert_eq!(mods[0].0, "foo");
+        assert_eq!(mods[1].0, "bar");
+        assert_eq!(mods[2].0, "baz");
+    }
+    
+    #[test]
+    fn test_valid_module_name() {
+        assert!(is_valid_module_name("foo"));
+        assert!(is_valid_module_name("foo_bar"));
+        assert!(is_valid_module_name("_private"));
+        assert!(!is_valid_module_name("Foo"));
+        assert!(!is_valid_module_name("123"));
+        assert!(!is_valid_module_name(""));
+    }
+    
+    #[test]
+    fn test_cargo_toml_generation() {
+        let original = r#"
+[package]
+name = "test-project"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+serde = "1.0"
+"#;
+        
+        let generated = generate_cargo_toml(original, true, true, "test");
+        assert!(generated.contains("name = \"test-project\""));
+        assert!(generated.contains("[[bin]]"));
+        assert!(generated.contains("[lib]"));
+        assert!(generated.contains("[dependencies]"));
+        assert!(generated.contains("serde"));
+    }
 }

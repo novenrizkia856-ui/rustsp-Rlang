@@ -2,7 +2,6 @@
 name = "rustsp"
 version = "0.2.0"
 edition = "2021"
-github = ""
 
 [lib]
 name = "rustsp"
@@ -11,5 +10,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "rustsp"
 path = "src/main.rs"
+
+[[bin]]
+name = "cargo-rustsp"
+path = "src/bin/cargo-rustsp.rs"
 
 [dependencies]

@@ -830,6 +830,11 @@ pub fn strip_effects_clause(type_str: &str) -> String {
     
     // Check if starts with "effects("
     if !trimmed.starts_with("effects(") {
+        // CRITICAL FIX: Also strip leading `->` if present
+        // This handles cases like "-> Block" that should just be "Block"
+        if trimmed.starts_with("->") {
+            return trimmed[2..].trim().to_string();
+        }
         return trimmed.to_string();
     }
     
@@ -858,7 +863,14 @@ pub fn strip_effects_clause(type_str: &str) -> String {
     }
     
     // Return everything after the effects(...) clause, trimmed
-    trimmed[effects_end..].trim().to_string()
+    // CRITICAL FIX: Also strip leading `->` from the result
+    // `effects(alloc) -> Block` should return `Block`, not `-> Block`
+    let result = trimmed[effects_end..].trim();
+    if result.starts_with("->") {
+        result[2..].trim().to_string()
+    } else {
+        result.to_string()
+    }
 }
 
 fn parse_rustsplus_function(after_fn: &str, is_pub: bool) -> Result<FunctionSignature, String> {
@@ -1028,6 +1040,23 @@ pub fn signature_to_rust(sig: &FunctionSignature) -> String {
     result.push('(');
     let params: Vec<String> = sig.parameters.iter()
         .map(|p| {
+            // CRITICAL FIX: Handle `self` parameter specially
+            // RustS+: `self &` or `self &mut` 
+            // Rust:   `&self` or `&mut self`
+            if p.name == "self" {
+                let type_trimmed = p.param_type.trim();
+                if type_trimmed == "&mut" || type_trimmed.starts_with("&mut") {
+                    return "&mut self".to_string();
+                } else if type_trimmed == "&" || type_trimmed.starts_with("&") {
+                    return "&self".to_string();
+                } else if type_trimmed.is_empty() {
+                    return "self".to_string();
+                } else {
+                    // Custom self type like `self: Box<Self>`
+                    return format!("self: {}", type_trimmed);
+                }
+            }
+            
             // L-06: Transform bare slice type [T] to &[T] for parameters
             // Bare [T] is unsized and cannot be a function parameter in Rust
             let transformed_type = transform_param_type(&p.param_type);
@@ -1038,8 +1067,17 @@ pub fn signature_to_rust(sig: &FunctionSignature) -> String {
     result.push(')');
     
     if let Some(ref ret) = sig.return_type {
-        result.push_str(" -> ");
-        result.push_str(ret);
+        // CRITICAL FIX: Don't add arrow if return type already has it
+        let ret_trimmed = ret.trim();
+        if !ret_trimmed.is_empty() {
+            if ret_trimmed.starts_with("->") {
+                result.push(' ');
+                result.push_str(ret_trimmed);
+            } else {
+                result.push_str(" -> ");
+                result.push_str(ret_trimmed);
+            }
+        }
     }
     
     if sig.is_single_line {

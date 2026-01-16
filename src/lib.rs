@@ -17,6 +17,8 @@ pub mod hir;
 pub mod eir;
 pub mod parser;
 
+pub mod source_map;
+
 // Re-export IR types for convenience
 pub use ast::{Span, Spanned, EffectDecl};
 pub use hir::{BindingId, BindingInfo, ScopeResolver, HirModule};
@@ -81,6 +83,13 @@ fn strip_inline_comment(line: &str) -> String {
 /// These lines are incomplete - the expression continues on the next line
 fn ends_with_continuation_operator(line: &str) -> bool {
     let trimmed = line.trim();
+    
+    // CRITICAL FIX: Lines ending with `(` or `[` are multiline expressions
+    // e.g., `format!(`, `vec![`, function calls with args on next line
+    if trimmed.ends_with('(') || trimmed.ends_with('[') {
+        return true;
+    }
+    
     trimmed.ends_with('^') || trimmed.ends_with('|') || trimmed.ends_with('&')
         || trimmed.ends_with('+') || trimmed.ends_with("+ ")
         || trimmed.ends_with('-') || trimmed.ends_with("- ")
@@ -98,6 +107,12 @@ fn needs_semicolon(trimmed: &str) -> bool {
     if trimmed.ends_with('{') || trimmed.ends_with('}') { return false; }
     if trimmed.ends_with(',') { return false; }
     
+    // CRITICAL FIX: Lines starting with `.` are method chain CONTINUATIONS
+    // They should NOT get semicolons as they continue from previous line
+    if trimmed.starts_with('.') {
+        return false;
+    }
+    
     // CRITICAL: Lines ending with binary operators are CONTINUATIONS
     // They should NOT get semicolons as the expression continues on the next line
     if trimmed.ends_with('^') || trimmed.ends_with('|') || trimmed.ends_with('&')
@@ -105,6 +120,13 @@ fn needs_semicolon(trimmed: &str) -> bool {
        || trimmed.ends_with('/') || trimmed.ends_with('%')
        || trimmed.ends_with("||") || trimmed.ends_with("&&")
        || trimmed.ends_with("<<") || trimmed.ends_with(">>") {
+        return false;
+    }
+    
+    // CRITICAL FIX: Lines ending with `(` or `[` are multiline calls/arrays/macros
+    // They should NOT get semicolons - the expression continues on next line
+    // This prevents `format!(;` and `vec![;`
+    if trimmed.ends_with('(') || trimmed.ends_with('[') {
         return false;
     }
     
@@ -131,6 +153,37 @@ fn needs_semicolon(trimmed: &str) -> bool {
     true
 }
 
+/// Check if a line is a function definition or other block-starting construct
+/// Used to exclude from struct literal detection
+fn is_function_definition(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("fn ") 
+        || trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("async fn ") 
+        || trimmed.starts_with("pub async fn ")
+        || trimmed.starts_with("const fn ") 
+        || trimmed.starts_with("pub const fn ")
+        || trimmed.starts_with("unsafe fn ") 
+        || trimmed.starts_with("pub unsafe fn ")
+        || trimmed.starts_with("extern fn ")
+        || trimmed.starts_with("pub extern fn ")
+}
+
+/// Check if a line starts a Rust block that should NOT trigger literal mode
+/// This includes impl blocks, mod blocks, trait blocks, etc.
+fn is_rust_block_start(line: &str) -> bool {
+    let trimmed = line.trim();
+    is_function_definition(trimmed)
+        || trimmed.starts_with("impl ")
+        || trimmed.starts_with("impl<")
+        || trimmed.starts_with("mod ")
+        || trimmed.starts_with("pub mod ")
+        || trimmed.starts_with("trait ")
+        || trimmed.starts_with("pub trait ")
+        || trimmed.starts_with("use ")
+        || trimmed.starts_with("pub use ")
+}
+
 /// L-08: Transform RustS+ macro calls to Rust macro calls
 /// 
 /// RustS+ allows: `println("hello")`, `format("x={}", x)`
@@ -138,7 +191,20 @@ fn needs_semicolon(trimmed: &str) -> bool {
 /// 
 /// This function adds the `!` for known macro names.
 fn transform_macro_calls(line: &str) -> String {
+    let trimmed = line.trim();
+    
+    // CRITICAL FIX: Skip function definitions - don't transform fn names like `fn format(`
+    if is_function_definition(trimmed) {
+        return line.to_string();
+    }
+    
+    // CRITICAL FIX: Skip attributes - #[cfg(test)] should NOT become #[cfg!(test)]
+    if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
+        return line.to_string();
+    }
+    
     // List of common Rust macros that need `!`
+    // CRITICAL FIX: Removed "cfg" - it's an attribute, not a macro call
     const MACROS: &[&str] = &[
         "println", "print", "eprintln", "eprint",
         "format", "panic", "todo", "unimplemented",
@@ -146,7 +212,7 @@ fn transform_macro_calls(line: &str) -> String {
         "debug_assert", "debug_assert_eq", "debug_assert_ne",
         "write", "writeln", "format_args",
         "include_str", "include_bytes", "concat", "stringify",
-        "env", "option_env", "cfg", "line", "column", "file",
+        "env", "option_env", "line", "column", "file",
         "module_path", "compile_error",
     ];
     
@@ -375,6 +441,12 @@ impl ArrayModeStack {
 fn detect_struct_literal_start(line: &str, registry: &StructRegistry) -> Option<(String, String)> {
     let trimmed = line.trim();
     
+    // CRITICAL FIX: EXCLUDE function definitions and other Rust blocks
+    // `fn foo(...) -> StructName {` is NOT a struct literal!
+    if is_rust_block_start(trimmed) {
+        return None;
+    }
+    
     if !trimmed.contains('=') || !trimmed.contains('{') {
         return None;
     }
@@ -412,6 +484,12 @@ fn detect_struct_literal_start(line: &str, registry: &StructRegistry) -> Option<
 fn detect_bare_struct_literal(line: &str, registry: &StructRegistry) -> Option<String> {
     let trimmed = line.trim();
     
+    // CRITICAL FIX: EXCLUDE function definitions and other Rust blocks
+    // `fn foo(...) -> StructName {` is NOT a struct literal!
+    if is_rust_block_start(trimmed) {
+        return None;
+    }
+    
     // Must have { but NOT have = before it (or = is inside the braces)
     if !trimmed.contains('{') {
         return None;
@@ -447,6 +525,11 @@ fn detect_bare_struct_literal(line: &str, registry: &StructRegistry) -> Option<S
 /// Detect BARE enum struct variant literal (without assignment): `Enum::Variant {`
 fn detect_bare_enum_literal(line: &str) -> Option<String> {
     let trimmed = line.trim();
+    
+    // CRITICAL FIX: EXCLUDE function definitions and other Rust blocks
+    if is_rust_block_start(trimmed) {
+        return None;
+    }
     
     // EXCLUDE match arms: `Event::Data { id, body } =>`
     if trimmed.contains("=>") {
@@ -484,6 +567,11 @@ fn is_valid_identifier(s: &str) -> bool {
 /// Detect if line starts an enum struct variant literal: `varname = Enum::Variant {`
 fn detect_enum_literal_start(line: &str) -> Option<(String, String)> {
     let trimmed = line.trim();
+    
+    // CRITICAL FIX: EXCLUDE function definitions and other Rust blocks
+    if is_rust_block_start(trimmed) {
+        return None;
+    }
     
     // EXCLUDE match arms: `Event::Data { id, body } =>`
     if trimmed.contains("=>") {
@@ -1514,10 +1602,70 @@ pub fn parse_rusts(source: &str) -> String {
     // Tracks when previous line ended with a binary operator
     let mut prev_line_was_continuation = false;
     
+    // MULTILINE EXPRESSION DEPTH TRACKING
+    // Tracks unclosed parens/brackets for multiline function calls, macros, arrays
+    // When > 0, we're inside a multiline expression and should NOT add semicolons
+    let mut multiline_expr_depth: i32 = 0;
+    
     for (line_num, line) in lines.iter().enumerate() {
         let clean_line = strip_inline_comment(line);
         let trimmed = clean_line.trim();
         let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+        
+        //=======================================================================
+        // MULTILINE EXPRESSION DEPTH TRACKING
+        // Track unclosed parens/brackets for multiline expressions like:
+        //   format!(           <- depth becomes 1
+        //       "{}",          <- still depth 1, no semicolon
+        //       value          <- still depth 1, no semicolon  
+        //   )                  <- depth becomes 0
+        // This ensures we don't add semicolons INSIDE multiline expressions
+        //=======================================================================
+        // Save depth BEFORE processing this line
+        let multiline_depth_before = multiline_expr_depth;
+        
+        // Update depth based on this line's parens/brackets
+        {
+            let mut in_string = false;
+            let mut escape_next = false;
+            for c in trimmed.chars() {
+                if escape_next {
+                    escape_next = false;
+                    continue;
+                }
+                if c == '\\' && in_string {
+                    escape_next = true;
+                    continue;
+                }
+                if c == '"' {
+                    in_string = !in_string;
+                    continue;
+                }
+                if !in_string {
+                    match c {
+                        '(' | '[' => multiline_expr_depth += 1,
+                        ')' | ']' => multiline_expr_depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            // Ensure depth doesn't go negative (defensive)
+            if multiline_expr_depth < 0 {
+                multiline_expr_depth = 0;
+            }
+        }
+        
+        // If we were inside a multiline expression BEFORE this line, skip semicolons
+        let inside_multiline_expr = multiline_depth_before > 0;
+        
+        // LOOK-AHEAD: Check if next line starts with `.` (method chain continuation)
+        // If so, don't add semicolon to current line
+        let next_line_is_method_chain = lines.get(line_num + 1)
+            .map(|next| {
+                let next_trimmed = strip_inline_comment(next).trim().to_string();
+                next_trimmed.starts_with('.')
+            })
+            .unwrap_or(false);
         
         //=======================================================================
         // MULTI-LINE FUNCTION SIGNATURE ACCUMULATION
@@ -2564,8 +2712,8 @@ pub fn parse_rusts(source: &str) -> String {
             let should_have_let = is_decl || (!is_mutation && !is_param) || is_shadowing;
             
             if is_outer {
-                // Check if value ends with continuation operator - don't add semicolon
-                let semi = if ends_with_continuation_operator(&expanded_value) { "" } else { ";" };
+                // Check if value ends with continuation operator OR method chain OR inside multiline expr
+                let semi = if ends_with_continuation_operator(&expanded_value) || next_line_is_method_chain || inside_multiline_expr { "" } else { ";" };
                 let output_line = format!("{}{} = {}{}", leading_ws, var_name, expanded_value, semi);
                 output_lines.push(output_line);
                 prev_line_was_continuation = ends_with_continuation_operator(&expanded_value);
@@ -2579,8 +2727,8 @@ pub fn parse_rusts(source: &str) -> String {
                 } else {
                     String::new()
                 };
-                // Check if value ends with continuation operator - don't add semicolon
-                let semi = if ends_with_continuation_operator(&expanded_value) { "" } else { ";" };
+                // Check if value ends with continuation operator OR method chain OR inside multiline expr
+                let semi = if ends_with_continuation_operator(&expanded_value) || next_line_is_method_chain || inside_multiline_expr { "" } else { ";" };
                 let output_line = format!("{}{} {}{} = {}{}", 
                     leading_ws, let_keyword, var_name, type_annotation, expanded_value, semi);
                 output_lines.push(output_line);
@@ -2595,15 +2743,15 @@ pub fn parse_rusts(source: &str) -> String {
                 } else {
                     String::new()
                 };
-                // Check if value ends with continuation operator - don't add semicolon
-                let semi = if ends_with_continuation_operator(&expanded_value) { "" } else { ";" };
+                // Check if value ends with continuation operator OR method chain OR inside multiline expr
+                let semi = if ends_with_continuation_operator(&expanded_value) || next_line_is_method_chain || inside_multiline_expr { "" } else { ";" };
                 let output_line = format!("{}{} {}{} = {}{}", 
                     leading_ws, let_keyword, var_name, type_annotation, expanded_value, semi);
                 output_lines.push(output_line);
                 prev_line_was_continuation = ends_with_continuation_operator(&expanded_value);
             } else if is_mutation && is_param {
                 // MUTATION: Only for actual mutations of function parameters
-                let semi = if ends_with_continuation_operator(&expanded_value) { "" } else { ";" };
+                let semi = if ends_with_continuation_operator(&expanded_value) || next_line_is_method_chain || inside_multiline_expr { "" } else { ";" };
                 let output_line = format!("{}{} = {}{}", leading_ws, var_name, expanded_value, semi);
                 output_lines.push(output_line);
                 prev_line_was_continuation = ends_with_continuation_operator(&expanded_value);
@@ -2617,7 +2765,7 @@ pub fn parse_rusts(source: &str) -> String {
                 } else {
                     String::new()
                 };
-                let semi = if ends_with_continuation_operator(&expanded_value) { "" } else { ";" };
+                let semi = if ends_with_continuation_operator(&expanded_value) || next_line_is_method_chain || inside_multiline_expr { "" } else { ";" };
                 let output_line = format!("{}{} {}{} = {}{}", 
                     leading_ws, let_keyword, var_name, type_annotation, expanded_value, semi);
                 output_lines.push(output_line);
@@ -2698,11 +2846,15 @@ pub fn parse_rusts(source: &str) -> String {
             // Determine semicolon: 
             // - No semicolon if line ends with continuation operator (expression continues on next line)
             // - No semicolon if it's a return expression (no ; needed before })
+            // - No semicolon if inside a multiline expression (format!(...), vec![...], etc.)
+            // - No semicolon if next line starts with `.` (method chain continuation)
             // - Otherwise, use needs_semicolon check
             // CRITICAL FIX: We no longer skip semicolon just because PREV line was continuation
             // Only skip if CURRENT line ends with continuation operator
             let should_add_semi = !this_line_ends_with_continuation
                 && !is_return_expr 
+                && !inside_multiline_expr  // CRITICAL: Skip semicolon inside multiline expressions
+                && !next_line_is_method_chain  // CRITICAL: Skip semicolon for method chain continuation
                 && needs_semicolon(&transformed);
             
             if should_add_semi {
@@ -2740,7 +2892,18 @@ pub fn parse_rusts(source: &str) -> String {
         .map(|line| strip_effects_from_line(&line))
         .collect();
     
-    let result = final_lines.join("\n");
+    //==========================================================================
+    // CRITICAL POST-PROCESSING: Strip `outer` keyword from field assignments
+    // `outer self.field = value` → `self.field = value`
+    // This handles cases where the assignment parser didn't match because
+    // `self.field` isn't a valid simple identifier
+    //==========================================================================
+    let outer_stripped: Vec<String> = final_lines
+        .into_iter()
+        .map(|line| strip_outer_keyword(&line))
+        .collect();
+    
+    let result = outer_stripped.join("\n");
     
     //==========================================================================
     // L-05: RUST SANITY CHECK
@@ -3145,6 +3308,27 @@ fn strip_effects_from_line(line: &str) -> String {
     }
     
     result
+}
+
+//=============================================================================
+// CRITICAL POST-PROCESSING: Strip `outer` keyword from field assignments
+// Handles cases like `outer self.field = value` that aren't parsed as assignments
+// because `self.field` isn't a valid simple identifier
+//=============================================================================
+
+/// Strip `outer` keyword from a line
+/// `outer self.hash = value` → `self.hash = value`
+fn strip_outer_keyword(line: &str) -> String {
+    let trimmed = line.trim();
+    let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+    
+    // Check for `outer ` at start of trimmed line
+    if trimmed.starts_with("outer ") {
+        let rest = trimmed.strip_prefix("outer ").unwrap();
+        return format!("{}{}", leading_ws, rest);
+    }
+    
+    line.to_string()
 }
 
 #[cfg(test)]
