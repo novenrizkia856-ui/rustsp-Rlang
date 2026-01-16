@@ -242,7 +242,9 @@ impl VariableTracker {
                 return assignment.line_num == line_num;
             }
         }
-        false
+        // CRITICAL FIX: If variable is NOT in tracker, it's a NEW variable
+        // Therefore this IS its first assignment - return TRUE not false!
+        true
     }
 
     pub fn is_shadowing(&self, var_name: &str, line_num: usize) -> bool {

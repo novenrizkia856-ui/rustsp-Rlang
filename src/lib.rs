@@ -9,6 +9,7 @@ pub mod error_msg;
 pub mod semantic_check;
 pub mod anti_fail_logic;
 pub mod rust_sanity;
+pub mod hex_normalizer;
 
 //IR-based modules
 pub mod ast;
@@ -47,6 +48,7 @@ use control_flow::{
     transform_enum_struct_init,
     MatchStringContext, transform_match_for_string_patterns, pattern_is_string_literal,
 };
+use hex_normalizer::normalize_hex_literals;
 
 /// Strip inline comments from a line, preserving string literals
 fn strip_inline_comment(line: &str) -> String {
@@ -75,12 +77,36 @@ fn strip_inline_comment(line: &str) -> String {
     result.trim_end().to_string()
 }
 
+/// Check if a line ends with a binary continuation operator
+/// These lines are incomplete - the expression continues on the next line
+fn ends_with_continuation_operator(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.ends_with('^') || trimmed.ends_with('|') || trimmed.ends_with('&')
+        || trimmed.ends_with('+') || trimmed.ends_with("+ ")
+        || trimmed.ends_with('-') || trimmed.ends_with("- ")
+        || trimmed.ends_with('*') || trimmed.ends_with("* ")
+        || trimmed.ends_with('/') || trimmed.ends_with("/ ")
+        || trimmed.ends_with('%')
+        || trimmed.ends_with("||") || trimmed.ends_with("&&")
+        || trimmed.ends_with("<<") || trimmed.ends_with(">>")
+}
+
 /// Check if a line needs a semicolon (ONLY for non-literal mode)
 fn needs_semicolon(trimmed: &str) -> bool {
     if trimmed.is_empty() { return false; }
     if trimmed.ends_with(';') { return false; }
     if trimmed.ends_with('{') || trimmed.ends_with('}') { return false; }
     if trimmed.ends_with(',') { return false; }
+    
+    // CRITICAL: Lines ending with binary operators are CONTINUATIONS
+    // They should NOT get semicolons as the expression continues on the next line
+    if trimmed.ends_with('^') || trimmed.ends_with('|') || trimmed.ends_with('&')
+       || trimmed.ends_with('+') || trimmed.ends_with('-') || trimmed.ends_with('*')
+       || trimmed.ends_with('/') || trimmed.ends_with('%')
+       || trimmed.ends_with("||") || trimmed.ends_with("&&")
+       || trimmed.ends_with("<<") || trimmed.ends_with(">>") {
+        return false;
+    }
     
     if trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ") 
        || trimmed.starts_with("struct ") || trimmed.starts_with("enum ")
@@ -172,6 +198,55 @@ fn transform_macro_calls(line: &str) -> String {
     }
     
     result
+}
+
+/// Transform bare slice types [T] to Vec<T> in struct field definitions
+/// Bare slices are unsized and can't be struct fields in Rust
+/// Example: `transactions: [Transaction],` -> `transactions: Vec<Transaction>,`
+fn transform_struct_field_slice_to_vec(line: &str) -> String {
+    // Check if this is a field line with a type
+    if !line.contains(':') {
+        return line.to_string();
+    }
+    
+    // Find the type part after the colon
+    let trimmed = line.trim();
+    if let Some(colon_pos) = trimmed.find(':') {
+        let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+        let field_name = trimmed[..colon_pos].trim();
+        let type_part = trimmed[colon_pos + 1..].trim();
+        
+        // Check if type is a bare slice [T] (not &[T] or already Vec<T>)
+        if type_part.starts_with('[') && !type_part.starts_with("&[") {
+            // Find the matching ]
+            let mut depth = 0;
+            let mut slice_end = None;
+            for (i, c) in type_part.char_indices() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            slice_end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            
+            if let Some(end_pos) = slice_end {
+                // Extract the element type
+                let element_type = &type_part[1..end_pos];
+                let rest = &type_part[end_pos + 1..]; // Usually just `,`
+                
+                // Transform to Vec<T>
+                return format!("{}{}: Vec<{}>{}", leading_ws, field_name, element_type, rest);
+            }
+        }
+    }
+    
+    line.to_string()
 }
 
 //===========================================================================
@@ -591,12 +666,14 @@ fn transform_enum_fields_inline(fields: &str) -> String {
 }
 
 /// Transform a single enum field: `x = 1` → `x: 1`
+/// Also handles nested struct literals recursively!
 fn transform_single_enum_field(field: &str) -> String {
     let trimmed = field.trim();
     if trimmed.is_empty() { return String::new(); }
     
     // Already transformed (has : but not ::)
-    if trimmed.contains(':') && !trimmed.contains("::") { 
+    // BUT: might still have nested struct with = inside, so check for that
+    if trimmed.contains(':') && !trimmed.contains("::") && !trimmed.contains('=') { 
         return trimmed.to_string(); 
     }
     
@@ -606,16 +683,181 @@ fn transform_single_enum_field(field: &str) -> String {
         let value = trimmed[eq_pos + 1..].trim();
         
         if is_valid_field_name(name) {
-            return format!("{}: {}", name, value);
+            // CRITICAL: Recursively transform nested struct literals in value!
+            let transformed_value = transform_nested_struct_value(value);
+            return format!("{}: {}", name, transformed_value);
         }
+    }
+    
+    // Even if no = found at top level, might have nested struct with =
+    if trimmed.contains('{') && trimmed.contains('=') {
+        return transform_nested_struct_value(trimmed);
     }
     
     trimmed.to_string()
 }
 
+/// Transform nested struct literals recursively
+/// `Address { value = addr_hash }` → `Address { value: addr_hash }`
+/// `PublicKey { x = pub_x, y = pub_y }` → `PublicKey { x: pub_x, y: pub_y }`
+fn transform_nested_struct_value(value: &str) -> String {
+    let trimmed = value.trim();
+    
+    // If no { or no =, nothing to transform
+    if !trimmed.contains('{') || !trimmed.contains('=') {
+        return trimmed.to_string();
+    }
+    
+    // Find the opening brace
+    if let Some(brace_start) = trimmed.find('{') {
+        let before_brace = &trimmed[..brace_start + 1];
+        let after_brace = &trimmed[brace_start + 1..];
+        
+        // Find matching closing brace
+        let mut depth = 1;
+        let mut brace_end = after_brace.len();
+        for (i, c) in after_brace.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        brace_end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        let fields_part = &after_brace[..brace_end];
+        let after_close = &after_brace[brace_end..];
+        
+        // Transform each field inside the braces
+        let transformed_fields = transform_struct_fields_recursive(fields_part);
+        return format!("{}{}{}", before_brace, transformed_fields, after_close);
+    }
+    
+    trimmed.to_string()
+}
+
+/// Transform struct fields recursively, handling nested structs
+fn transform_struct_fields_recursive(fields: &str) -> String {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut brace_depth: usize = 0;
+    let mut prev_char = ' ';
+    
+    for c in fields.chars() {
+        if c == '"' && prev_char != '\\' {
+            in_string = !in_string;
+        }
+        if !in_string {
+            if c == '{' { brace_depth += 1; }
+            if c == '}' { brace_depth = brace_depth.saturating_sub(1); }
+        }
+        
+        if c == ',' && !in_string && brace_depth == 0 {
+            let transformed = transform_single_struct_field_recursive(&current);
+            if !transformed.is_empty() {
+                result.push(transformed);
+            }
+            current.clear();
+        } else {
+            current.push(c);
+        }
+        prev_char = c;
+    }
+    
+    // Last field
+    let transformed = transform_single_struct_field_recursive(&current);
+    if !transformed.is_empty() {
+        result.push(transformed);
+    }
+    
+    // Join with ", " but preserve spacing
+    if result.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", result.join(", "))
+    }
+}
+
+/// Transform a single struct field, recursively handling nested structs
+fn transform_single_struct_field_recursive(field: &str) -> String {
+    let trimmed = field.trim();
+    if trimmed.is_empty() { return String::new(); }
+    
+    // Find = that's not ==, !=, etc (at the top level only)
+    if let Some(eq_pos) = find_field_eq_top_level(trimmed) {
+        let name = trimmed[..eq_pos].trim();
+        let value = trimmed[eq_pos + 1..].trim().trim_end_matches(',');  // Remove trailing comma
+        
+        if is_valid_field_name(name) {
+            // Recursively transform nested struct in value
+            let transformed_value = if value.contains('{') && value.contains('=') {
+                transform_nested_struct_value(value)
+            } else {
+                value.to_string()
+            };
+            return format!("{}: {}", name, transformed_value);
+        }
+    }
+    
+    // If already has : (but not ::), it's already transformed, but check nested
+    if trimmed.contains(':') && !trimmed.contains("::") {
+        // Still might have nested struct with = in value part
+        if let Some(colon_pos) = trimmed.find(':') {
+            if !trimmed[..colon_pos].contains("::") {
+                let name = trimmed[..colon_pos].trim();
+                let value = trimmed[colon_pos + 1..].trim().trim_end_matches(',');  // Remove trailing comma
+                if value.contains('{') && value.contains('=') {
+                    let transformed_value = transform_nested_struct_value(value);
+                    return format!("{}: {}", name, transformed_value);
+                }
+            }
+        }
+        return trimmed.to_string();
+    }
+    
+    trimmed.to_string()
+}
+
+/// Find field = at TOP LEVEL only (not inside nested braces)
+fn find_field_eq_top_level(s: &str) -> Option<usize> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut brace_depth: usize = 0;
+    
+    for i in 0..chars.len() {
+        match chars[i] {
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            '=' if brace_depth == 0 => {
+                let prev = if i > 0 { chars[i-1] } else { ' ' };
+                let next = if i + 1 < chars.len() { chars[i+1] } else { ' ' };
+                
+                if prev != '!' && prev != '<' && prev != '>' && prev != '=' && next != '=' && next != '>' {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Transform a literal field line: `field = value` → `field: value,`
 /// NO `let`, NO `;` - this is expression-only context!
+/// CRITICAL: Also transforms nested struct literals recursively!
+/// CRITICAL: Adds .to_vec() for slice parameters that need to become Vec
 fn transform_literal_field(line: &str) -> String {
+    transform_literal_field_with_ctx(line, None)
+}
+
+/// Transform a literal field with optional function context
+/// If ctx is provided, slice parameters will get .to_vec() added
+fn transform_literal_field_with_ctx(line: &str, ctx: Option<&CurrentFunctionContext>) -> String {
     let trimmed = line.trim();
     let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
     
@@ -629,43 +871,125 @@ fn transform_literal_field(line: &str) -> String {
         return line.to_string();
     }
     
-    // Already has colon (except ::)
+    // Already has colon (except ::) - but might have nested struct with = in value
     if trimmed.contains(':') && !trimmed.contains("::") {
+        // Check if there's a nested struct that needs transformation
+        if trimmed.contains('{') && trimmed.contains('=') {
+            // Find the colon position
+            if let Some(colon_pos) = trimmed.find(':') {
+                if !trimmed[..colon_pos].contains("::") {
+                    let field = trimmed[..colon_pos].trim();
+                    let value = trimmed[colon_pos + 1..].trim().trim_end_matches(',');
+                    let transformed_value = transform_nested_struct_value(value);
+                    return format!("{}{}: {},", leading_ws, field, transformed_value);
+                }
+            }
+        }
         let clean = trimmed.trim_end_matches(',');
         return format!("{}{},", leading_ws, clean);
     }
     
     // Nested literal start: `header = Header {` - transform = to :
+    // ALSO transform nested struct fields inside!
     if trimmed.contains('{') {
-        if let Some(eq_pos) = find_field_eq(trimmed) {
+        if let Some(eq_pos) = find_field_eq_top_level(trimmed) {
             let field = trimmed[..eq_pos].trim();
             let value = trimmed[eq_pos + 1..].trim();
             if is_valid_field_name(field) {
-                return format!("{}{}: {}", leading_ws, field, value);
+                // Transform nested struct in value
+                let transformed_value = transform_nested_struct_value(value);
+                return format!("{}{}: {}", leading_ws, field, transformed_value);
             }
         }
-        return format!("{}{}", leading_ws, trimmed);
+        // Even without = at top level, might be bare struct that needs inner transform
+        let transformed = transform_nested_struct_value(trimmed);
+        return format!("{}{}", leading_ws, transformed);
     }
     
     // Simple field: `field = value`
     if let Some(eq_pos) = find_field_eq(trimmed) {
         let field = trimmed[..eq_pos].trim();
-        let value = trimmed[eq_pos + 1..].trim();
+        let value = trimmed[eq_pos + 1..].trim().trim_end_matches(',');  // Remove trailing comma
         
         if is_valid_field_name(field) && !value.is_empty() {
             // Transform string literals to String::from
-            let transformed_value = if is_string_literal(value) {
+            let mut transformed_value = if is_string_literal(value) {
                 let inner = &value[1..value.len()-1];
                 format!("String::from(\"{}\")", inner)
             } else {
                 value.to_string()
             };
             
+            // CRITICAL FIX: Add .to_vec() for slice parameters assigned to struct fields
+            // If value is a bare identifier that's a slice parameter, it needs .to_vec()
+            if let Some(ctx) = ctx {
+                if is_valid_identifier(&transformed_value) && ctx.is_slice_param(&transformed_value) {
+                    transformed_value = format!("{}.to_vec()", transformed_value);
+                }
+            }
+            
+            // CRITICAL FIX: Add .clone() for field access expressions
+            // Pattern: `x.y` where x.y is likely a non-Copy struct field
+            // This prevents move errors when the same field is used multiple times
+            if should_clone_field_value(&transformed_value) {
+                transformed_value = format!("{}.clone()", transformed_value);
+            }
+            
             return format!("{}{}: {},", leading_ws, field, transformed_value);
         }
     }
     
     format!("{}{}", leading_ws, trimmed)
+}
+
+/// Check if a value expression should have .clone() added
+/// Returns true for field access expressions that are likely non-Copy
+fn should_clone_field_value(value: &str) -> bool {
+    let v = value.trim();
+    
+    // Skip if already has .clone() or .to_vec()
+    if v.ends_with(".clone()") || v.ends_with(".to_vec()") {
+        return false;
+    }
+    
+    // Skip method calls (contains `()` anywhere - even in the middle)
+    // Examples: `x.len()`, `x.len() as u32`, `foo().bar`
+    if v.contains("()") {
+        return false;
+    }
+    
+    // Skip cast expressions (contains ` as `)
+    // Examples: `x as u32`, `x.len() as u32`
+    if v.contains(" as ") {
+        return false;
+    }
+    
+    // Skip literals
+    if v.starts_with('"') || v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
+        return false;
+    }
+    if v == "true" || v == "false" {
+        return false;
+    }
+    
+    // Skip simple identifiers (likely Copy types or already handled)
+    if !v.contains('.') {
+        return false;
+    }
+    
+    // Skip path expressions like TxType::Stake
+    if v.contains("::") {
+        return false;
+    }
+    
+    // Skip array indexing like arr[i]
+    if v.contains('[') {
+        return false;
+    }
+    
+    // This is a field access pattern like `from.address`
+    // These are likely non-Copy struct fields that should be cloned
+    true
 }
 
 /// Find the `=` that's a field assignment (not ==, !=, <=, >=, =>)
@@ -717,6 +1041,7 @@ fn is_string_literal(s: &str) -> bool {
 /// - Is a method call on indexed element: `arr[i].len()`
 /// - Is a field access: `arr[i].field`
 /// - Is inside string literal
+/// - Has `as` cast (e.g., `arr[i] as u64`) - cast types are typically Copy
 fn transform_array_access_clone(value: &str) -> String {
     let trimmed = value.trim();
     
@@ -728,6 +1053,13 @@ fn transform_array_access_clone(value: &str) -> String {
     // Skip if not a simple array index pattern
     // Must match: identifier[expr]
     if !trimmed.contains('[') || !trimmed.contains(']') {
+        return value.to_string();
+    }
+    
+    // CRITICAL: Skip if there's an `as` cast - cast targets are typically Copy types
+    // e.g., `bytes[i] as u64` should NOT become `bytes[i] as u64.clone()`
+    // because u64 is a Copy type and .clone() after cast is invalid syntax
+    if trimmed.contains(" as ") {
         return value.to_string();
     }
     
@@ -940,12 +1272,17 @@ fn is_cloneable_array_access(expr: &str) -> bool {
 //===========================================================================
 
 pub fn parse_rusts(source: &str) -> String {
-    let lines: Vec<&str> = source.lines().collect();
+    // CRITICAL: Normalize custom hex literals FIRST
+    // Convert 0xMERKLE01 → 0x<valid_hex>, 0xWALLET01 → 0x<valid_hex>, etc.
+    // This ensures ALL hex literals are valid Rust hex before transpilation
+    let normalized_source = normalize_hex_literals(source);
+    
+    let lines: Vec<&str> = normalized_source.lines().collect();
     let mut tracker = VariableTracker::new();
     
     // Run scope analysis
     let mut scope_analyzer = ScopeAnalyzer::new();
-    scope_analyzer.analyze(source);
+    scope_analyzer.analyze(&normalized_source);
     
     // Build registries
     let mut fn_registry = FunctionRegistry::new();
@@ -961,6 +1298,9 @@ pub fn parse_rusts(source: &str) -> String {
     let mut current_array_var: Option<String> = None;
     
     let mut brace_depth: usize = 0;
+    
+    // CRITICAL FIX: Track multi-line function signatures in first pass
+    let mut first_pass_fn_acc: Option<String> = None;
     
     // First pass: register structs, enums, functions, track assignments
     for (line_num, line) in lines.iter().enumerate() {
@@ -983,10 +1323,47 @@ pub fn parse_rusts(source: &str) -> String {
             }
         }
         
-        // Register function signatures
+        //=====================================================================
+        // CRITICAL FIX: Handle multi-line function signatures
+        // Functions like:
+        //   fn create_block(
+        //       header BlockHeader,
+        //       transactions [Transaction]
+        //   ) Block { ... }
+        // Must be registered for transform_call_args to work
+        //=====================================================================
+        
+        // Continue accumulating multi-line function
+        if let Some(ref mut acc) = first_pass_fn_acc {
+            acc.push(' ');
+            acc.push_str(trimmed);
+            
+            let paren_opens = acc.matches('(').count();
+            let paren_closes = acc.matches(')').count();
+            
+            // Signature complete when parens balanced and contains `{`
+            if paren_opens == paren_closes && acc.contains('{') {
+                if let FunctionParseResult::RustSPlusSignature(sig) = parse_function_line(acc) {
+                    fn_registry.register(sig);
+                }
+                first_pass_fn_acc = None;
+            }
+            continue;
+        }
+        
+        // Register function signatures (single-line or start of multi-line)
         if trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ") {
-            if let FunctionParseResult::RustSPlusSignature(sig) = parse_function_line(trimmed) {
-                fn_registry.register(sig);
+            let paren_opens = trimmed.matches('(').count();
+            let paren_closes = trimmed.matches(')').count();
+            
+            if paren_opens == paren_closes && trimmed.contains('{') {
+                // Complete single-line signature
+                if let FunctionParseResult::RustSPlusSignature(sig) = parse_function_line(trimmed) {
+                    fn_registry.register(sig);
+                }
+            } else if paren_opens > paren_closes {
+                // Start of multi-line signature
+                first_pass_fn_acc = Some(trimmed.to_string());
             }
         }
         
@@ -1128,12 +1505,92 @@ pub fn parse_rusts(source: &str) -> String {
     // IF EXPRESSION ASSIGNMENT MODE - tracks `x = if cond {` for semicolon at end
     let mut if_expr_assignment_depth: Option<usize> = None;
     
+    // MULTI-LINE FUNCTION SIGNATURE MODE
+    // Accumulates lines when function signature spans multiple lines
+    let mut multiline_fn_acc: Option<String> = None;
+    let mut multiline_fn_leading_ws: String = String::new();
+    
+    // EXPRESSION CONTINUATION TRACKING
+    // Tracks when previous line ended with a binary operator
+    let mut prev_line_was_continuation = false;
+    
     for (line_num, line) in lines.iter().enumerate() {
         let clean_line = strip_inline_comment(line);
         let trimmed = clean_line.trim();
         let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
         
-        // Track function context
+        //=======================================================================
+        // MULTI-LINE FUNCTION SIGNATURE ACCUMULATION
+        // When function signature spans multiple lines like:
+        //   fn foo(
+        //       a u64,
+        //       b u64
+        //   ) RetType {
+        // We accumulate all lines until we have the complete signature
+        //=======================================================================
+        if let Some(ref mut acc) = multiline_fn_acc {
+            // Continue accumulating
+            acc.push(' ');
+            acc.push_str(trimmed);
+            
+            // Check if signature is complete (has matching parens AND ends with {)
+            let paren_opens = acc.matches('(').count();
+            let paren_closes = acc.matches(')').count();
+            
+            if paren_opens == paren_closes && acc.ends_with('{') {
+                // Signature is complete! Process it
+                let complete_sig = acc.clone();
+                multiline_fn_acc = None;
+                
+                // Track function context
+                in_function_body = true;
+                function_start_brace = brace_depth + 1;
+                
+                if let FunctionParseResult::RustSPlusSignature(ref sig) = parse_function_line(&complete_sig) {
+                    current_fn_ctx.enter(sig, function_start_brace);
+                }
+                
+                // Process the complete signature
+                match parse_function_line(&complete_sig) {
+                    FunctionParseResult::RustSPlusSignature(sig) => {
+                        let rust_sig = signature_to_rust(&sig);
+                        output_lines.push(format!("{}{}", multiline_fn_leading_ws, rust_sig));
+                    }
+                    FunctionParseResult::RustPassthrough => {
+                        output_lines.push(format!("{}{}", multiline_fn_leading_ws, complete_sig));
+                    }
+                    FunctionParseResult::Error(e) => {
+                        output_lines.push(format!("{}// COMPILE ERROR: {}", multiline_fn_leading_ws, e));
+                        output_lines.push(format!("{}{}", multiline_fn_leading_ws, complete_sig));
+                    }
+                    FunctionParseResult::NotAFunction => {
+                        output_lines.push(format!("{}{}", multiline_fn_leading_ws, complete_sig));
+                    }
+                }
+                
+                // Update brace depth for the opening brace
+                brace_depth += 1;
+                continue;
+            } else {
+                // Not complete yet, continue accumulating
+                continue;
+            }
+        }
+        
+        // Check if this line starts a multi-line function signature
+        if (trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ")) && trimmed.contains('(') {
+            let paren_opens = trimmed.matches('(').count();
+            let paren_closes = trimmed.matches(')').count();
+            
+            // If parens are unbalanced, start accumulating
+            if paren_opens > paren_closes {
+                multiline_fn_acc = Some(trimmed.to_string());
+                multiline_fn_leading_ws = leading_ws.clone();
+                continue;
+            }
+        }
+        
+        // Track function context (for single-line signatures)
         if trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ") {
             in_function_body = true;
             function_start_brace = brace_depth + 1;
@@ -1178,6 +1635,8 @@ pub fn parse_rusts(source: &str) -> String {
         };
         
         if trimmed.is_empty() {
+            // Empty line breaks any continuation
+            prev_line_was_continuation = false;
             output_lines.push(String::new());
             continue;
         }
@@ -1246,10 +1705,15 @@ pub fn parse_rusts(source: &str) -> String {
         // LITERAL MODE ACTIVE - transform as field, NO let, NO ;
         //=======================================================================
         if literal_mode.is_active() {
-            let transformed = transform_literal_field(&clean_line);
+            // CRITICAL FIX: Pass function context so slice params get .to_vec()
+            let transformed = transform_literal_field_with_ctx(&clean_line, Some(&current_fn_ctx));
             
             // Check if this line ALSO starts a nested literal
-            if trimmed.contains('{') && !trimmed.ends_with('}') {
+            // CRITICAL FIX: Use opens > closes to detect multi-line nested literals
+            // A line like `address = Address { value = addr_hash },` has opens=closes=1
+            // so it's a COMPLETE single-line literal, not a multi-line start.
+            // Only enter nested mode if we open MORE braces than we close.
+            if trimmed.contains('{') && opens > closes {
                 // Enter nested literal mode - nested literals are fields, not assignments
                 let kind = if trimmed.contains("::") { 
                     LiteralKind::EnumVariant 
@@ -1401,11 +1865,14 @@ pub fn parse_rusts(source: &str) -> String {
             let needs_as_str = match_string_ctx.needs_as_str();
             
             if let Some((var_name, match_expr)) = parse_control_flow_assignment(trimmed) {
-                // Need to check if this is first assignment
-                let is_first = tracker.is_first_assignment(&var_name, line_num);
+                // CRITICAL FIX: Check if variable is a function parameter
+                let is_param = current_fn_ctx.params.contains_key(&var_name);
+                let is_decl = scope_analyzer.is_decl(line_num);
+                let is_mutation = scope_analyzer.is_mut(line_num);
                 let is_shadowing = tracker.is_shadowing(&var_name, line_num);
                 let needs_mut = scope_analyzer.needs_mut(&var_name, line_num);
-                let needs_let = is_first || is_shadowing;
+                // Use same logic: add let unless it's mutating a parameter
+                let needs_let = is_decl || (!is_mutation && !is_param) || is_shadowing;
                 
                 // Transform match expression if needed
                 let transformed_match_expr = if needs_as_str {
@@ -1443,11 +1910,14 @@ pub fn parse_rusts(source: &str) -> String {
         //=======================================================================
         if is_if_assignment(trimmed) {
             if let Some((var_name, if_expr)) = parse_control_flow_assignment(trimmed) {
-                // Need to check if this is first assignment
-                let is_first = tracker.is_first_assignment(&var_name, line_num);
+                // CRITICAL FIX: Check if variable is a function parameter
+                let is_param = current_fn_ctx.params.contains_key(&var_name);
+                let is_decl = scope_analyzer.is_decl(line_num);
+                let is_mutation = scope_analyzer.is_mut(line_num);
                 let is_shadowing = tracker.is_shadowing(&var_name, line_num);
                 let needs_mut = scope_analyzer.needs_mut(&var_name, line_num);
-                let needs_let = is_first || is_shadowing;
+                // Use same logic: add let unless it's mutating a parameter
+                let needs_let = is_decl || (!is_mutation && !is_param) || is_shadowing;
                 
                 // CRITICAL: Wrap if expression in parentheses for valid Rust expression context
                 if needs_let {
@@ -1507,18 +1977,45 @@ pub fn parse_rusts(source: &str) -> String {
                 }
                 expanded_value = transform_call_args(&expanded_value, &fn_registry);
                 
-                // PRIORITY ORDER:
-                // 1. outer keyword → mutation
-                // 2. is_mutation (from scope analyzer) → mutation (NO let)
-                // 3. is_explicit_mut OR is_decl → new declaration with let
+                // PRIORITY ORDER (FIXED):
+                // 1. outer keyword → mutation to outer scope (no let)
+                // 2. is_explicit_mut → new declaration with mut (let mut)
+                // 3. is_decl from scope_analyzer → new declaration (let)
+                // 4. is_mutation AND variable is a function parameter → mutation (no let)
+                // 5. Default → new declaration (let)
+                
+                // CRITICAL FIX: Check if variable is a function parameter
+                let is_param = current_fn_ctx.params.contains_key(&var_name);
+                let is_shadowing = tracker.is_shadowing(&var_name, line_num);
+                let should_have_let = is_decl || (!is_mutation && !is_param) || is_shadowing;
+                
+                // CRITICAL FIX: Check if value ends with `{` (struct literal start)
+                // If so, DON'T add semicolon and enter literal mode
+                let is_struct_literal_start = expanded_value.trim().ends_with('{');
+                let semi = if is_struct_literal_start { "" } else { ";" };
+                
+                // If this is a struct literal start inside match arm, enter literal mode
+                if is_struct_literal_start {
+                    // Enter literal mode for multi-line struct
+                    literal_mode.enter(LiteralKind::Struct, prev_depth + opens, true);
+                }
                 
                 if is_outer {
-                    output_lines.push(format!("{}{} = {};", leading_ws, var_name, expanded_value));
-                } else if is_mutation && !is_explicit_mut {
-                    // L-03: Mutation to existing variable - NO let
-                    output_lines.push(format!("{}{} = {};", leading_ws, var_name, expanded_value));
-                } else if is_explicit_mut || is_decl {
+                    output_lines.push(format!("{}{} = {}{}", leading_ws, var_name, expanded_value, semi));
+                } else if is_explicit_mut {
                     // CRITICAL: `mut x = 10` MUST become `let mut x = 10;`
+                    let let_keyword = "let mut";
+                    let type_annotation = if let Some(ref t) = var_type {
+                        format!(": {}", t)
+                    } else if VariableTracker::detect_string_literal(&value) {
+                        ": String".to_string()
+                    } else {
+                        String::new()
+                    };
+                    output_lines.push(format!("{}{} {}{} = {}{}", 
+                        leading_ws, let_keyword, var_name, type_annotation, expanded_value, semi));
+                } else if should_have_let {
+                    // NEW DECLARATION: scope_analyzer says decl, or not mutation, or shadowing
                     let let_keyword = if needs_mut { "let mut" } else { "let" };
                     let type_annotation = if let Some(ref t) = var_type {
                         format!(": {}", t)
@@ -1527,26 +2024,23 @@ pub fn parse_rusts(source: &str) -> String {
                     } else {
                         String::new()
                     };
-                    output_lines.push(format!("{}{} {}{} = {};", 
-                        leading_ws, let_keyword, var_name, type_annotation, expanded_value));
+                    output_lines.push(format!("{}{} {}{} = {}{}", 
+                        leading_ws, let_keyword, var_name, type_annotation, expanded_value, semi));
+                } else if is_mutation && is_param {
+                    // MUTATION: Only for actual mutations of function parameters
+                    output_lines.push(format!("{}{} = {}{}", leading_ws, var_name, expanded_value, semi));
                 } else {
-                    let is_first = tracker.is_first_assignment(&var_name, line_num);
-                    let is_shadowing = tracker.is_shadowing(&var_name, line_num);
-                    
-                    if is_first || is_shadowing {
-                        let let_keyword = if needs_mut { "let mut" } else { "let" };
-                        let type_annotation = if let Some(ref t) = var_type {
-                            format!(": {}", t)
-                        } else if VariableTracker::detect_string_literal(&value) {
-                            ": String".to_string()
-                        } else {
-                            String::new()
-                        };
-                        output_lines.push(format!("{}{} {}{} = {};", 
-                            leading_ws, let_keyword, var_name, type_annotation, expanded_value));
+                    // FALLBACK: Default to new declaration
+                    let let_keyword = if needs_mut { "let mut" } else { "let" };
+                    let type_annotation = if let Some(ref t) = var_type {
+                        format!(": {}", t)
+                    } else if VariableTracker::detect_string_literal(&value) {
+                        ": String".to_string()
                     } else {
-                        output_lines.push(format!("{}{} = {};", leading_ws, var_name, expanded_value));
-                    }
+                        String::new()
+                    };
+                    output_lines.push(format!("{}{} {}{} = {}{}", 
+                        leading_ws, let_keyword, var_name, type_annotation, expanded_value, semi));
                 }
                 continue;
             }
@@ -1661,6 +2155,9 @@ pub fn parse_rusts(source: &str) -> String {
                 continue;
             }
             let transformed = transform_struct_field(&clean_line);
+            // CRITICAL FIX: Transform bare slice types [T] to Vec<T> for struct fields
+            // Bare slices are unsized and can't be struct fields in Rust
+            let transformed = transform_struct_field_slice_to_vec(&transformed);
             output_lines.push(transformed);
             continue;
         }
@@ -1715,7 +2212,9 @@ pub fn parse_rusts(source: &str) -> String {
             }
             
             // Struct variant start tracking
-            if trimmed.contains('{') && !trimmed.ends_with('}') {
+            // CRITICAL FIX: Use opens > closes to detect multi-line struct variants
+            // A line like `Variant { x: i32 },` has opens=closes=1, so it's complete
+            if trimmed.contains('{') && opens > closes {
                 enum_ctx.enter_struct_variant();
             }
             
@@ -1968,13 +2467,16 @@ pub fn parse_rusts(source: &str) -> String {
         // ENTER ARRAY MODE - NO semicolons inside!
         //=======================================================================
         if let Some((var_name, var_type, after_bracket)) = detect_array_literal_start(trimmed) {
-            // Determine if we need let/mut
-            let is_first = tracker.is_first_assignment(&var_name, line_num);
+            // CRITICAL FIX: Check if variable is a function parameter
+            let is_param = current_fn_ctx.params.contains_key(&var_name);
+            let is_decl = scope_analyzer.is_decl(line_num);
+            let is_mutation = scope_analyzer.is_mut(line_num);
             let is_shadowing = tracker.is_shadowing(&var_name, line_num);
             let borrowed_mut = tracker.is_mut_borrowed(&var_name);
             let scope_needs_mut = scope_analyzer.needs_mut(&var_name, line_num);
             let needs_mut = borrowed_mut || scope_needs_mut;
-            let needs_let = is_first || is_shadowing;
+            // Use same logic: add let unless it's mutating a parameter
+            let needs_let = is_decl || (!is_mutation && !is_param) || is_shadowing;
             
             // Enter array mode
             array_mode.enter(
@@ -2043,11 +2545,48 @@ pub fn parse_rusts(source: &str) -> String {
             // Transform enum struct init: Event::C { x = 4 } -> Event::C { x: 4 }
             expanded_value = transform_enum_struct_init(&expanded_value);
             
+            // PRIORITY ORDER (FIXED):
+            // 1. outer keyword → mutation to outer scope (no let)
+            // 2. is_explicit_mut → new declaration with mut (let mut)
+            // 3. is_decl from scope_analyzer → new declaration (let)
+            // 4. is_mutation AND variable is a function parameter → mutation (no let)
+            // 5. Default → new declaration (let) - safer than causing "cannot find value" errors
+            
+            // CRITICAL FIX: Check if variable is a function parameter
+            // Only treat as mutation if it's mutating a parameter, not a local variable
+            let is_param = current_fn_ctx.params.contains_key(&var_name);
+            let is_shadowing = tracker.is_shadowing(&var_name, line_num);
+            
+            // CRITICAL: is_mutation should only skip `let` if it's actually mutating
+            // a previously declared variable in the SAME scope
+            // If scope_analyzer marked it as decl, trust that
+            // If neither decl nor mutation, default to adding `let`
+            let should_have_let = is_decl || (!is_mutation && !is_param) || is_shadowing;
+            
             if is_outer {
-                let output_line = format!("{}{} = {};", leading_ws, var_name, expanded_value);
+                // Check if value ends with continuation operator - don't add semicolon
+                let semi = if ends_with_continuation_operator(&expanded_value) { "" } else { ";" };
+                let output_line = format!("{}{} = {}{}", leading_ws, var_name, expanded_value, semi);
                 output_lines.push(output_line);
-            } else if is_explicit_mut || is_decl {
+                prev_line_was_continuation = ends_with_continuation_operator(&expanded_value);
+            } else if is_explicit_mut {
                 // CRITICAL: `mut x = 10` MUST become `let mut x = 10;`
+                let let_keyword = "let mut";
+                let type_annotation = if let Some(ref t) = var_type {
+                    format!(": {}", t)
+                } else if VariableTracker::detect_string_literal(&value) && var_type.as_deref() != Some("&str") {
+                    ": String".to_string()
+                } else {
+                    String::new()
+                };
+                // Check if value ends with continuation operator - don't add semicolon
+                let semi = if ends_with_continuation_operator(&expanded_value) { "" } else { ";" };
+                let output_line = format!("{}{} {}{} = {}{}", 
+                    leading_ws, let_keyword, var_name, type_annotation, expanded_value, semi);
+                output_lines.push(output_line);
+                prev_line_was_continuation = ends_with_continuation_operator(&expanded_value);
+            } else if should_have_let {
+                // NEW DECLARATION: Either scope_analyzer says decl, or it's not a mutation, or shadowing
                 let let_keyword = if needs_mut { "let mut" } else { "let" };
                 let type_annotation = if let Some(ref t) = var_type {
                     format!(": {}", t)
@@ -2056,33 +2595,33 @@ pub fn parse_rusts(source: &str) -> String {
                 } else {
                     String::new()
                 };
-                let output_line = format!("{}{} {}{} = {};", 
-                    leading_ws, let_keyword, var_name, type_annotation, expanded_value);
+                // Check if value ends with continuation operator - don't add semicolon
+                let semi = if ends_with_continuation_operator(&expanded_value) { "" } else { ";" };
+                let output_line = format!("{}{} {}{} = {}{}", 
+                    leading_ws, let_keyword, var_name, type_annotation, expanded_value, semi);
                 output_lines.push(output_line);
-            } else if is_mutation {
-                let output_line = format!("{}{} = {};", leading_ws, var_name, expanded_value);
+                prev_line_was_continuation = ends_with_continuation_operator(&expanded_value);
+            } else if is_mutation && is_param {
+                // MUTATION: Only for actual mutations of function parameters
+                let semi = if ends_with_continuation_operator(&expanded_value) { "" } else { ";" };
+                let output_line = format!("{}{} = {}{}", leading_ws, var_name, expanded_value, semi);
                 output_lines.push(output_line);
+                prev_line_was_continuation = ends_with_continuation_operator(&expanded_value);
             } else {
-                let is_first = tracker.is_first_assignment(&var_name, line_num);
-                let is_shadowing = tracker.is_shadowing(&var_name, line_num);
-                let needs_let = is_first || is_shadowing;
-                
-                if needs_let {
-                    let let_keyword = if needs_mut { "let mut" } else { "let" };
-                    let type_annotation = if let Some(ref t) = var_type {
-                        format!(": {}", t)
-                    } else if VariableTracker::detect_string_literal(&value) && var_type.as_deref() != Some("&str") {
-                        ": String".to_string()
-                    } else {
-                        String::new()
-                    };
-                    let output_line = format!("{}{} {}{} = {};", 
-                        leading_ws, let_keyword, var_name, type_annotation, expanded_value);
-                    output_lines.push(output_line);
+                // FALLBACK: Default to new declaration (safer)
+                let let_keyword = if needs_mut { "let mut" } else { "let" };
+                let type_annotation = if let Some(ref t) = var_type {
+                    format!(": {}", t)
+                } else if VariableTracker::detect_string_literal(&value) && var_type.as_deref() != Some("&str") {
+                    ": String".to_string()
                 } else {
-                    let output_line = format!("{}{} = {};", leading_ws, var_name, expanded_value);
-                    output_lines.push(output_line);
-                }
+                    String::new()
+                };
+                let semi = if ends_with_continuation_operator(&expanded_value) { "" } else { ";" };
+                let output_line = format!("{}{} {}{} = {}{}", 
+                    leading_ws, let_keyword, var_name, type_annotation, expanded_value, semi);
+                output_lines.push(output_line);
+                prev_line_was_continuation = ends_with_continuation_operator(&expanded_value);
             }
         } else {
             // Not an assignment - transform and pass through
@@ -2149,7 +2688,24 @@ pub fn parse_rusts(source: &str) -> String {
                 }
             }
             
-            if needs_semicolon(&transformed) && !is_return_expr {
+            // Check if this is a continuation line or ends with continuation operator
+            let this_line_is_continuation = prev_line_was_continuation;
+            let this_line_ends_with_continuation = ends_with_continuation_operator(&transformed);
+            
+            // Update continuation state for next iteration
+            prev_line_was_continuation = this_line_ends_with_continuation;
+            
+            // Determine semicolon: 
+            // - No semicolon if line ends with continuation operator (expression continues on next line)
+            // - No semicolon if it's a return expression (no ; needed before })
+            // - Otherwise, use needs_semicolon check
+            // CRITICAL FIX: We no longer skip semicolon just because PREV line was continuation
+            // Only skip if CURRENT line ends with continuation operator
+            let should_add_semi = !this_line_ends_with_continuation
+                && !is_return_expr 
+                && needs_semicolon(&transformed);
+            
+            if should_add_semi {
                 let output = format!("{}{};", leading_ws, transformed);
                 output_lines.push(output);
             } else {
@@ -2266,6 +2822,8 @@ fn transform_literal_fields_inline(fields: &str) -> String {
     let mut in_string = false;
     let mut brace_depth: usize = 0;
     
+    // First pass: collect all fields
+    let mut raw_fields = Vec::new();
     for c in fields.chars() {
         if c == '"' && !current.ends_with('\\') {
             in_string = !in_string;
@@ -2276,52 +2834,162 @@ fn transform_literal_fields_inline(fields: &str) -> String {
         }
         
         if c == ',' && !in_string && brace_depth == 0 {
-            let transformed = transform_single_literal_field(&current);
-            if !transformed.is_empty() {
-                result.push(transformed);
-            }
+            raw_fields.push(current.clone());
             current.clear();
         } else {
             current.push(c);
         }
     }
+    if !current.trim().is_empty() {
+        raw_fields.push(current);
+    }
     
-    // Last field
-    let transformed = transform_single_literal_field(&current);
-    if !transformed.is_empty() {
-        result.push(transformed);
+    // CRITICAL FIX: Track field values to detect duplicates
+    // Duplicate values (like from.address used twice) need .clone() on earlier uses
+    let mut value_last_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    
+    // First pass: find last occurrence of each value expression
+    for (i, field) in raw_fields.iter().enumerate() {
+        if let Some(val) = extract_field_value(field) {
+            // Normalize the value for comparison
+            let normalized = val.trim().to_string();
+            if !normalized.is_empty() && is_moveable_expression(&normalized) {
+                value_last_index.insert(normalized, i);
+            }
+        }
+    }
+    
+    // Second pass: transform fields, adding .clone() for duplicate values
+    for (i, field) in raw_fields.iter().enumerate() {
+        let field_val = extract_field_value(field);
+        let needs_clone = if let Some(ref val) = field_val {
+            let normalized = val.trim().to_string();
+            if let Some(&last_idx) = value_last_index.get(&normalized) {
+                i < last_idx && is_moveable_expression(&normalized)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        
+        let transformed = transform_single_literal_field_with_clone(field, needs_clone);
+        if !transformed.is_empty() {
+            result.push(transformed);
+        }
     }
     
     result.join(", ")
 }
 
-/// Transform a single field: `id = 1` → `id: 1`
-fn transform_single_literal_field(field: &str) -> String {
+/// Extract field value from a field assignment
+fn extract_field_value(field: &str) -> Option<String> {
+    let trimmed = field.trim();
+    if trimmed.is_empty() || trimmed.starts_with("..") {
+        return None;
+    }
+    
+    if let Some(eq_pos) = find_field_eq(trimmed) {
+        let value = trimmed[eq_pos + 1..].trim();
+        return Some(value.to_string());
+    } else if trimmed.contains(':') && !trimmed.contains("::") {
+        if let Some(colon_pos) = trimmed.find(':') {
+            let value = trimmed[colon_pos + 1..].trim();
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Check if an expression is "moveable" (not Copy, could cause use-after-move)
+fn is_moveable_expression(expr: &str) -> bool {
+    let expr = expr.trim();
+    // Skip literals and simple values that are likely Copy
+    if expr.parse::<i64>().is_ok() || expr.parse::<f64>().is_ok() {
+        return false;
+    }
+    if expr == "true" || expr == "false" {
+        return false;
+    }
+    
+    // Skip method calls (contains `()`)
+    if expr.contains("()") {
+        return false;
+    }
+    
+    // Skip cast expressions (contains ` as `)
+    if expr.contains(" as ") {
+        return false;
+    }
+    
+    // Skip path expressions like TxType::Stake
+    if expr.contains("::") {
+        return false;
+    }
+    
+    // Field access patterns like `from.address` are likely to be moveable
+    if expr.contains('.') {
+        return true;
+    }
+    
+    // Simple identifiers that are struct/enum types might be moveable
+    // But we can't know for sure without type info, so be conservative
+    false
+}
+
+/// Transform a single field with optional .clone()
+fn transform_single_literal_field_with_clone(field: &str, add_clone: bool) -> String {
     let trimmed = field.trim();
     if trimmed.is_empty() { return String::new(); }
     
     // Spread syntax
     if trimmed.starts_with("..") { return trimmed.to_string(); }
     
-    // Already transformed
-    if trimmed.contains(':') && !trimmed.contains("::") { return trimmed.to_string(); }
+    // Already transformed (has colon)
+    if trimmed.contains(':') && !trimmed.contains("::") {
+        if add_clone {
+            // Find the value part and add .clone()
+            if let Some(colon_pos) = trimmed.find(':') {
+                let name = trimmed[..colon_pos].trim();
+                let value = trimmed[colon_pos + 1..].trim();
+                // Only add .clone() if value is a clonable expression
+                if should_clone_field_value(value) && !value.ends_with(".clone()") {
+                    return format!("{}: {}.clone()", name, value);
+                }
+            }
+        }
+        return trimmed.to_string();
+    }
     
     if let Some(eq_pos) = find_field_eq(trimmed) {
         let name = trimmed[..eq_pos].trim();
         let value = trimmed[eq_pos + 1..].trim();
         
         if is_valid_field_name(name) {
-            let transformed_value = if is_string_literal(value) {
+            let mut transformed_value = if is_string_literal(value) {
                 let inner = &value[1..value.len()-1];
                 format!("String::from(\"{}\")", inner)
             } else {
                 value.to_string()
             };
+            
+            // Add .clone() if needed for duplicate values OR for field access expressions
+            // CRITICAL FIX: Consistent with transform_literal_field_with_ctx
+            let needs_clone = add_clone || should_clone_field_value(&transformed_value);
+            if needs_clone && !transformed_value.ends_with(".clone()") {
+                transformed_value = format!("{}.clone()", transformed_value);
+            }
+            
             return format!("{}: {}", name, transformed_value);
         }
     }
     
     trimmed.to_string()
+}
+
+/// Transform a single field: `id = 1` → `id: 1`
+fn transform_single_literal_field(field: &str) -> String {
+    transform_single_literal_field_with_clone(field, false)
 }
 
 //=============================================================================

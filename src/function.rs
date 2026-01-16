@@ -136,7 +136,10 @@ impl CurrentFunctionContext {
         self.name = Some(sig.name.clone());
         self.params.clear();
         for p in &sig.parameters {
-            self.params.insert(p.name.clone(), p.param_type.clone());
+            // CRITICAL FIX: Store TRANSFORMED param type, not raw type
+            // This ensures is_slice_param() works correctly for RustS+ [T] → &[T]
+            let transformed_type = transform_param_type(&p.param_type);
+            self.params.insert(p.name.clone(), transformed_type);
         }
         self.return_type = sig.return_type.clone();
         self.start_depth = depth;
@@ -161,6 +164,19 @@ impl CurrentFunctionContext {
         self.params.get(name)
             .map(|t| t == "&String" || t == "&mut String")
             .unwrap_or(false)
+    }
+    
+    /// Check if a parameter is a slice type (&[T])
+    /// This is used to know when to add .to_vec() for struct field assignments
+    pub fn is_slice_param(&self, name: &str) -> bool {
+        self.params.get(name)
+            .map(|t| t.starts_with("&[") && t.ends_with(']'))
+            .unwrap_or(false)
+    }
+    
+    /// Get the parameter type for a given name
+    pub fn get_param_type(&self, name: &str) -> Option<&String> {
+        self.params.get(name)
     }
 }
 
@@ -368,9 +384,19 @@ fn split_call_args(s: &str) -> Vec<String> {
 fn coerce_argument(arg: &str, param_type: &str) -> String {
     let arg = arg.trim();
     
+    // CRITICAL FIX: Transform param_type first (e.g., [T] → &[T])
+    // The signature stores original RustS+ types, but we need Rust types for coercion
+    let transformed_param_type = transform_param_type(param_type);
+    let param_type = transformed_param_type.as_str();
+    
     // L-10: Handle &[T] parameters - add & to array arguments
     // When param is &[T] and arg is a plain identifier (array variable), add &
     if param_type.starts_with("&[") {
+        // Check if arg is an array literal like [x, y, z]
+        if arg.starts_with('[') && arg.ends_with(']') && !arg.starts_with("&[") {
+            // Array literal needs & to convert to slice reference
+            return format!("&{}", arg);
+        }
         // Check if arg is already a reference
         if !arg.starts_with('&') {
             // Check if it's a simple identifier (array variable)
@@ -406,7 +432,142 @@ fn coerce_argument(arg: &str, param_type: &str) -> String {
         }
     }
     
+    // ==========================================================================
+    // CRITICAL FIX: Auto-clone struct arguments
+    // RustS+ uses value semantics - when passing a struct to a function,
+    // we want to clone it so the original can still be used.
+    // This prevents all "use of moved value" errors.
+    // ==========================================================================
+    
+    // Check if param_type is a struct (non-primitive, non-reference)
+    if should_auto_clone_for_param(param_type) && should_clone_argument(arg) {
+        return format!("{}.clone()", arg);
+    }
+    
     arg.to_string()
+}
+
+/// Check if a parameter type requires auto-clone (is a struct/non-Copy type)
+fn should_auto_clone_for_param(param_type: &str) -> bool {
+    let pt = param_type.trim();
+    
+    // Skip if already a reference
+    if pt.starts_with('&') {
+        return false;
+    }
+    
+    // Skip primitive Copy types
+    let primitives = [
+        "u8", "u16", "u32", "u64", "u128", "usize",
+        "i8", "i16", "i32", "i64", "i128", "isize",
+        "f32", "f64", "bool", "char", "()",
+    ];
+    
+    if primitives.contains(&pt) {
+        return false;
+    }
+    
+    // Skip generic/slice types that start with &
+    if pt.starts_with("&[") || pt.starts_with("&str") {
+        return false;
+    }
+    
+    // If it starts with uppercase letter, it's likely a struct/enum type
+    if let Some(first_char) = pt.chars().next() {
+        if first_char.is_uppercase() {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Check if an argument should have .clone() added
+fn should_clone_argument(arg: &str) -> bool {
+    let a = arg.trim();
+    
+    // Skip if empty
+    if a.is_empty() {
+        return false;
+    }
+    
+    // Skip if already has .clone()
+    if a.ends_with(".clone()") {
+        return false;
+    }
+    
+    // Skip if it's a literal
+    if a.starts_with('"') || a.starts_with('\'') {
+        return false;
+    }
+    if a.parse::<i64>().is_ok() || a.parse::<f64>().is_ok() {
+        return false;
+    }
+    if a == "true" || a == "false" {
+        return false;
+    }
+    
+    // Skip if it's already a reference
+    if a.starts_with('&') {
+        return false;
+    }
+    
+    // Skip if it's a function call (ends with `)` but not `.clone()`)
+    // We don't want to clone function results - they're already owned
+    if a.ends_with(')') && !a.ends_with(".clone()") {
+        // Check if it's a method call vs function call
+        // Method calls on values should still be cloned in some cases
+        // But function calls return owned values, no need to clone
+        if !a.contains('.') {
+            return false;  // Pure function call like func()
+        }
+        // For method calls like x.method(), only skip if it returns a new value
+        // This is hard to determine without type info, so skip all method calls
+        return false;
+    }
+    
+    // Clone simple identifiers and field accesses
+    // These are likely struct values that could be moved
+    if is_simple_identifier(a) || is_field_access(a) {
+        return true;
+    }
+    
+    false
+}
+
+/// Check if expression is a field access like `x.field` or `x.y.z`
+fn is_field_access(s: &str) -> bool {
+    let trimmed = s.trim();
+    
+    // Must contain dot but not be a method call
+    if !trimmed.contains('.') {
+        return false;
+    }
+    
+    // Must not end with () - that's a method call
+    if trimmed.ends_with(')') {
+        return false;
+    }
+    
+    // Must not contain :: - that's a path
+    if trimmed.contains("::") {
+        return false;
+    }
+    
+    // Split by dots and check each part is a valid identifier
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    
+    // Each part should be a valid identifier
+    for part in parts {
+        if !is_simple_identifier(part) {
+            return false;
+        }
+    }
+    
+    true
 }
 
 /// Check if a string is a simple identifier (variable name)
@@ -439,9 +600,15 @@ fn is_slice_index_access(s: &str) -> bool {
     
     // Find the bracket position
     if let Some(bracket_pos) = trimmed.find('[') {
-        // Part before [ must be a simple identifier
+        // Part before [ must be a valid base (identifier or field access)
         let var_part = &trimmed[..bracket_pos];
-        if is_simple_identifier(var_part) {
+        
+        // CRITICAL FIX: Accept both simple identifiers AND field access patterns
+        // Examples:
+        // - `arr[i]` - simple identifier
+        // - `block.transactions[i]` - field access
+        // - `self.data[idx]` - field access
+        if is_simple_identifier(var_part) || is_valid_index_base(var_part) {
             // Check that brackets are balanced and at the end
             let bracket_part = &trimmed[bracket_pos..];
             let open_count = bracket_part.chars().filter(|&c| c == '[').count();
@@ -451,6 +618,52 @@ fn is_slice_index_access(s: &str) -> bool {
     }
     
     false
+}
+
+/// Check if expression is a valid base for array indexing
+/// Accepts: simple identifiers, field access chains
+/// Examples: `arr`, `block.transactions`, `self.data.items`
+fn is_valid_index_base(s: &str) -> bool {
+    let trimmed = s.trim();
+    
+    // Must not be empty
+    if trimmed.is_empty() {
+        return false;
+    }
+    
+    // Must not contain brackets or parens
+    if trimmed.contains('[') || trimmed.contains('(') || trimmed.contains(')') {
+        return false;
+    }
+    
+    // Must not contain :: (path separator)
+    if trimmed.contains("::") {
+        return false;
+    }
+    
+    // If it contains dots, it's a field access chain
+    if trimmed.contains('.') {
+        // Split by dots and verify each part is a valid identifier
+        let parts: Vec<&str> = trimmed.split('.').collect();
+        if parts.len() < 2 {
+            return false;
+        }
+        
+        // Each part must be a valid identifier
+        for part in parts {
+            let p = part.trim();
+            if p.is_empty() {
+                return false;
+            }
+            if !is_simple_identifier(p) {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    // Otherwise it should be a simple identifier
+    is_simple_identifier(trimmed)
 }
 
 // ============================================================================

@@ -363,8 +363,75 @@ pub fn transform_arm_pattern(line: &str) -> String {
         return line.to_string();
     }
     
+    // CRITICAL FIX: Add `ref` to String-like field bindings ONLY
+    // This is a heuristic - add ref to fields that are likely String type
+    // based on common naming patterns (reason, message, name, error, etc.)
+    let pattern = add_ref_to_string_fields(pattern);
+    
     // Add `=>` between pattern and `{`
     format!("{}{} => {{", leading_ws, pattern)
+}
+
+/// Add `ref` to pattern bindings that are likely String types
+/// This uses heuristics based on common field names for strings
+fn add_ref_to_string_fields(pattern: &str) -> String {
+    // Check if pattern has struct destructuring
+    if !pattern.contains('{') || !pattern.contains('}') {
+        return pattern.to_string();
+    }
+    
+    // Common String field names that should get `ref`
+    let string_field_names = [
+        "reason", "message", "error", "name", "description", "text",
+        "content", "body", "title", "label", "value", "data", "info",
+        "msg", "err", "str", "string", "s"
+    ];
+    
+    // Find the struct part: everything between first `{` and last `}` in pattern
+    if let Some(open_brace) = pattern.find('{') {
+        if let Some(close_brace) = pattern.rfind('}') {
+            if close_brace > open_brace {
+                let before = &pattern[..open_brace + 1];
+                let fields_str = &pattern[open_brace + 1..close_brace];
+                let after = &pattern[close_brace..];
+                
+                // Split fields and selectively add ref
+                let fields: Vec<&str> = fields_str.split(',').collect();
+                let new_fields: Vec<String> = fields.iter()
+                    .map(|f| {
+                        let f = f.trim();
+                        if f.is_empty() {
+                            String::new()
+                        } else if f.starts_with("ref ") || f.starts_with("mut ") || f.contains(':') {
+                            // Already has ref/mut or is a rename pattern (x: y)
+                            f.to_string()
+                        } else {
+                            // Check if field name suggests it's a String
+                            let field_lower = f.to_lowercase();
+                            if string_field_names.iter().any(|&s| field_lower == s || field_lower.ends_with(s)) {
+                                format!("ref {}", f)
+                            } else {
+                                f.to_string()
+                            }
+                        }
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                
+                return format!("{} {} {}", before, new_fields.join(", "), after);
+            }
+        }
+    }
+    
+    pattern.to_string()
+}
+
+/// Add `ref` to struct pattern bindings - DISABLED
+/// This function is kept for reference but no longer used because
+/// automatic ref addition causes type mismatches for Copy types.
+#[allow(dead_code)]
+fn add_ref_to_struct_pattern(pattern: &str) -> String {
+    pattern.to_string()
 }
 
 /// Transform match arm closing brace - add comma
