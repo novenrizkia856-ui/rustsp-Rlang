@@ -1136,6 +1136,33 @@ fn should_clone_field_value(value: &str) -> bool {
         return false;
     }
     
+    // CRITICAL FIX: Skip expressions with arithmetic operators
+    // Examples: `w.balance + amount`, `x.value - y`, `a.len * b`
+    // These are computed values, not direct field accesses that need clone
+    if v.contains(" + ") || v.contains(" - ") || v.contains(" * ") || 
+       v.contains(" / ") || v.contains(" % ") {
+        return false;
+    }
+    
+    // CRITICAL FIX: Skip expressions with comparison operators
+    // Examples: `x.value == 0`, `a.len > b`
+    if v.contains(" == ") || v.contains(" != ") || v.contains(" < ") || 
+       v.contains(" > ") || v.contains(" <= ") || v.contains(" >= ") {
+        return false;
+    }
+    
+    // CRITICAL FIX: Skip expressions with logical operators
+    // Examples: `x.flag && y.flag`, `a.valid || b.valid`
+    if v.contains(" && ") || v.contains(" || ") {
+        return false;
+    }
+    
+    // CRITICAL FIX: Skip expressions with bitwise operators
+    if v.contains(" & ") || v.contains(" | ") || v.contains(" ^ ") || 
+       v.contains(" << ") || v.contains(" >> ") {
+        return false;
+    }
+    
     // Skip literals
     if v.starts_with('"') || v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
         return false;
@@ -2277,6 +2304,43 @@ pub fn parse_rusts(source: &str) -> String {
                     output_lines.push(format!("{}{} {}{} = {}{}", 
                         leading_ws, let_keyword, var_name, type_annotation, expanded_value, semi));
                 }
+                continue;
+            }
+            
+            //=================================================================
+            // BARE STRUCT LITERAL INSIDE MATCH ARM BODY
+            // Handle `Wallet {` as return expression (no assignment prefix)
+            // Must check BEFORE "Not an assignment" block!
+            //=================================================================
+            if let Some(struct_name) = detect_bare_struct_literal(trimmed, &struct_registry) {
+                // Check if single-line: `Wallet { id: 1, balance: 100 }`
+                if trimmed.ends_with('}') {
+                    let transformed = transform_bare_struct_literal(trimmed);
+                    output_lines.push(format!("{}{}", leading_ws, transformed));
+                    continue;
+                }
+                
+                // Multi-line - ENTER LITERAL MODE (is_assignment = false, return expression)
+                literal_mode.enter(LiteralKind::Struct, prev_depth + opens, false);
+                output_lines.push(format!("{}{} {{", leading_ws, struct_name));
+                continue;
+            }
+            
+            //=================================================================
+            // BARE ENUM STRUCT VARIANT LITERAL INSIDE MATCH ARM BODY
+            // Handle `Event::Data {` as return expression (no assignment prefix)
+            //=================================================================
+            if let Some(enum_path) = detect_bare_enum_literal(trimmed) {
+                // Check if single-line
+                if trimmed.ends_with('}') {
+                    let transformed = transform_bare_struct_literal(trimmed);
+                    output_lines.push(format!("{}{}", leading_ws, transformed));
+                    continue;
+                }
+                
+                // Multi-line - ENTER LITERAL MODE (is_assignment = false, return expression)
+                literal_mode.enter(LiteralKind::EnumVariant, prev_depth + opens, false);
+                output_lines.push(format!("{}{} {{", leading_ws, enum_path));
                 continue;
             }
             
@@ -3498,6 +3562,38 @@ mod tests {
         assert!(!output.contains("let y"));
         assert!(output.contains("x: 10"));
         assert!(output.contains("y: 20"));
+    }
+    
+    #[test]
+    fn test_bare_struct_literal_in_match_arm() {
+        // This is the bug case: bare struct literal as return expression in match arm
+        // Should NOT have `let` inside the struct literal fields!
+        let input = r#"struct Wallet {
+    id u32
+    balance i64
+}
+
+enum Transaction {
+    Deposit { amount i64 }
+}
+
+fn apply_tx(w Wallet, tx Transaction) Wallet {
+    match tx {
+        Transaction::Deposit { amount } {
+            Wallet {
+                id = w.id
+                balance = w.balance + amount
+            }
+        }
+    }
+}"#;
+        let output = parse_rusts(input);
+        // Should NOT have `let id` or `let balance` inside struct literal
+        assert!(!output.contains("let id"), "Bug: 'let id' found in struct literal: {}", output);
+        assert!(!output.contains("let balance"), "Bug: 'let balance' found in struct literal: {}", output);
+        // Should have proper field syntax
+        assert!(output.contains("id:"), "Missing 'id:' field syntax in output: {}", output);
+        assert!(output.contains("balance:"), "Missing 'balance:' field syntax in output: {}", output);
     }
     
     //=========================================================================
