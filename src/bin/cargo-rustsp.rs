@@ -1,17 +1,13 @@
 //! cargo-rustsp v1.0.0 - Transparent Cargo Wrapper for RustS+
 //!
-//! Simple design:
+//! Design:
 //! 1. Find project root (Cargo.toml)
 //! 2. Preprocess all .rss files → .rs (in-place)
-//! 3. Pass ALL arguments to cargo unchanged
+//! 3. Track all generated .rs files
+//! 4. Pass ALL arguments to cargo unchanged
+//! 5. AUTO-CLEANUP: Delete generated .rs files after cargo finishes
 //!
-//! This means ANY cargo command works:
-//!   cargo rustsp build --workspace --release
-//!   cargo rustsp test --test foo -- --ignored --nocapture
-//!   cargo rustsp run -p my-crate --bin my-bin -- arg1 arg2
-//!   cargo rustsp doc --no-deps
-//!   cargo rustsp clippy -- -W warnings
-//!   etc.
+//! This keeps your source tree clean - only .rss files remain!
 
 use std::collections::HashMap;
 use std::env;
@@ -32,7 +28,71 @@ mod ansi {
     pub const DIM: &str = "\x1b[2m";
     pub const BOLD_RED: &str = "\x1b[1;31m";
     pub const BOLD_GREEN: &str = "\x1b[1;32m";
+    pub const BOLD_YELLOW: &str = "\x1b[1;33m";
     pub const BOLD_CYAN: &str = "\x1b[1;36m";
+}
+
+//=============================================================================
+// Generated Files Tracker - Auto cleanup on drop
+//=============================================================================
+
+/// Tracks generated .rs files and cleans them up when dropped
+struct GeneratedFilesTracker {
+    files: Vec<PathBuf>,
+    quiet: bool,
+    keep_generated: bool,
+}
+
+impl GeneratedFilesTracker {
+    fn new(quiet: bool, keep_generated: bool) -> Self {
+        GeneratedFilesTracker {
+            files: Vec::new(),
+            quiet,
+            keep_generated,
+        }
+    }
+    
+    fn track(&mut self, path: PathBuf) {
+        self.files.push(path);
+    }
+    
+    fn cleanup(&mut self) {
+        if self.keep_generated {
+            if !self.quiet && !self.files.is_empty() {
+                eprintln!("{}      Keeping{} {} generated .rs file(s) (--rustsp-keep)", 
+                    ansi::BOLD_YELLOW, ansi::RESET, self.files.len());
+            }
+            return;
+        }
+        
+        let mut cleaned = 0;
+        for path in &self.files {
+            if path.exists() {
+                if fs::remove_file(path).is_ok() {
+                    cleaned += 1;
+                }
+            }
+        }
+        
+        if !self.quiet && cleaned > 0 {
+            eprintln!("{}     Cleanup{} removed {} generated .rs file(s)", 
+                ansi::BOLD_GREEN, ansi::RESET, cleaned);
+        }
+        
+        self.files.clear();
+    }
+    
+    fn file_count(&self) -> usize {
+        self.files.len()
+    }
+}
+
+impl Drop for GeneratedFilesTracker {
+    fn drop(&mut self) {
+        // Auto cleanup when tracker goes out of scope
+        // This handles normal exit, early return, and panic
+        self.cleanup();
+    }
 }
 
 //=============================================================================
@@ -111,7 +171,7 @@ fn find_project_root() -> Option<PathBuf> {
 
 /// Find rustsp compiler binary
 fn find_rustsp_binary() -> String {
-    // Check common names
+    // Check common names in PATH
     for cmd in &["rustsp", "rusts_plus", "rustsp.exe", "rusts_plus.exe"] {
         if Command::new(cmd)
             .arg("--version")
@@ -189,16 +249,28 @@ fn compile_rss(rustsp: &str, input: &Path, output: &Path, quiet: bool) -> Result
 }
 
 /// Preprocess all .rss files in the project IN-PLACE
-fn preprocess_project(project_root: &Path, force: bool, quiet: bool) -> Result<(usize, usize), String> {
+/// Returns the tracker that will auto-cleanup on drop
+fn preprocess_project(
+    project_root: &Path, 
+    force: bool, 
+    quiet: bool,
+    keep_generated: bool,
+) -> Result<GeneratedFilesTracker, String> {
     let cache_dir = project_root.join("target").join("rustsp_cache");
     let mut cache = FileCache::new(&cache_dir);
     let rustsp = find_rustsp_binary();
+    
+    // Create tracker for generated files
+    let mut tracker = GeneratedFilesTracker::new(quiet, keep_generated);
     
     // Find all .rss files
     let rss_files = find_rss_files(project_root);
     
     if rss_files.is_empty() {
-        return Ok((0, 0));
+        if !quiet {
+            eprintln!("  {}(no .rss files found){}", ansi::DIM, ansi::RESET);
+        }
+        return Ok(tracker);
     }
     
     let mut compiled = 0;
@@ -212,16 +284,17 @@ fn preprocess_project(project_root: &Path, force: bool, quiet: bool) -> Result<(
             .map_err(|e| format!("Failed to read {}: {}", rss_path.display(), e))?;
         let content_hash = hash_content(&content);
         
-        // Check if rebuild needed
-        let needs_rebuild = force || 
+        // Always need to generate for this run (even if cached hash matches)
+        // because we delete .rs files after each run
+        let needs_compile = force || 
                            cache.needs_rebuild(rss_path, content_hash) ||
                            !rs_path.exists();
         
-        if needs_rebuild {
+        if needs_compile {
             if !quiet {
                 let display_path = rss_path.strip_prefix(project_root)
                     .unwrap_or(rss_path);
-                eprintln!("  {}{}{} {}", ansi::DIM, "Compiling", ansi::RESET, display_path.display());
+                eprintln!("   {}Compiling{} {}", ansi::DIM, ansi::RESET, display_path.display());
             }
             
             compile_rss(&rustsp, rss_path, &rs_path, quiet)?;
@@ -230,16 +303,25 @@ fn preprocess_project(project_root: &Path, force: bool, quiet: bool) -> Result<(
         } else {
             cached += 1;
         }
+        
+        // Track this file for cleanup (regardless of whether we compiled or used cache)
+        // The .rs file exists now, so we need to clean it up
+        tracker.track(rs_path);
     }
     
     // Save cache
     let _ = cache.save();
     
-    Ok((compiled, cached))
+    if !quiet {
+        eprintln!("{}  Preprocessed{} {} compiled, {} cached", 
+            ansi::BOLD_GREEN, ansi::RESET, compiled, cached);
+    }
+    
+    Ok(tracker)
 }
 
-/// Clean generated .rs files (those with corresponding .rss)
-fn clean_generated_files(project_root: &Path) -> usize {
+/// Manually clean all generated .rs files (those with corresponding .rss)
+fn clean_all_generated_files(project_root: &Path) -> usize {
     let mut cleaned = 0;
     
     fn clean_recursive(dir: &Path, cleaned: &mut usize) {
@@ -280,8 +362,11 @@ fn print_usage() {
     eprintln!();
     eprintln!("{}HOW IT WORKS:{}", ansi::BOLD, ansi::RESET);
     eprintln!("    1. Finds all .rss files in the project");
-    eprintln!("    2. Compiles them to .rs (in-place, alongside source)");
-    eprintln!("    3. Passes ALL arguments to cargo unchanged");
+    eprintln!("    2. Compiles them to .rs (in-place, temporarily)");
+    eprintln!("    3. Runs cargo with your exact arguments");
+    eprintln!("    4. {}AUTO-CLEANS{} generated .rs files after cargo finishes", ansi::BOLD_GREEN, ansi::RESET);
+    eprintln!();
+    eprintln!("    Your source tree stays clean - only .rss files remain!");
     eprintln!();
     eprintln!("{}EXAMPLES:{}", ansi::BOLD, ansi::RESET);
     eprintln!("    cargo rustsp build");
@@ -296,13 +381,13 @@ fn print_usage() {
     eprintln!("    cargo rustsp bench");
     eprintln!();
     eprintln!("{}RUSTSP-SPECIFIC OPTIONS:{}", ansi::BOLD, ansi::RESET);
-    eprintln!("    --rustsp-force    Force rebuild all .rss files (ignore cache)");
+    eprintln!("    --rustsp-force    Force recompile all .rss files (ignore cache)");
     eprintln!("    --rustsp-quiet    Suppress rustsp preprocessing output");
-    eprintln!("    --rustsp-clean    Clean generated .rs files and exit");
+    eprintln!("    --rustsp-keep     Keep generated .rs files (don't auto-clean)");
+    eprintln!("    --rustsp-clean    Manually clean any leftover .rs files and exit");
     eprintln!();
     eprintln!("{}NOTE:{}", ansi::BOLD, ansi::RESET);
-    eprintln!("    Any cargo command works! cargo-rustsp just preprocesses .rss");
-    eprintln!("    files before running cargo with your exact arguments.");
+    eprintln!("    Any cargo command works! cargo-rustsp is a transparent wrapper.");
 }
 
 fn main() {
@@ -314,6 +399,7 @@ fn main() {
     // Extract rustsp-specific flags
     let mut force_rebuild = false;
     let mut rustsp_quiet = false;
+    let mut keep_generated = false;
     let mut clean_only = false;
     let mut cargo_args: Vec<String> = Vec::new();
     
@@ -321,13 +407,14 @@ fn main() {
         match arg.as_str() {
             "--rustsp-force" => force_rebuild = true,
             "--rustsp-quiet" => rustsp_quiet = true,
+            "--rustsp-keep" => keep_generated = true,
             "--rustsp-clean" => clean_only = true,
             "-h" | "--help" if cargo_args.is_empty() => {
                 print_usage();
                 exit(0);
             }
             "-V" | "--version" if cargo_args.is_empty() => {
-                println!("cargo-rustsp 2.0.0");
+                println!("cargo-rustsp 2.1.0");
                 exit(0);
             }
             _ => cargo_args.push(arg.clone()),
@@ -344,12 +431,12 @@ fn main() {
         }
     };
     
-    // Handle clean-only
+    // Handle manual clean
     if clean_only {
         if !rustsp_quiet {
-            eprintln!("{}   Cleaning{} generated .rs files...", ansi::BOLD_CYAN, ansi::RESET);
+            eprintln!("{}    Cleaning{} any leftover generated .rs files...", ansi::BOLD_CYAN, ansi::RESET);
         }
-        let cleaned = clean_generated_files(&project_root);
+        let cleaned = clean_all_generated_files(&project_root);
         
         // Also clean cache
         let cache_dir = project_root.join("target").join("rustsp_cache");
@@ -358,7 +445,7 @@ fn main() {
         }
         
         if !rustsp_quiet {
-            eprintln!("{}   Cleaned{} {} generated .rs file(s)", 
+            eprintln!("{}    Cleaned{} {} file(s)", 
                 ansi::BOLD_GREEN, ansi::RESET, cleaned);
         }
         exit(0);
@@ -372,47 +459,44 @@ fn main() {
     
     // Preprocess .rss files
     if !rustsp_quiet {
-        eprintln!("{}  Preprocessing{} RustS+ files...", ansi::BOLD_CYAN, ansi::RESET);
+        eprintln!("{}Preprocessing{} RustS+ files...", ansi::BOLD_CYAN, ansi::RESET);
     }
     
-    match preprocess_project(&project_root, force_rebuild, rustsp_quiet) {
-        Ok((compiled, cached)) => {
-            if !rustsp_quiet && (compiled > 0 || cached > 0) {
-                eprintln!("{}   Preprocessed{} {} compiled, {} cached", 
-                    ansi::BOLD_GREEN, ansi::RESET, compiled, cached);
-            } else if !rustsp_quiet && compiled == 0 && cached == 0 {
-                eprintln!("  {}(no .rss files found){}", ansi::DIM, ansi::RESET);
-            }
-        }
+    // The tracker will auto-cleanup when it goes out of scope
+    let tracker = match preprocess_project(&project_root, force_rebuild, rustsp_quiet, keep_generated) {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("{}error{}: {}", ansi::BOLD_RED, ansi::RESET, e);
             exit(1);
         }
-    }
+    };
     
     // Run cargo with all provided arguments
     if !rustsp_quiet {
-        eprintln!("{}      Running{} cargo {}", 
+        eprintln!("{}     Running{} cargo {}", 
             ansi::BOLD_CYAN, ansi::RESET, 
             cargo_args.join(" "));
     }
     
-    let status = Command::new("cargo")
+    let cargo_result = Command::new("cargo")
         .current_dir(&project_root)
         .args(&cargo_args)
         .status();
     
-    match status {
-        Ok(s) => {
-            if !s.success() {
-                exit(s.code().unwrap_or(1));
-            }
-        }
+    // Get exit code before tracker cleanup
+    let exit_code = match cargo_result {
+        Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
             eprintln!("{}error{}: failed to run cargo: {}", ansi::BOLD_RED, ansi::RESET, e);
-            exit(1);
+            1
         }
-    }
+    };
+    
+    // Tracker will be dropped here and cleanup will happen automatically
+    // This is explicit drop to show when cleanup happens
+    drop(tracker);
+    
+    exit(exit_code);
 }
 
 //=============================================================================
@@ -431,5 +515,31 @@ mod tests {
         
         assert_eq!(h1, h2);
         assert_ne!(h1, h3);
+    }
+    
+    #[test]
+    fn test_tracker_cleanup() {
+        use std::io::Write;
+        
+        // Create temp file
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test_rustsp_cleanup.rs");
+        
+        // Write something
+        {
+            let mut f = fs::File::create(&test_file).unwrap();
+            f.write_all(b"// test").unwrap();
+        }
+        
+        // Create tracker and track the file
+        {
+            let mut tracker = GeneratedFilesTracker::new(true, false);
+            tracker.track(test_file.clone());
+            assert!(test_file.exists());
+            // tracker dropped here, should cleanup
+        }
+        
+        // File should be deleted
+        assert!(!test_file.exists());
     }
 }
