@@ -1,8 +1,7 @@
 # RustS+ (RustSPlus)
 
 **The Programming Language with Effect Honesty**
-
-*Rust mencegah memory bugs. RustS+ mencegah logic bugs.*
+*Rust prevents memory bugs. RustS+ prevents logic bugs.*
 
 
 ---
@@ -25,9 +24,9 @@
 
 ---
 
-## 🎯 What is RustS+?
+## What is RustS+?
 
-**RustS+** adalah **superset** dari Rust yang menambahkan lapisan **Logic Safety** di atas **Memory Safety** Rust. RustS+ memperkenalkan konsep **Effect Ownership** — sebuah sistem yang memaksa programmer untuk jujur tentang apa yang dilakukan kode mereka.
+RustS+ is a superset of Rust that adds a layer of logic safety on top of Rust's memory safety. RustS+ introduces the concept of effect ownership — a system that forces programmers to be honest about what their code does.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -57,11 +56,11 @@
 
 ---
 
-## 💭 Philosophy
+## Philosophy
 
 ### The Problem RustS+ Solves
 
-Rust mencegah **memory bugs** — use-after-free, double-free, data races. Tapi Rust tidak mencegah **logic bugs**:
+Rust prevents **memory bugs** — use-after-free, double-free, data races. But Rust doesn't prevent **logic bugs**:
 
 ```rust
 // Rust allows this - looks pure but has hidden effects
@@ -75,7 +74,7 @@ fn calculate_price(item: &Item) -> f64 {
 
 ### The RustS+ Solution
 
-RustS+ memaksa kejujuran:
+RustS+ forces honesty:
 
 ```rust
 // RustS+ - effects must be declared
@@ -93,15 +92,15 @@ fn pure_calculate(item &Item) f64 {
 
 ### Core Principles
 
-1. **Effect Honesty**: Jika fungsi melakukan efek → WAJIB deklarasi
-2. **Intent Clarity**: Tidak ada ambiguitas tentang apa yang kode lakukan
-3. **Explicit State**: Semua perubahan state harus eksplisit
-4. **No Hidden Mutations**: Assignment = deklarasi baru, bukan mutasi diam-diam
-5. **Compile-Time Enforcement**: Semua aturan di-enforce sebelum runtime
+1. Effect Honesty: If a function performs an effect, it MUST have a declaration.
+2. Intent Clarity: There is no ambiguity about what the code does.
+3. Explicit State: All state changes must be explicit.
+4. No Hidden Mutations: Assignment = new declaration, not silent mutation.
+5. Compile-Time Enforcement: All rules are enforced before runtime.
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Installation
 
@@ -120,7 +119,7 @@ cp target/release/cargo-rustsp ~/.cargo/bin/
 
 ### Hello World
 
-Buat file `hello.rss`:
+create a file `hello.rss`:
 
 ```rust
 fn main() effects(io) {
@@ -128,7 +127,7 @@ fn main() effects(io) {
 }
 ```
 
-Compile dan run:
+Compile and run:
 
 ```bash
 rustsp hello.rss -o hello
@@ -238,9 +237,9 @@ fn main() effects(io) {
 
 ---
 
-## 🧠 Formal IR Pipeline
+## Formal IR Pipeline
 
-RustS+ bukan sekadar "bahasa dengan sintaks baru" — ini adalah **sistem formal untuk menjamin kebenaran makna program**. Arsitekturnya dibangun di atas rangkaian **Intermediate Representation (IR)** formal:
+RustS+ isn't just a "language with new syntax" — it's a formal system for ensuring the correctness of program meaning. Its architecture is built on a series of formal Intermediate Representations (IRs):
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -280,21 +279,20 @@ RustS+ bukan sekadar "bahasa dengan sintaks baru" — ini adalah **sistem formal
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Mengapa IR Formal?
+### Why Formal IR?
 
-Dengan arsitektur ini, RustS+ menjadi **semantic compiler** yang memahami apa yang dilakukan program secara formal, bukan sekadar **text transformer**:
+With this architecture, RustS+ becomes a semantic compiler that understands what a program does formally, not just a text transformer:
 
 | Approach | Problem |
 |----------|---------|
-| Regex/Text-based | Tidak memahami context, mudah salah |
-| AST-only | Tidak memahami scope dan binding |
-| **HIR + EIR** | Memahami makna dan effect secara formal |
-
+| Regex/Text-based | Doesn't understand context, prone to errors |
+| AST-only | Doesn't understand scope and binding |
+| HIR + EIR | Understands meaning and effect formally |
 ---
 
-## 🎭 Two-Layer Type System
+## Two-Layer Type System
 
-RustS+ memiliki **Type System dua-lapis**:
+RustS+ has a **two-layer Type System**:
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -302,8 +300,8 @@ RustS+ memiliki **Type System dua-lapis**:
 │  ┌─────────────────────────────────────────────────────────┐  │
 │  │  read(x)  │  write(x)  │  io  │  alloc  │  panic        │  │
 │  │                                                         │  │
-│  │  "Setiap nilai tidak hanya memiliki tipe data,          │  │
-│  │   tetapi juga HAK atas realitas"                        │  │
+│  │  "Every value has not only a data type,                 │  │
+│  │ but also a RIGHT to reality"                            │  │
 │  └─────────────────────────────────────────────────────────┘  │
 ├───────────────────────────────────────────────────────────────┤
 │  LAYER 1: RUST TYPE SYSTEM                                    │
@@ -313,54 +311,53 @@ RustS+ memiliki **Type System dua-lapis**:
 └───────────────────────────────────────────────────────────────┘
 ```
 
-### Effect as Linear Resource
+### Effect as a Linear Resource
 
-**Capability `write(x)` diperlakukan sebagai linear resource** — sama seperti `&mut T` di Rust:
+The `write(x)` capability is treated as a linear resource** — just like `&mut T` in Rust:
 
-- **Tidak boleh diduplikasi** — hanya satu pihak yang boleh memiliki `write(x)` pada satu waktu
-- **Harus dipropagasi** — jika fungsi memiliki write capability, caller harus declare atau propagate
-- **Exclusive ownership** — dua fungsi tidak boleh sama-sama menulis state yang sama tanpa koordinasi
+- **Must not be duplicated** — only one party can have `write(x)` at a time
+- **Must be propagated** — if a function has write capability, the caller must declare or propagate it
+- **Exclusive ownership** — two functions cannot write to the same state without coordination
 
 ```rust
-// write(acc) adalah "exclusive write token" untuk acc
+// write(acc) is the "exclusive write token" for acc
 fn deposit(acc Account, amount i64) effects(write acc) Account {
-    acc.balance = acc.balance + amount  // OK - memiliki write token
+    acc.balance = acc.balance + amount  // OK - has write token
     acc
 }
 
 fn withdraw(acc Account, amount i64) effects(write acc) Account {
-    acc.balance = acc.balance - amount  // OK - memiliki write token
+    acc.balance = acc.balance - amount  // OK - has write token
     acc
 }
 
-// ERROR: Dua write token untuk acc di jalur eksekusi yang sama
-// akan terdeteksi sebagai RSPL315: Effect ownership violation
+// ERROR: Two write tokens for acc on the same execution path
+// will be detected as RSPL315: Effect ownership violation
 ```
 
 ### Function Type Signature
 
-Setiap fungsi di RustS+ secara formal bertipe:
+Every function in RustS+ is formally typed:
 
 ```
 (parameter types) → return type + capability set
 ```
 
-Contoh:
+Example:
 ```rust
 fn transfer(from Account, to Account, amount i64) 
     effects(write from, write to) 
     (Account, Account)
     
-// Type signature formal:
+// Formal signature type:
 // (Account, Account, i64) → (Account, Account) + {write(from), write(to)}
 ```
 
 ---
 
-## ⚙️ Compilation Pipeline
+## Compilation Pipeline
 
-RustS+ menggunakan **4-stage compilation pipeline**:
-
+RustS+ uses a **4-stage compilation pipeline**:
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    STAGE 0: Analysis                                │
@@ -445,15 +442,15 @@ RustS+ menggunakan **4-stage compilation pipeline**:
 
 ---
 
-## 🛡️ The Anti-Fail Logic System
+## The Anti-Fail Logic System
 
-Anti-Fail Logic adalah jantung dari RustS+. Sistem ini terdiri dari **6 Logic Rules** dan **6 Effect Rules**.
+Anti-Fail Logic is the heart of RustS+. This system consists of 6 Logic Rules and 6 Effect Rules.
 
 ### Logic Rules
 
 #### Logic-01: Expression Completeness
 
-`if`/`match` yang digunakan sebagai value WAJIB memiliki semua branch.
+An `if`/`match` used as a value MUST contain all branches.
 
 ```rust
 // ❌ INVALID - missing else
@@ -467,7 +464,7 @@ result = if x > 0 { "positive" } else { "negative" }
 
 #### Logic-02: Ambiguous Shadowing
 
-Assignment ke variabel outer scope tanpa `outer` keyword akan ERROR.
+Assignment to an outer scope variable without the `outer` keyword will ERROR.
 
 ```rust
 // ❌ INVALID - ambiguous
@@ -487,7 +484,7 @@ x = 10
 
 #### Logic-03: Illegal Statement in Expression
 
-`let` statement tidak boleh muncul di expression context.
+`let` statements must not appear in the expression context.
 
 ```rust
 // ❌ INVALID
@@ -507,18 +504,17 @@ result = {
 
 #### Logic-04: Implicit Mutation
 
-Mutasi field struct harus bisa di-track.
+Struct field mutations must be trackable.
 
 #### Logic-05: Unclear Intent
 
-Pattern yang membingungkan seperti empty blocks `{}` akan di-flag.
+Confusing patterns such as empty blocks `{}` will be flagged.
 
 **Error Code:** `RSPL001`
 
 #### Logic-06: Same-Scope Reassignment
 
-Reassignment di scope yang sama WAJIB menggunakan `mut`.
-
+Reassignments within the same scope MUST use `mut`.
 ```rust
 // ❌ INVALID
 x = 10
@@ -535,7 +531,7 @@ x = 20  // OK - declared as mut
 
 #### Effect-01: Undeclared Effect
 
-Jika fungsi melakukan efek, WAJIB deklarasi.
+If the function performs an effect, it MUST have a declaration.
 
 ```rust
 // ❌ INVALID
@@ -553,11 +549,11 @@ fn greet() effects(io) {
 
 #### Effect-02: Effect Leak
 
-Effect tidak boleh bocor ke closure tanpa propagation.
+Effects must not leak into the closure without propagation.
 
-#### Effect-03: Pure Calling Effectful
+#### Effect-03: Pure Calling Effective
 
-Fungsi pure TIDAK BOLEH memanggil fungsi effectful.
+Pure functions MUST NOT call effectful functions.
 
 ```rust
 // ❌ INVALID
@@ -577,7 +573,7 @@ fn caller() effects(io) {
 
 #### Effect-04: Missing Propagation
 
-Effect dari callee WAJIB dipropagasi ke caller.
+The effect of the callee MUST be propagated to the caller.
 
 ```rust
 // ❌ INVALID
@@ -597,20 +593,19 @@ fn outer() effects(io) {
 
 #### Effect-05: Effect Scope Violation
 
-Effect harus dilakukan dalam scope yang valid.
+The effect must be executed within a valid scope.
 
 #### Effect-06: Concurrent Effect Conflict
 
-Dua sumber effect tidak boleh menulis state yang sama.
+Two effect sources cannot write the same state.
 
 ---
 
-## 🎭 Effect Ownership Model
+## Effect Ownership Model
 
 ### Concept: Borrow Checker for Program Meaning
 
-Sama seperti Rust memiliki borrow checker untuk memory, RustS+ memiliki **effect checker** untuk program meaning.
-
+Just as Rust has a borrow checker for memory, RustS+ has an effect checker for program meaning.
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    OWNERSHIP PARALLEL                       │
@@ -673,27 +668,27 @@ Sama seperti Rust memiliki borrow checker untuk memory, RustS+ memiliki **effect
 
 ### Effect Inference Algorithm
 
-RustS+ menggunakan **Effect Inference Algorithm** yang berjalan di atas HIR. Setiap ekspresi dan statement menghasilkan **jejak efek** yang dihitung secara **struktural**, bukan berbasis teks/regex:
+RustS+ uses the Effect Inference Algorithm that runs on top of the HIR. Each expression and statement generates an effect trace that is computed structurally, not text/regex-based:
 
 | Expression/Statement | Inferred Effect | Reasoning |
-|---------------------|-----------------|-----------|
-| `42`, `"hello"`, `true` | ∅ (none) | Literal tidak menghasilkan efek |
-| `x` (read variable) | `read(x)` | Membaca binding menghasilkan read |
-| `w.field` | `read(w)` | Akses field = read owner object |
-| `w.field = 3` | `write(w)` | Mutasi field = mutasi owner |
-| `w = new_w` | ∅ (none) | Rebinding ≠ mutasi isi |
-| `println!(...)` | `io` | I/O operation (AST-level pattern) |
+|---------------------|-------------------|----------|
+| `42`, `"hello"`, `true` | ∅ (none) | Literals produce no effect |
+| `x` (read variable) | `read(x)` | Reading a binding produces a read |
+| `w.field` | `read(w)` | Field access = read owner object |
+| `w.field = 3` | `write(w)` | Field mutation = owner mutation |
+| `w = new_w` | ∅ (none) | Rebinding ≠ content mutation |
+| `println!(...)` | `io` | I/O operations (AST-level patterns) |
 | `Vec::new()` | `alloc` | Memory allocation |
 | `.unwrap()` | `panic` | May panic |
-| `f(args...)` | `effects(f) ∪ effects(args)` | Gabungan caller + callee |
-| `if c { a } else { b }` | `effects(c) ∪ effects(a) ∪ effects(b)` | Union semua branch |
+| `f(args...)` | `effects(f) ∪effects(args)` | Combined caller + callee |
+| `if c { a } else { b }` | `effects(c) ∪effects(a) ∪effects(b)` | Union of all branches |
 
-**Key Insight:** Mutasi terhadap **field** (`w.x = 3`) dianggap sebagai mutasi terhadap **owner object** (`write(w)`). Ini karena perubahan field mengubah *state* keseluruhan object.
+**Key Insight:** A mutation to a **field** (`w.x = 3`) is treated as a mutation to the **owner object** (`write(w)`). This is because changing the field changes the *state* of the entire object.
 
 ```rust
 fn update_balance(acc Account, delta i64) effects(write acc) Account {
-    // acc.balance = ... menghasilkan write(acc)
-    // karena field mutation = owner mutation
+    // acc.balance = ... produces write(acc)
+    // because field mutation = owner mutation
     acc.balance = acc.balance + delta
     acc
 }
@@ -701,7 +696,7 @@ fn update_balance(acc Account, delta i64) effects(write acc) Account {
 
 ### Effect Dependency Graph
 
-RustS+ builds a **dependency graph** untuk cross-function effect analysis:
+RustS+ builds a **dependency graph** for cross-function effect analysis:
 
 ```
            ┌──────────────────┐
@@ -726,7 +721,7 @@ RustS+ builds a **dependency graph** untuk cross-function effect analysis:
 
 ---
 
-## 📖 Syntax Reference
+## Syntax Reference
 
 ### Variables
 
@@ -1049,11 +1044,11 @@ pub struct SourceLocation {
 
 ---
 
-## 🛠️ Cargo Integration
+## Cargo Integration
 
 ### Apa itu cargo-rustsp?
 
-`cargo-rustsp` adalah **build tool** yang mengintegrasikan RustS+ compiler dengan ekosistem Cargo. Dengan cargo-rustsp, kamu bisa menggunakan workflow Cargo yang familiar (`cargo build`, `cargo run`, dll) untuk project RustS+.
+`cargo-rustsp` is a build tool that integrates the RustS+ compiler with the Cargo ecosystem. With cargo-rustsp, you can use familiar Cargo workflows (`cargo build`, `cargo run`, etc.) for RustS+ projects.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -1079,16 +1074,16 @@ pub struct SourceLocation {
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Fitur Utama
+### Key Features
 
-| Fitur | Deskripsi |
+| Features | Description |
 |-------|-----------|
-| **Multi-Module** | Full support untuk nested modules (`mod foo;` resolves ke `foo.rss` atau `foo/mod.rss`) |
-| **Workspace** | Build multiple crates dalam satu workspace |
-| **Incremental** | Hash-based caching - hanya recompile file yang berubah |
-| **Mixed Projects** | Gabungkan `.rs` (pure Rust) dan `.rss` (RustS+) dalam satu project |
-| **Features** | Full `--features` support seperti cargo biasa |
-| **Error Mapping** | Error messages menunjuk ke lokasi di file `.rss` asli |
+| **Multi-Module** | Full support for nested modules (`mod foo;` resolves to `foo.rss` or `foo/mod.rss`) |
+| **Workspace** | Build multiple crates in a single workspace |
+| **Incremental** | Hash-based caching - only recompile changed files |
+| **Mixed Projects** | Combine `.rs` (pure Rust) and `.rss` (RustS+) in a single project |
+| **Features** | Full `--features` support like regular cargo |
+| **Error Mapping** | Error messages point to the location in the original `.rss` file |
 
 ### Installation
 
@@ -1097,16 +1092,16 @@ pub struct SourceLocation {
 git clone https://github.com/novenrizkia856-ui/rustsp-Rlang
 cd rustsp-Rlang-main
 
-# Build compiler dan cargo-rustsp
+# Build compiler and cargo-rustsp
 cargo build --release
 
 # Install ke PATH
 cp target/release/rustsp ~/.cargo/bin/
 cp target/release/cargo-rustsp ~/.cargo/bin/
 
-# Verifikasi instalasi
+# verification
 cargo rustsp --version
-# Output: cargo-rustsp 0.9.0
+# Output: cargo-rustsp x.x.x
 ```
 
 ### Commands
@@ -1202,7 +1197,7 @@ my_workspace/
 
 ### Module Resolution
 
-cargo-rustsp mengikuti aturan module resolution Rust:
+cargo-rustsp follows Rust's module resolution rules:
 
 ```
 mod foo;  →  Mencari dalam urutan:
@@ -1268,8 +1263,7 @@ cargo rustsp build
 
 ### Incremental Compilation
 
-cargo-rustsp menyimpan cache untuk mempercepat rebuild:
-
+cargo-rustsp caches to speed up rebuilds:
 ```
 target/
 └── rustsp_build/
@@ -1278,15 +1272,14 @@ target/
     └── release/           # Release build artifacts
 ```
 
-Cara kerja:
-- Setiap file `.rss` di-hash berdasarkan content
-- Jika hash sama dengan cache → skip compilation
-- Force rebuild dengan `--force`
+How it works:
+- Each `.rss` file is hashed based on its content
+- If the hash matches the cache → skip compilation
+- Force rebuild with `--force`
 
 ### Shadow Directory Isolation
 
-cargo-rustsp menggunakan TEMP directory untuk menghindari konflik dengan parent Cargo.toml:
-
+cargo-rustsp uses a TEMP directory to avoid conflicts with the parent Cargo.toml:
 ```
 Original Project              Shadow Project (TEMP)
 ────────────────              ─────────────────────
@@ -1300,16 +1293,16 @@ my_project/                   /tmp/rustsp_shadow_my_project/
 
 ### Workspace Build
 
-Untuk workspace dengan multiple crates:
+for workspace with multiple crates:
 
 ```bash
-# Build semua members yang punya .rss files
+# build all members has a .rss files
 cargo rustsp build
 
 # Build specific package
 cargo rustsp build -p core
 
-# Build all packages (termasuk pure Rust)
+# Build all packages (including pure Rust)
 cargo rustsp build --workspace
 ```
 
@@ -1329,31 +1322,30 @@ cargo rustsp build --no-default-features --features="minimal"
 ### Troubleshooting
 
 #### "Could not find Cargo.toml"
-Pastikan kamu di directory yang berisi `Cargo.toml` atau subdirectory-nya.
+Make sure you are in the directory containing `Cargo.toml` or its subdirectories.
 
 #### "No .rss files found"
-cargo-rustsp akan fallback ke plain `cargo` jika tidak ada file `.rss`.
+cargo-rustsp will fallback to plain `cargo` if there is no `.rss` file.
 
 #### "rustsp: command not found"
-Pastikan `rustsp` compiler ada di PATH atau di directory yang sama dengan `cargo-rustsp`.
+Make sure the `rustsp` compiler is in the PATH or in the same directory as `cargo-rustsp`.
 
 #### Cache Issues
-Jika build terasa stale:
+If the build feels stale:
 ```bash
 cargo rustsp clean
 cargo rustsp build --force
 ```
 
 #### Module Not Found
-Pastikan struktur folder mengikuti konvensi:
-- `mod foo;` → butuh `foo.rss` ATAU `foo/mod.rss`
-
+Make sure the folder structure follows the convention:
+- `mod foo;` → need `foo.rss` OR `foo/mod.rss`
 
 ## 🔬 Technical Deep Dive
 
 ### Lowering Implementation
 
-Lowering adalah proses transformasi RustS+ syntax ke valid Rust. File `lib.rs` berisi implementasi utama.
+Lowering is the process of transforming RustS+ syntax into valid Rust. The `lib.rs` file contains the main implementation.
 
 #### Key Transformation Functions
 
@@ -1472,7 +1464,7 @@ pub fn check_rust_output(code: &str) -> SanityCheckResult {
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 ### Development Setup
 
