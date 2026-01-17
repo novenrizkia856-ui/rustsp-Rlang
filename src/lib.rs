@@ -2364,8 +2364,7 @@ pub fn parse_rusts(source: &str) -> String {
                     let let_keyword = "let mut";
                     let type_annotation = if let Some(ref t) = var_type {
                         format!(": {}", t)
-                    } else if VariableTracker::detect_string_literal(&value) {
-                        ": String".to_string()
+                    // FIXED: Don't auto-add `: String` - let Rust infer &str for bare literals
                     } else {
                         String::new()
                     };
@@ -2376,8 +2375,7 @@ pub fn parse_rusts(source: &str) -> String {
                     let let_keyword = if needs_mut { "let mut" } else { "let" };
                     let type_annotation = if let Some(ref t) = var_type {
                         format!(": {}", t)
-                    } else if VariableTracker::detect_string_literal(&value) {
-                        ": String".to_string()
+                    // FIXED: Don't auto-add `: String` - let Rust infer &str for bare literals
                     } else {
                         String::new()
                     };
@@ -2391,8 +2389,7 @@ pub fn parse_rusts(source: &str) -> String {
                     let let_keyword = if needs_mut { "let mut" } else { "let" };
                     let type_annotation = if let Some(ref t) = var_type {
                         format!(": {}", t)
-                    } else if VariableTracker::detect_string_literal(&value) {
-                        ": String".to_string()
+                    // FIXED: Don't auto-add `: String` - let Rust infer &str for bare literals
                     } else {
                         String::new()
                     };
@@ -2968,8 +2965,7 @@ pub fn parse_rusts(source: &str) -> String {
                 let let_keyword = "let mut";
                 let type_annotation = if let Some(ref t) = var_type {
                     format!(": {}", t)
-                } else if VariableTracker::detect_string_literal(&value) && var_type.as_deref() != Some("&str") {
-                    ": String".to_string()
+                // FIXED: Don't auto-add `: String` - let Rust infer &str for bare literals
                 } else {
                     String::new()
                 };
@@ -2984,8 +2980,7 @@ pub fn parse_rusts(source: &str) -> String {
                 let let_keyword = if needs_mut { "let mut" } else { "let" };
                 let type_annotation = if let Some(ref t) = var_type {
                     format!(": {}", t)
-                } else if VariableTracker::detect_string_literal(&value) && var_type.as_deref() != Some("&str") {
-                    ": String".to_string()
+                // FIXED: Don't auto-add `: String` - let Rust infer &str for bare literals
                 } else {
                     String::new()
                 };
@@ -3006,8 +3001,7 @@ pub fn parse_rusts(source: &str) -> String {
                 let let_keyword = if needs_mut { "let mut" } else { "let" };
                 let type_annotation = if let Some(ref t) = var_type {
                     format!(": {}", t)
-                } else if VariableTracker::detect_string_literal(&value) && var_type.as_deref() != Some("&str") {
-                    ": String".to_string()
+                // FIXED: Don't auto-add `: String` - let Rust infer &str for bare literals
                 } else {
                     String::new()
                 };

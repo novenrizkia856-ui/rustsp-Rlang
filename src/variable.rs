@@ -407,12 +407,21 @@ pub fn expand_value(value: &str, explicit_type: Option<&str>) -> String {
     let trimmed = value.trim();
     
     // Handle string literal (simple case, no concatenation)
+    // CRITICAL FIX: In Rust, bare string literals are &'static str by default
+    // Only convert to String::from() if EXPLICITLY typed as String
     if VariableTracker::detect_string_literal(trimmed) {
-        if explicit_type == Some("&str") {
+        // If explicit type is &str OR no explicit type → keep as literal
+        // Rust will infer &'static str which is correct
+        if explicit_type.is_none() || explicit_type == Some("&str") {
             return trimmed.to_string();
         }
-        let inner = &trimmed[1..trimmed.len()-1];
-        return format!("String::from(\"{}\")", inner);
+        // Only convert to String if EXPLICITLY typed as String
+        if explicit_type == Some("String") {
+            let inner = &trimmed[1..trimmed.len()-1];
+            return format!("String::from(\"{}\")", inner);
+        }
+        // Default: keep as literal
+        return trimmed.to_string();
     }
     
     // Handle string concatenation: String + String should become String + &String
@@ -463,4 +472,51 @@ fn expand_string_concatenation(expr: &str) -> String {
     }
     
     result_parts.join(" + ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_expand_value_string_literal_no_type() {
+        // CRITICAL: When no explicit type, string literal should stay as literal
+        // This allows Rust to infer &'static str
+        let result = expand_value("\"hello\"", None);
+        assert_eq!(result, "\"hello\"", 
+            "String literal without explicit type should stay as literal, got: {}", result);
+    }
+    
+    #[test]
+    fn test_expand_value_string_literal_explicit_str() {
+        // When explicit type is &str, keep as literal
+        let result = expand_value("\"hello\"", Some("&str"));
+        assert_eq!(result, "\"hello\"", 
+            "String literal with explicit &str should stay as literal, got: {}", result);
+    }
+    
+    #[test]
+    fn test_expand_value_string_literal_explicit_string() {
+        // ONLY when explicit type is String, convert to String::from()
+        let result = expand_value("\"hello\"", Some("String"));
+        assert_eq!(result, "String::from(\"hello\")", 
+            "String literal with explicit String should convert, got: {}", result);
+    }
+    
+    #[test]
+    fn test_expand_value_preserves_long_string() {
+        // Test with a long string like SHA256 hash
+        let hash = "\"3cca5fcf71bf8609a64c354abf4773110dd315159be317b4218b7b8fadb6d0ce\"";
+        let result = expand_value(hash, None);
+        assert_eq!(result, hash, 
+            "Long string literal should stay as literal, got: {}", result);
+    }
+    
+    #[test]
+    fn test_infer_type_string_literal() {
+        // infer_type should return "String" for string literals
+        // (this is for type tracking, not for output generation)
+        let result = VariableTracker::infer_type("\"hello\"");
+        assert_eq!(result, Some("String".to_string()));
+    }
 }
