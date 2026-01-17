@@ -1,11 +1,10 @@
 # RustS+ Language Specification v0.9
 
-> **RustS+** adalah superset Rust yang dirancang untuk mencegah **bug logika** dengan tingkat keseriusan yang sama seperti Rust mencegah **bug memori**. Dokumen ini adalah **spesifikasi normatif** — setiap aturan di sini di-enforce oleh compiler.
+> **RustS+** is a superset of Rust designed to prevent **logic bugs** with the same severity as Rust prevents **memory bugs**. This document is a **normative specification** — every rule here is enforced by the compiler.
 
 ---
 
-## Daftar Isi
-
+## Table of Contents
 1. [Filosofi Inti](#1-filosofi-inti)
 2. [Pipeline Compiler](#2-pipeline-compiler)
 3. [Sistem Variabel](#3-sistem-variabel)
@@ -20,68 +19,66 @@
 
 ---
 
-## 1. Filosofi Inti
+## 1. Core Philosophy
 
-### 1.1 Tujuan RustS+
+### 1.1 Goals of RustS+
 
-RustS+ adalah **lapisan bahasa (superset)** di atas Rust dengan tujuan:
+RustS+ is a language layer (superset) on top of Rust with the following goals:
 
-| Layer | Penjaga | Dicegah |
-|-------|---------|---------|
+| Layer | Guard | Prevent |
+|--------|---------|---------|
 | Rust | Memory Safety | Use-after-free, double-free, data races |
 | RustS+ | Logic Safety | Hidden effects, ambiguous intent, dishonest code |
 
-**Prinsip Fundamental:**
+**Fundamental Principles:**
 
-1. **Tidak ada perubahan state tanpa niat eksplisit**
-2. **Tidak ada efek samping tersembunyi**  
-3. **Tidak ada shadowing ambigu**
-4. **Tidak ada logika "terasa benar tapi salah"**
+1. **No state changes without explicit intent**
+2. **No hidden side effects**
+3. **No ambiguous shadowing**
+4. **No "feels right but is wrong" logic**
 
-### 1.2 Kode Tidak Jujur Tidak Pernah Dikompilasi
+### 1.2 Dishonest Code Never Compiles
 
-RustS+ menerapkan filosofi **"Honest Code Only"**:
+RustS+ implements the **"Honest Code Only"** philosophy:
 
-- Jika fungsi melakukan efek → **WAJIB** mendeklarasikannya
-- Jika variabel di-reassign → **WAJIB** menggunakan `mut`
-- Jika modifikasi variabel outer scope → **WAJIB** menggunakan `outer`
+- If a function performs an effect → **MUST** declare it
+- If a variable is reassigned → **MUST** use `mut`
+- If an outer-scope variable is modified → **MUST** use `outer`
 
-Kode yang melanggar aturan ini **TIDAK AKAN** diteruskan ke Rust compiler.
+Code that violates these rules **WILL NOT** be passed to the Rust compiler.
 
-### 1.3 Semantic Compiler, Bukan Text Transformer
+### 1.3 Semantic Compiler, Not a Text Transformer
 
-RustS+ **bukan** sekadar "bahasa dengan sintaks baru" yang ditransform via regex. RustS+ adalah **sistem formal untuk menjamin kebenaran makna program**.
-
+RustS+ is **not** simply a "language with new syntax" transformed via regex. RustS+ is a **formal system for ensuring the correctness of program meaning**.
 ```
 ┌───────────────────────────────────────────────────────────────────┐
-│  MISCONCEPTION: RustS+ adalah regex/text transformer               │
+│  MISCONCEPTION: RustS+ is a regex/text transformer                │
 │  ─────────────────────────────────────────────────────────────    │
-│  ❌ Source → Regex Replace → Rust                                  │
-│                                                                    │
-│  REALITY: RustS+ adalah semantic compiler                          │
+│  ❌ Source → Regex Replace → Rust                                 │
+│                                                                   │
+│  REALITY: RustS+ is a semantic compiler                           │
 │  ─────────────────────────────────────────────────────────────    │
-│  ✅ Source → AST → HIR → EIR → Validated Rust                      │
-│              ↑      ↑     ↑                                        │
-│           struktur makna effect                                    │
+│  ✅ Source → AST → HIR → EIR → Validated Rust                     │
+│              ↑      ↑     ↑                                       │
+│           effect meaning structure                                │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-**Mengapa ini penting?**
+**Why is this important?**
 
 | Approach | Problem |
 |----------|---------|
-| Regex-based | Tidak memahami context, mudah salah parse |
-| AST-only | Tidak memahami scope dan binding resolution |
-| **HIR + EIR** | Memahami **makna** dan **effect** secara formal |
+| Regex-based | Doesn't understand context, prone to misparsing |
+| AST-only | Doesn't understand scope and binding resolution |
+| **HIR + EIR** | Formally understanding **meaning** and **effect** |
 
-RustS+ membangun **tiga layer IR**:
+RustS+ builds **three layers of IR**:
 
-1. **AST (Abstract Syntax Tree)** - Struktur sintaks
-2. **HIR (High-level IR)** - Resolved bindings, scope, mutability  
+1. **AST (Abstract Syntax Tree)** - Syntax structure
+2. **HIR (High-level IR)** - Resolved bindings, scope, mutability
 3. **EIR (Effect IR)** - Effect inference, propagation, ownership
 
-Dengan arsitektur ini, RustS+ dapat mendeteksi kesalahan **semantik** (bukan hanya sintaks) sebelum satu baris Rust pun dihasilkan.
-
+With this architecture, RustS+ can detect **semantic** errors (not just syntax) before a single line of Rust is generated.
 ---
 
 ## 2. Pipeline Compiler
