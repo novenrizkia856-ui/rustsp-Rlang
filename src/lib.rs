@@ -94,11 +94,32 @@ fn transform_generic_brackets(type_str: &str) -> String {
     let trimmed = type_str.trim();
     
     // List of known generic types that use Type[T] syntax
+    // CRITICAL: Includes both container types AND traits with generic parameters
     const GENERIC_TYPES: &[&str] = &[
+        // Collections
         "Vec", "HashMap", "HashSet", "BTreeMap", "BTreeSet",
-        "Option", "Result", "Box", "Rc", "Arc", "RefCell", "Cell",
-        "Mutex", "RwLock", "Cow", "PhantomData",
         "VecDeque", "LinkedList", "BinaryHeap",
+        // Smart pointers & wrappers
+        "Option", "Result", "Box", "Rc", "Arc", "RefCell", "Cell",
+        "Mutex", "RwLock", "Cow", "PhantomData", "Weak", "Pin",
+        // Conversion traits (CRITICAL for impl Into[T], From[T], etc.)
+        "Into", "From", "TryInto", "TryFrom",
+        "AsRef", "AsMut",
+        // Iterator traits
+        "Iterator", "IntoIterator", "ExactSizeIterator", "DoubleEndedIterator",
+        // Function traits
+        "Fn", "FnMut", "FnOnce", "FnPtr",
+        // Deref/Borrow traits
+        "Deref", "DerefMut", "Borrow", "BorrowMut",
+        // Range types
+        "Range", "RangeInclusive", "RangeFrom", "RangeTo", "RangeFull",
+        // Other common generics
+        "Sender", "Receiver", "SyncSender",
+        "MaybeUninit", "ManuallyDrop",
+        // Serde traits
+        "Serialize", "Deserialize",
+        // Common external crates
+        "Lazy", "OnceCell", "OnceLock",
     ];
     
     let mut result = trimmed.to_string();
@@ -1116,16 +1137,23 @@ fn transform_literal_field_with_ctx(line: &str, ctx: Option<&CurrentFunctionCont
             if is_valid_field_name(field) {
                 // Transform nested struct in value
                 let transformed_value = transform_nested_struct_value(value);
-                // CRITICAL FIX: Add trailing comma for struct literal fields!
-                // If line ends with }, add comma. If line ends with { (multiline start), no comma.
-                let suffix = if transformed_value.trim().ends_with('}') { "," } else { "" };
+                // CRITICAL FIX: Add trailing comma for COMPLETE struct literal fields!
+                // A field is complete if it doesn't end with `{` or `[` (multiline start indicators)
+                // Fields ending with `}`, `]`, `)`, or any value are COMPLETE and need comma
+                let tv = transformed_value.trim();
+                let is_multiline_start = tv.ends_with('{') || tv.ends_with('[');
+                let already_has_comma = tv.ends_with(',');
+                let suffix = if !is_multiline_start && !already_has_comma { "," } else { "" };
                 return format!("{}{}: {}{}", leading_ws, field, transformed_value, suffix);
             }
         }
         // Even without = at top level, might be bare struct that needs inner transform
         let transformed = transform_nested_struct_value(trimmed);
-        // CRITICAL FIX: Add trailing comma if complete struct literal
-        let suffix = if transformed.trim().ends_with('}') && !transformed.trim().ends_with("},") { "," } else { "" };
+        // CRITICAL FIX: Add trailing comma if complete (not multiline start)
+        let t = transformed.trim();
+        let is_multiline_start = t.ends_with('{') || t.ends_with('[');
+        let already_has_comma = t.ends_with(',') || t.ends_with("},");
+        let suffix = if !is_multiline_start && !already_has_comma { "," } else { "" };
         return format!("{}{}{}", leading_ws, transformed, suffix);
     }
     
@@ -1260,9 +1288,20 @@ fn find_field_eq(s: &str) -> Option<usize> {
 
 fn is_valid_field_name(s: &str) -> bool {
     if s.is_empty() { return false; }
-    let first = s.chars().next().unwrap();
+    
+    // CRITICAL FIX: Support Rust raw identifiers (r#keyword)
+    // Raw identifiers are used to use reserved keywords as identifiers
+    // Example: `type` is a keyword, so must be written as `r#type`
+    let identifier = if s.starts_with("r#") && s.len() > 2 {
+        &s[2..]  // Strip r# prefix for validation
+    } else {
+        s
+    };
+    
+    if identifier.is_empty() { return false; }
+    let first = identifier.chars().next().unwrap();
     if !first.is_alphabetic() && first != '_' { return false; }
-    s.chars().all(|c| c.is_alphanumeric() || c == '_')
+    identifier.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 fn is_string_literal(s: &str) -> bool {

@@ -161,15 +161,28 @@ pub fn transform_struct_field(line: &str) -> String {
 }
 
 /// Check if this is a valid field/identifier name
+/// CRITICAL: Supports Rust raw identifiers (r#keyword) for reserved keywords
 fn is_valid_field_name(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    let first = s.chars().next().unwrap();
+    
+    // Support raw identifiers: r#type, r#match, r#async, etc.
+    let identifier = if s.starts_with("r#") && s.len() > 2 {
+        &s[2..]  // Strip r# prefix for validation
+    } else {
+        s
+    };
+    
+    if identifier.is_empty() {
+        return false;
+    }
+    
+    let first = identifier.chars().next().unwrap();
     if !first.is_alphabetic() && first != '_' {
         return false;
     }
-    s.chars().all(|c| c.is_alphanumeric() || c == '_')
+    identifier.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// Check if a line is a struct instantiation
@@ -357,6 +370,23 @@ mod tests {
         // CRITICAL: Input with trailing comma should NOT produce double comma
         assert_eq!(transform_struct_field("    value i32,"), "    value: i32,");
         assert_eq!(transform_struct_field("    name String,"), "    name: String,");
+    }
+    
+    #[test]
+    fn test_struct_field_with_raw_identifier() {
+        // CRITICAL: Raw identifiers (r#keyword) must be supported
+        // These are used when field names are Rust reserved keywords
+        assert_eq!(transform_struct_field("    r#type String"), "    r#type: String,");
+        assert_eq!(transform_struct_field("    pub r#type String"), "    pub r#type: String,");
+        assert_eq!(transform_struct_field("    r#match i32"), "    r#match: i32,");
+        assert_eq!(transform_struct_field("    r#async bool"), "    r#async: bool,");
+    }
+    
+    #[test]
+    fn test_struct_init_field_with_raw_identifier() {
+        // CRITICAL: Raw identifiers in struct instantiation
+        assert_eq!(transform_struct_init_field("    r#type = \"wasm\".to_string()", false), "    r#type: \"wasm\".to_string(),");
+        assert_eq!(transform_struct_init_field("    r#match = 42", false), "    r#match: 42,");
     }
     
     #[test]

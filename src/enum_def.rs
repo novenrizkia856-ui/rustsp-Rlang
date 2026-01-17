@@ -134,6 +134,13 @@ pub fn transform_enum_variant(line: &str, in_struct_variant: bool) -> String {
         return line.to_string();
     }
     
+    // CRITICAL FIX: Attributes pass through unchanged
+    // #[error("...")] or #[derive(...)] should NOT be transformed
+    // These may contain { } which would incorrectly trigger struct variant handling
+    if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
+        return line.to_string();
+    }
+    
     // Already has comma at end, likely processed
     if trimmed.ends_with(',') {
         return line.to_string();
@@ -377,5 +384,23 @@ mod tests {
     #[test]
     fn test_inline_struct_fields() {
         assert_eq!(transform_inline_struct_fields("x i32, y i32"), "x: i32, y: i32");
+    }
+    
+    #[test]
+    fn test_attribute_passthrough() {
+        // CRITICAL: Attributes with braces must NOT be transformed
+        // The {0} format placeholder must remain unchanged
+        assert_eq!(
+            transform_enum_variant("    #[error(\"validation error: {0}\")]", false), 
+            "    #[error(\"validation error: {0}\")]"
+        );
+        assert_eq!(
+            transform_enum_variant("    #[derive(Debug, Clone)]", false), 
+            "    #[derive(Debug, Clone)]"
+        );
+        assert_eq!(
+            transform_enum_variant("    #[serde(default)]", false), 
+            "    #[serde(default)]"
+        );
     }
 }

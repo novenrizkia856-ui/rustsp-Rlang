@@ -55,11 +55,32 @@ fn transform_generic_brackets(type_str: &str) -> String {
     let trimmed = type_str.trim();
     
     // List of known generic types that use Type[T] syntax
+    // CRITICAL: Includes both container types AND traits with generic parameters
     const GENERIC_TYPES: &[&str] = &[
+        // Collections
         "Vec", "HashMap", "HashSet", "BTreeMap", "BTreeSet",
-        "Option", "Result", "Box", "Rc", "Arc", "RefCell", "Cell",
-        "Mutex", "RwLock", "Cow", "PhantomData",
         "VecDeque", "LinkedList", "BinaryHeap",
+        // Smart pointers & wrappers
+        "Option", "Result", "Box", "Rc", "Arc", "RefCell", "Cell",
+        "Mutex", "RwLock", "Cow", "PhantomData", "Weak", "Pin",
+        // Conversion traits (CRITICAL for impl Into[T], From[T], etc.)
+        "Into", "From", "TryInto", "TryFrom",
+        "AsRef", "AsMut",
+        // Iterator traits
+        "Iterator", "IntoIterator", "ExactSizeIterator", "DoubleEndedIterator",
+        // Function traits
+        "Fn", "FnMut", "FnOnce", "FnPtr",
+        // Deref/Borrow traits
+        "Deref", "DerefMut", "Borrow", "BorrowMut",
+        // Range types
+        "Range", "RangeInclusive", "RangeFrom", "RangeTo", "RangeFull",
+        // Other common generics
+        "Sender", "Receiver", "SyncSender",
+        "MaybeUninit", "ManuallyDrop",
+        // Serde traits
+        "Serialize", "Deserialize",
+        // Common external crates
+        "Lazy", "OnceCell", "OnceLock",
     ];
     
     let mut result = trimmed.to_string();
