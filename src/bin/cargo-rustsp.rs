@@ -1,4 +1,4 @@
-//! cargo-rustsp v2.0.0 - Transparent Cargo Wrapper for RustS+
+//! cargo-rustsp v1.0.0 - Transparent Cargo Wrapper for RustS+
 //!
 //! Simple design:
 //! 1. Find project root (Cargo.toml)
@@ -272,7 +272,7 @@ fn clean_generated_files(project_root: &Path) -> usize {
 //=============================================================================
 
 fn print_usage() {
-    eprintln!("{}cargo-rustsp{} v2.0.0 - Transparent Cargo Wrapper for RustS+", 
+    eprintln!("{}cargo-rustsp{} v1.0.0 - Transparent Cargo Wrapper for RustS+", 
         ansi::BOLD_CYAN, ansi::RESET);
     eprintln!();
     eprintln!("{}USAGE:{}", ansi::BOLD, ansi::RESET);
