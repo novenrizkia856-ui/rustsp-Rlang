@@ -1064,6 +1064,44 @@ fn split_by_comma(s: &str) -> Vec<String> {
 fn parse_single_param(param: &str) -> Result<Parameter, String> {
     let param = param.trim();
     
+    // CRITICAL FIX: Handle special self parameters
+    // &self, &mut self, self are valid Rust patterns without explicit type annotation
+    // RustS+ should accept these directly
+    if param == "&self" {
+        return Ok(Parameter {
+            name: "self".to_string(),
+            param_type: "&".to_string(),
+            is_borrow: true,
+            is_mut_borrow: false,
+        });
+    }
+    if param == "&mut self" {
+        return Ok(Parameter {
+            name: "self".to_string(),
+            param_type: "&mut".to_string(),
+            is_borrow: true,
+            is_mut_borrow: true,
+        });
+    }
+    if param == "self" {
+        return Ok(Parameter {
+            name: "self".to_string(),
+            param_type: "".to_string(),
+            is_borrow: false,
+            is_mut_borrow: false,
+        });
+    }
+    // Also handle: self: Type (explicit self type)
+    if param.starts_with("self:") {
+        let type_str = param[5..].trim().to_string();
+        return Ok(Parameter {
+            name: "self".to_string(),
+            param_type: type_str,
+            is_borrow: false,
+            is_mut_borrow: false,
+        });
+    }
+    
     let first_space = param.find(' ').ok_or_else(|| format!(
         "Parameter '{}' has no type annotation. All parameters must have explicit types in RustS+.",
         param

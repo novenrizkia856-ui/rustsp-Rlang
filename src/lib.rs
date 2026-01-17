@@ -182,6 +182,13 @@ fn ends_with_continuation_operator(line: &str) -> bool {
 fn needs_semicolon(trimmed: &str) -> bool {
     if trimmed.is_empty() { return false; }
     if trimmed.ends_with(';') { return false; }
+    
+    // CRITICAL FIX: use/pub use statements ALWAYS need semicolons, even if they end with }
+    // Example: `use std::collections::{HashMap, HashSet}` ends with } but needs ;
+    if trimmed.starts_with("use ") || trimmed.starts_with("pub use ") {
+        return true;
+    }
+    
     if trimmed.ends_with('{') || trimmed.ends_with('}') { return false; }
     if trimmed.ends_with(',') { return false; }
     
@@ -777,9 +784,22 @@ fn transform_array_element(line: &str) -> String {
 
 /// Transform enum struct variant inside array: Event::C { x = 4 } -> Event::C { x: 4 }
 fn transform_enum_struct_init_in_array(s: &str) -> String {
-    // Check if this is an enum struct variant
-    if !s.contains("::") || !s.contains('{') {
+    // CRITICAL FIX: Handle BOTH enum struct variants (Event::C { x = 1 })
+    // AND plain struct literals (BlobRef { hash = x })
+    // Only need { to transform - the :: requirement was too strict!
+    if !s.contains('{') {
         return s.to_string();
+    }
+    
+    // Also need = inside braces to transform (otherwise already Rust syntax)
+    // Check if there's = between { and } (not == or != etc)
+    if let Some(brace_start) = s.find('{') {
+        let after_brace = &s[brace_start..];
+        // Quick check: if there's no = or all : are already present, skip
+        let has_assignment_eq = has_assignment_equals_in_braces(after_brace);
+        if !has_assignment_eq {
+            return s.to_string();
+        }
     }
     
     // Find { and transform fields inside
@@ -799,6 +819,32 @@ fn transform_enum_struct_init_in_array(s: &str) -> String {
     }
     
     s.to_string()
+}
+
+/// Check if there's an assignment = inside braces (not == or !=)
+fn has_assignment_equals_in_braces(s: &str) -> bool {
+    let mut in_string = false;
+    let mut prev_char = ' ';
+    let chars: Vec<char> = s.chars().collect();
+    
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '"' && prev_char != '\\' {
+            in_string = !in_string;
+        }
+        
+        if !in_string && c == '=' {
+            // Check it's not == or != or <= or >=
+            let next = chars.get(i + 1).copied().unwrap_or(' ');
+            if prev_char != '!' && prev_char != '=' && prev_char != '<' && prev_char != '>' 
+               && next != '=' && next != '>' {
+                return true;
+            }
+        }
+        
+        prev_char = c;
+    }
+    
+    false
 }
 
 /// Transform inline enum fields: "x = 1, y = 2" → "x: 1, y: 2"
@@ -1070,12 +1116,17 @@ fn transform_literal_field_with_ctx(line: &str, ctx: Option<&CurrentFunctionCont
             if is_valid_field_name(field) {
                 // Transform nested struct in value
                 let transformed_value = transform_nested_struct_value(value);
-                return format!("{}{}: {}", leading_ws, field, transformed_value);
+                // CRITICAL FIX: Add trailing comma for struct literal fields!
+                // If line ends with }, add comma. If line ends with { (multiline start), no comma.
+                let suffix = if transformed_value.trim().ends_with('}') { "," } else { "" };
+                return format!("{}{}: {}{}", leading_ws, field, transformed_value, suffix);
             }
         }
         // Even without = at top level, might be bare struct that needs inner transform
         let transformed = transform_nested_struct_value(trimmed);
-        return format!("{}{}", leading_ws, transformed);
+        // CRITICAL FIX: Add trailing comma if complete struct literal
+        let suffix = if transformed.trim().ends_with('}') && !transformed.trim().ends_with("},") { "," } else { "" };
+        return format!("{}{}{}", leading_ws, transformed, suffix);
     }
     
     // Simple field: `field = value`
@@ -1719,6 +1770,11 @@ pub fn parse_rusts(source: &str) -> String {
     let mut multiline_expr_depth: i32 = 0;
     
     for (line_num, line) in lines.iter().enumerate() {
+        // CRITICAL FIX: Strip BOM (Byte Order Mark) from the line
+        // BOM is \u{FEFF} and can appear at the start of UTF-8 files
+        // It's invisible but causes issues if not handled
+        let line = line.trim_start_matches('\u{FEFF}');
+        
         let clean_line = strip_inline_comment(line);
         let trimmed = clean_line.trim();
         let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();

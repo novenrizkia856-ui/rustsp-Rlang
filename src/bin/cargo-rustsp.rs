@@ -733,6 +733,20 @@ fn parse_toml_value(content: &str, key: &str) -> Option<String> {
 }
 
 fn extract_dependencies(content: &str) -> String {
+    extract_dependencies_with_path_rewrite(content, None)
+}
+
+/// Extract dependencies with optional path rewriting for shadow builds.
+/// 
+/// When `original_crate_root` is provided, all relative path dependencies
+/// are rewritten to absolute paths so they work from the shadow directory.
+/// 
+/// Example:
+///   Original (in D:\dsdn\crates\validator):
+///     dsdn-common = { path = "../common" }
+///   Rewritten (for shadow build):
+///     dsdn-common = { path = "D:/dsdn/crates/common" }
+fn extract_dependencies_with_path_rewrite(content: &str, original_crate_root: Option<&Path>) -> String {
     let mut result = String::new();
     let mut in_section = false;
     let mut current_section = String::new();
@@ -767,11 +781,128 @@ fn extract_dependencies(content: &str) -> String {
         }
         
         if in_section && !trimmed.is_empty() && !trimmed.starts_with('#') {
-            result.push_str(line);
+            // CRITICAL FIX: Rewrite path dependencies to absolute paths
+            let processed_line = if let Some(crate_root) = original_crate_root {
+                rewrite_path_dependency(line, crate_root)
+            } else {
+                line.to_string()
+            };
+            result.push_str(&processed_line);
             result.push('\n');
         }
     }
     
+    result
+}
+
+/// Normalize a path string for use in Cargo.toml
+/// 
+/// On Windows, canonicalize() returns paths with \\?\ prefix (extended-length path).
+/// This prefix is NOT valid in Cargo.toml, so we must strip it.
+/// 
+/// Examples:
+///   - `\\?\D:\dsdn\crates\common` -> `D:/dsdn/crates/common`
+///   - `/home/user/project` -> `/home/user/project` (unchanged)
+fn normalize_path_for_cargo(path_str: &str) -> String {
+    let mut result = path_str.to_string();
+    
+    // CRITICAL FIX: Strip Windows extended-length path prefix
+    // canonicalize() on Windows returns \\?\C:\... which is invalid for Cargo
+    if result.starts_with(r"\\?\") {
+        result = result[4..].to_string();
+    }
+    // Also handle the forward-slash version (in case it was already converted)
+    if result.starts_with("//?/") {
+        result = result[4..].to_string();
+    }
+    
+    // Convert backslashes to forward slashes (works in Cargo.toml on all platforms)
+    result.replace('\\', "/")
+}
+
+/// Rewrite a dependency line, converting relative path to absolute.
+/// 
+/// Handles both inline format and table format:
+///   - `dep = { path = "../foo" }` -> `dep = { path = "/abs/path/foo" }`
+///   - `path = "../foo"` -> `path = "/abs/path/foo"`
+fn rewrite_path_dependency(line: &str, crate_root: &Path) -> String {
+    // Look for path = "..." pattern
+    if !line.contains("path") {
+        return line.to_string();
+    }
+    
+    // Use a more robust approach: find `path = "..."` and replace it
+    let mut result = String::new();
+    let mut remaining = line;
+    
+    while let Some(path_pos) = remaining.find("path") {
+        // Add everything before "path"
+        result.push_str(&remaining[..path_pos]);
+        remaining = &remaining[path_pos..];
+        
+        // Check if this is actually `path = "..."`
+        let after_path = &remaining[4..]; // Skip "path"
+        let after_path_trimmed = after_path.trim_start();
+        
+        if !after_path_trimmed.starts_with('=') {
+            // Not a path assignment, just the word "path" somewhere
+            result.push_str("path");
+            remaining = &remaining[4..];
+            continue;
+        }
+        
+        // Skip to after the =
+        let eq_offset = 4 + (after_path.len() - after_path_trimmed.len());
+        let after_eq = &remaining[eq_offset + 1..]; // +1 for '='
+        let after_eq_trimmed = after_eq.trim_start();
+        
+        if !after_eq_trimmed.starts_with('"') {
+            // Not a quoted string
+            result.push_str("path");
+            remaining = &remaining[4..];
+            continue;
+        }
+        
+        // Find the content between quotes
+        let quote_content_start = eq_offset + 1 + (after_eq.len() - after_eq_trimmed.len()) + 1;
+        let content_remaining = &remaining[quote_content_start..];
+        
+        if let Some(end_quote) = content_remaining.find('"') {
+            let rel_path_str = &content_remaining[..end_quote];
+            
+            // Convert relative path to absolute
+            let rel_path = Path::new(rel_path_str);
+            if rel_path.is_relative() && (rel_path_str.starts_with("..") || rel_path_str.starts_with("./")) {
+                let abs_path = crate_root.join(rel_path);
+                
+                // CRITICAL FIX: Use normalize_path_for_cargo to handle Windows \\?\ prefix
+                let abs_str = if let Ok(canonical) = abs_path.canonicalize() {
+                    normalize_path_for_cargo(&canonical.to_string_lossy())
+                } else {
+                    normalize_path_for_cargo(&abs_path.to_string_lossy())
+                };
+                
+                // Build the replacement
+                result.push_str("path = \"");
+                result.push_str(&abs_str);
+                result.push('"');
+                
+                // Continue after the closing quote
+                remaining = &content_remaining[end_quote + 1..];
+            } else {
+                // Not a relative path we need to rewrite, keep as-is
+                result.push_str(&remaining[..quote_content_start + end_quote + 1]);
+                remaining = &content_remaining[end_quote + 1..];
+            }
+        } else {
+            // No closing quote found, keep as-is
+            result.push_str("path");
+            remaining = &remaining[4..];
+        }
+    }
+    
+    // Add any remaining content
+    result.push_str(remaining);
     result
 }
 
@@ -808,6 +939,7 @@ fn generate_cargo_toml(
     has_main: bool,
     has_lib: bool,
     project_name: &str,
+    crate_root: Option<&Path>,
 ) -> String {
     let name = parse_toml_value(original_toml, "name")
         .unwrap_or_else(|| project_name.to_string());
@@ -825,9 +957,19 @@ fn generate_cargo_toml(
     toml.push_str(&format!("edition = \"{}\"\n", edition));
     
     // Copy other package fields
+    // CRITICAL FIX: Some fields are arrays (authors, keywords, categories)
+    // and should NOT be wrapped in extra quotes!
     for field in ["authors", "description", "license", "repository", "readme", "keywords", "categories"] {
         if let Some(value) = parse_toml_value(original_toml, field) {
-            toml.push_str(&format!("{} = \"{}\"\n", field, value));
+            // CRITICAL FIX: Check if value is an array or already has quotes
+            // Arrays start with '[', don't wrap them in extra quotes!
+            if value.starts_with('[') {
+                // Array value - use as-is (e.g., authors = ["INEVA team"])
+                toml.push_str(&format!("{} = {}\n", field, value));
+            } else {
+                // String value - wrap in quotes
+                toml.push_str(&format!("{} = \"{}\"\n", field, value));
+            }
         }
     }
     toml.push('\n');
@@ -840,13 +982,18 @@ fn generate_cargo_toml(
     }
     
     // Library target
+    // CRITICAL FIX: When package name has dashes (e.g., "dsdn-validator"),
+    // the library crate name must use underscores (e.g., "dsdn_validator")
+    // so that `use dsdn_validator::*` works from the binary.
     if has_lib {
+        let lib_name = name.replace('-', "_");
         toml.push_str("[lib]\n");
+        toml.push_str(&format!("name = \"{}\"\n", lib_name));
         toml.push_str("path = \"src/lib.rs\"\n\n");
     }
     
-    // Dependencies
-    let deps = extract_dependencies(original_toml);
+    // Dependencies - CRITICAL FIX: Rewrite path dependencies to absolute paths
+    let deps = extract_dependencies_with_path_rewrite(original_toml, crate_root);
     if !deps.is_empty() {
         toml.push_str(&deps);
         toml.push('\n');
@@ -1101,7 +1248,8 @@ fn build_single_crate(ctx: &mut BuildContext, crate_root: &Path) -> Result<(), S
         .and_then(|n| n.to_str())
         .unwrap_or("rustsp_project");
     
-    let new_toml = generate_cargo_toml(&original_toml, has_main, has_lib, project_name);
+    // CRITICAL FIX: Pass crate_root so path dependencies can be rewritten to absolute paths
+    let new_toml = generate_cargo_toml(&original_toml, has_main, has_lib, project_name, Some(&crate_root));
     fs::write(ctx.shadow_dir.join("Cargo.toml"), &new_toml)
         .map_err(|e| format!("Failed to write Cargo.toml: {}", e))?;
     
@@ -1474,11 +1622,90 @@ edition = "2021"
 serde = "1.0"
 "#;
         
-        let generated = generate_cargo_toml(original, true, true, "test");
+        let generated = generate_cargo_toml(original, true, true, "test", None);
         assert!(generated.contains("name = \"test-project\""));
         assert!(generated.contains("[[bin]]"));
         assert!(generated.contains("[lib]"));
         assert!(generated.contains("[dependencies]"));
         assert!(generated.contains("serde"));
+    }
+    
+    #[test]
+    fn test_cargo_toml_with_authors_array() {
+        // CRITICAL TEST: authors is an ARRAY, not a string!
+        // Must not be wrapped in extra quotes
+        let original = r#"
+[package]
+name = "dsdn-validator"
+version = "0.1.0"
+edition = "2021"
+authors = ["INEVA team"]
+keywords = ["blockchain", "storage"]
+
+[dependencies]
+serde = "1.0"
+"#;
+        
+        let generated = generate_cargo_toml(original, false, true, "validator", None);
+        
+        // authors should be an array, NOT wrapped in quotes
+        assert!(generated.contains("authors = [\"INEVA team\"]"), 
+            "authors should be array, got: {}", generated);
+        // keywords should also be an array
+        assert!(generated.contains("keywords = [\"blockchain\", \"storage\"]"),
+            "keywords should be array, got: {}", generated);
+        // Should NOT contain the buggy double-quoted array
+        assert!(!generated.contains("authors = \"["), 
+            "authors should NOT be double-quoted, got: {}", generated);
+        
+        // CRITICAL: Library name should have underscores, not dashes
+        // so `use dsdn_validator::*` works
+        assert!(generated.contains("name = \"dsdn_validator\""),
+            "Library name should use underscores, got: {}", generated);
+    }
+    
+    #[test]
+    fn test_path_dependency_rewrite() {
+        use std::path::PathBuf;
+        
+        // Test rewriting path dependencies
+        let line = r#"dsdn-common = { path = "../common", version = "0.1" }"#;
+        let crate_root = PathBuf::from("/project/crates/validator");
+        
+        let result = rewrite_path_dependency(line, &crate_root);
+        
+        // Should contain absolute path
+        assert!(result.contains("/project/crates/common") || result.contains("\\project\\crates\\common"),
+            "Path should be absolute, got: {}", result);
+        // Should still have version
+        assert!(result.contains("version = \"0.1\""),
+            "Should preserve other fields, got: {}", result);
+    }
+    
+    #[test]
+    fn test_normalize_path_for_cargo() {
+        // Test Windows extended-length path prefix stripping
+        assert_eq!(
+            normalize_path_for_cargo(r"\\?\D:\dsdn\crates\common"),
+            "D:/dsdn/crates/common"
+        );
+        
+        // Test forward-slash version (in case already converted incorrectly)
+        assert_eq!(
+            normalize_path_for_cargo("//?/D:/dsdn/crates/common"),
+            "D:/dsdn/crates/common"
+        );
+        
+        // Test normal paths are unchanged (except backslash conversion)
+        assert_eq!(
+            normalize_path_for_cargo(r"D:\dsdn\crates\common"),
+            "D:/dsdn/crates/common"
+        );
+        
+        // Test Unix paths are unchanged
+        assert_eq!(
+            normalize_path_for_cargo("/home/user/project"),
+            "/home/user/project"
+        );
     }
 }

@@ -65,8 +65,8 @@ pub fn parse_struct_header(line: &str) -> Option<String> {
 }
 
 /// Transform a struct field line from RustS+ to Rust
-/// Input:  "    id u64"
-/// Output: "    id: u64,"
+/// Input:  "    id u64"         -> "    id: u64,"
+/// Input:  "    pub hash String" -> "    pub hash: String,"
 pub fn transform_struct_field(line: &str) -> String {
     let trimmed = line.trim();
     
@@ -79,25 +79,80 @@ pub fn transform_struct_field(line: &str) -> String {
         return line.to_string();
     }
     
-    // Check if already has colon (Rust syntax)
-    if trimmed.contains(':') {
-        // Already Rust syntax, just ensure comma
-        let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-        let clean = trimmed.trim_end_matches(',');
-        return format!("{}{},", leading_ws, clean);
+    // Check if already has colon (Rust syntax) - but not ::
+    if trimmed.contains(':') && !trimmed.starts_with("pub:") {
+        // Check it's actually field: Type syntax, not something else
+        // Avoid false positives from :: in types
+        let colon_pos = trimmed.find(':');
+        let double_colon_pos = trimmed.find("::");
+        if let Some(cp) = colon_pos {
+            // If there's :: and : is part of ::, it's not field syntax
+            if double_colon_pos.is_some() && double_colon_pos.unwrap() == cp {
+                // This is ::, not field: Type - continue to parse
+            } else {
+                // Already Rust syntax, just ensure comma
+                let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+                let clean = trimmed.trim_end_matches(',');
+                return format!("{}{},", leading_ws, clean);
+            }
+        }
     }
     
-    // Parse: field_name Type
+    // Parse the field line
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.len() >= 2 {
-        let field_name = parts[0];
+    let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+    
+    // CRITICAL FIX: Handle visibility modifiers (pub, pub(crate), etc.)
+    // Patterns:
+    //   "field_name Type"           -> 2+ parts, no visibility
+    //   "pub field_name Type"       -> 3+ parts, pub visibility
+    //   "pub(crate) field_name Type" -> 3+ parts, pub(crate) visibility
+    
+    if parts.is_empty() {
+        return line.to_string();
+    }
+    
+    // Check for visibility modifier
+    let (visibility, field_start_idx) = if parts[0] == "pub" {
+        // Check if it's pub(something)
+        if parts.len() > 1 && parts[1].starts_with('(') {
+            // pub(crate) or pub(super) etc - combine them
+            // Find where the visibility ends
+            let mut vis_end = 1;
+            let mut combined_vis = "pub".to_string();
+            for (i, part) in parts.iter().enumerate().skip(1) {
+                combined_vis.push(' ');
+                combined_vis.push_str(part);
+                if part.ends_with(')') {
+                    vis_end = i + 1;
+                    break;
+                }
+            }
+            (Some(combined_vis), vis_end)
+        } else {
+            (Some("pub".to_string()), 1)
+        }
+    } else if parts[0].starts_with("pub(") {
+        // pub(crate) as single token
+        (Some(parts[0].to_string()), 1)
+    } else {
+        (None, 0)
+    };
+    
+    // Now parse field_name and Type from remaining parts
+    let remaining_parts = &parts[field_start_idx..];
+    
+    if remaining_parts.len() >= 2 {
+        let field_name = remaining_parts[0];
         // CRITICAL FIX: Strip trailing comma from field_type to avoid double comma
-        let field_type = parts[1..].join(" ").trim_end_matches(',').to_string();
+        let field_type = remaining_parts[1..].join(" ").trim_end_matches(',').to_string();
         
-        // Validate field name
+        // Validate field name (should be lowercase identifier, not a keyword)
         if is_valid_field_name(field_name) {
-            let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-            return format!("{}{}: {},", leading_ws, field_name, field_type);
+            return match visibility {
+                Some(vis) => format!("{}{} {}: {},", leading_ws, vis, field_name, field_type),
+                None => format!("{}{}: {},", leading_ws, field_name, field_type),
+            };
         }
     }
     
@@ -280,6 +335,21 @@ mod tests {
         assert_eq!(transform_struct_field("    id u64"), "    id: u64,");
         assert_eq!(transform_struct_field("    name String"), "    name: String,");
         assert_eq!(transform_struct_field("    active bool"), "    active: bool,");
+    }
+    
+    #[test]
+    fn test_struct_field_with_pub_visibility() {
+        // CRITICAL: pub visibility modifier must be preserved correctly
+        assert_eq!(transform_struct_field("    pub hash String"), "    pub hash: String,");
+        assert_eq!(transform_struct_field("    pub name String"), "    pub name: String,");
+        assert_eq!(transform_struct_field("    pub ok bool"), "    pub ok: bool,");
+        assert_eq!(transform_struct_field("    pub errors Vec<String>"), "    pub errors: Vec<String>,");
+    }
+    
+    #[test]
+    fn test_struct_field_with_pub_crate_visibility() {
+        // pub(crate) and other restricted visibility
+        assert_eq!(transform_struct_field("    pub(crate) id u64"), "    pub(crate) id: u64,");
     }
     
     #[test]

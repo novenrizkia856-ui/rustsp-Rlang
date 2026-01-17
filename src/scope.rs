@@ -564,6 +564,16 @@ impl ScopeAnalyzer {
         let mut in_function_signature = false;
         let mut current_function_line: Option<usize> = None;
         
+        //=====================================================================
+        // CRITICAL FIX: Track struct literal mode
+        // When inside a struct literal, `field = value` is NOT a variable assignment!
+        // We track depth of struct literals separately from code blocks.
+        //
+        // struct_literal_depth > 0 means we're inside a struct literal and should
+        // NOT treat `field = value` as variable assignment.
+        //=====================================================================
+        let mut struct_literal_depth: usize = 0;
+        
         for (line_num, line) in lines.iter().enumerate() {
             let clean = strip_comment(line);
             let trimmed = clean.trim();
@@ -587,6 +597,34 @@ impl ScopeAnalyzer {
             let is_closure = trimmed.contains("|") && 
                 (trimmed.contains("||") || (trimmed.matches('|').count() >= 2));
             
+            //=================================================================
+            // CRITICAL FIX: Detect struct literal start
+            // Patterns:
+            //   - `var = StructName {` (assignment)
+            //   - `Some(StructName {` (function call containing struct)
+            //   - `StructName {` (bare return expression)
+            //   - `vec![StructName {` (macro call)
+            //   - Match arm: `Pattern { ... } {` followed by struct
+            //
+            // A struct literal starts when:
+            //   1. Line contains `{`
+            //   2. NOT a control flow statement
+            //   3. NOT a function/impl/trait/mod/enum/struct definition
+            //   4. Has a PascalCase identifier before `{`
+            //=================================================================
+            let is_struct_literal_start = detect_struct_literal_start(trimmed) 
+                && !is_control_flow_line 
+                && !is_function_def
+                && !is_closure
+                && !trimmed.starts_with("impl ")
+                && !trimmed.starts_with("trait ")
+                && !trimmed.starts_with("mod ")
+                && !trimmed.starts_with("pub mod ")
+                && !trimmed.starts_with("struct ")
+                && !trimmed.starts_with("pub struct ")
+                && !trimmed.starts_with("enum ")
+                && !trimmed.starts_with("pub enum ");
+            
             // NEW: Extract function parameters
             if is_function_def {
                 in_function_signature = true;
@@ -604,6 +642,20 @@ impl ScopeAnalyzer {
             let opens = trimmed.matches('{').count();
             let closes = trimmed.matches('}').count();
             
+            //=================================================================
+            // CRITICAL FIX: Update struct_literal_depth for closing braces
+            // Decrement depth for each `}` that closes a struct literal
+            //=================================================================
+            if struct_literal_depth > 0 {
+                // Each close potentially closes a struct literal
+                // But we need to be careful: some closes might be from match arms
+                for _ in 0..closes {
+                    if struct_literal_depth > 0 {
+                        struct_literal_depth -= 1;
+                    }
+                }
+            }
+            
             // Pop for leading `}` BEFORE checking control flow
             let leading_closes = if trimmed.starts_with('}') {
                 let mut count = 0;
@@ -620,40 +672,64 @@ impl ScopeAnalyzer {
                 stack.pop();
             }
             
+            //=================================================================
+            // CRITICAL FIX: SKIP parse_assignment when inside struct literal
+            // Inside struct literals, `field = value` is a field initialization,
+            // NOT a variable assignment!
+            //=================================================================
+            let should_parse_assignment = struct_literal_depth == 0;
+            
             // Parse assignment AFTER handling leading closes
-            if let Some((var_name, var_type, value, is_outer)) = parse_assignment(trimmed) {
-                let inferred = var_type.clone().or_else(|| infer_type(&value));
-                
-                // Use different analysis for outer vs regular assignment
-                let kind = if is_outer {
-                    analyze_outer_assignment(&stack, &var_name)
-                } else {
-                    analyze_assignment(&stack, &var_name, &inferred)
-                };
-                
-                match kind {
-                    AssignKind::NewDecl => {
-                        stack.declare(&var_name, inferred, line_num);
-                        self.decl_lines.insert(line_num, (var_name, false));
+            if should_parse_assignment {
+                if let Some((var_name, var_type, value, is_outer)) = parse_assignment(trimmed) {
+                    let inferred = var_type.clone().or_else(|| infer_type(&value));
+                    
+                    // Use different analysis for outer vs regular assignment
+                    let kind = if is_outer {
+                        analyze_outer_assignment(&stack, &var_name)
+                    } else {
+                        analyze_assignment(&stack, &var_name, &inferred)
+                    };
+                    
+                    match kind {
+                        AssignKind::NewDecl => {
+                            stack.declare(&var_name, inferred, line_num);
+                            self.decl_lines.insert(line_num, (var_name, false));
+                        }
+                        AssignKind::Shadow => {
+                            stack.declare(&var_name, inferred, line_num);
+                            self.decl_lines.insert(line_num, (var_name, true));
+                        }
+                        AssignKind::Mutation { decl_line } => {
+                            stack.mark_mut(&var_name, decl_line);
+                            self.mut_vars.insert((var_name.clone(), decl_line), true);
+                            self.mut_lines.insert(line_num, (var_name, decl_line));
+                        }
+                        AssignKind::OuterMutation { decl_line } => {
+                            stack.mark_mut(&var_name, decl_line);
+                            self.mut_vars.insert((var_name.clone(), decl_line), true);
+                            self.mut_lines.insert(line_num, (var_name, decl_line));
+                            self.outer_lines.insert(line_num, true);
+                        }
+                        AssignKind::OuterError(msg) => {
+                            eprintln!("// COMPILE ERROR at line {}: {}", line_num + 1, msg);
+                        }
                     }
-                    AssignKind::Shadow => {
-                        stack.declare(&var_name, inferred, line_num);
-                        self.decl_lines.insert(line_num, (var_name, true));
-                    }
-                    AssignKind::Mutation { decl_line } => {
-                        stack.mark_mut(&var_name, decl_line);
-                        self.mut_vars.insert((var_name.clone(), decl_line), true);
-                        self.mut_lines.insert(line_num, (var_name, decl_line));
-                    }
-                    AssignKind::OuterMutation { decl_line } => {
-                        stack.mark_mut(&var_name, decl_line);
-                        self.mut_vars.insert((var_name.clone(), decl_line), true);
-                        self.mut_lines.insert(line_num, (var_name, decl_line));
-                        self.outer_lines.insert(line_num, true);
-                    }
-                    AssignKind::OuterError(msg) => {
-                        eprintln!("// COMPILE ERROR at line {}: {}", line_num + 1, msg);
-                    }
+                }
+            }
+            
+            //=================================================================
+            // CRITICAL FIX: Update struct_literal_depth for opening braces
+            // Increment depth for each `{` that starts a struct literal
+            //=================================================================
+            if is_struct_literal_start {
+                // This line starts a struct literal
+                struct_literal_depth += opens;
+            } else if struct_literal_depth > 0 && opens > 0 {
+                // Already inside struct literal, nested struct opens more
+                // Check if this line also contains a nested struct start
+                if detect_struct_literal_start(trimmed) {
+                    struct_literal_depth += opens;
                 }
             }
             
@@ -862,6 +938,153 @@ fn is_valid_ident(s: &str) -> bool {
         return false;
     }
     s.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+//=============================================================================
+// STRUCT LITERAL DETECTION
+// Detect when a line starts a struct literal expression.
+// This is CRITICAL for correctly handling nested struct literals where
+// `field = value` should NOT be treated as variable assignment.
+//=============================================================================
+
+/// Detect if a line starts a struct literal.
+/// 
+/// Returns true for patterns like:
+///   - `var = StructName {` (assignment to struct literal)
+///   - `Some(StructName {` (function call containing struct)
+///   - `StructName {` (bare struct literal, e.g., return expression)
+///   - `vec![StructName {` (macro call containing struct)
+///   - `Enum::Variant {` (enum variant with struct fields)
+///
+/// Returns false for:
+///   - `if condition {` (control flow)
+///   - `fn name() {` (function definition)
+///   - `impl Trait {` (impl block)
+///   - `struct Name {` (struct definition)
+///   - etc.
+fn detect_struct_literal_start(line: &str) -> bool {
+    let trimmed = line.trim();
+    
+    // Must contain `{` to potentially start a struct literal
+    if !trimmed.contains('{') {
+        return false;
+    }
+    
+    // Find the position of `{`
+    let brace_pos = match trimmed.find('{') {
+        Some(pos) => pos,
+        None => return false,
+    };
+    
+    // Get the part before `{`
+    let before_brace = trimmed[..brace_pos].trim();
+    
+    // Empty before brace (just `{`) - this is a bare block, not struct literal
+    if before_brace.is_empty() {
+        return false;
+    }
+    
+    // Check for match arm pattern: `Pattern { destructure } {`
+    // This is tricky - the `{` after destructure is a code block, not struct literal
+    // But `Pattern {` might be followed by struct field initialization
+    
+    // Find the identifier before `{` - it might be:
+    //   1. `StructName` in `var = StructName {`
+    //   2. `StructName` in `Some(StructName {`
+    //   3. `StructName` in bare `StructName {`
+    //   4. `Variant` in `Enum::Variant {`
+    
+    // Extract the name/path right before `{`
+    let name_before_brace = extract_name_before_brace(before_brace);
+    
+    if let Some(name) = name_before_brace {
+        // Check if it looks like a struct name (PascalCase) or enum path
+        if is_pascal_case(&name) || name.contains("::") {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Extract the identifier/path immediately before `{`
+/// 
+/// Examples:
+///   - `var = StructName` -> Some("StructName")
+///   - `Some(StructName` -> Some("StructName")
+///   - `vec![StructName` -> Some("StructName")
+///   - `Enum::Variant` -> Some("Enum::Variant")
+///   - `if condition` -> Some("condition") (but not PascalCase)
+fn extract_name_before_brace(before_brace: &str) -> Option<String> {
+    let trimmed = before_brace.trim();
+    
+    if trimmed.is_empty() {
+        return None;
+    }
+    
+    // Check for assignment pattern: `var = StructName`
+    if let Some(eq_pos) = trimmed.rfind('=') {
+        // Make sure it's not == or !=
+        let before_eq = &trimmed[..eq_pos];
+        if !before_eq.ends_with('!') && !before_eq.ends_with('=') {
+            let after_eq = trimmed[eq_pos + 1..].trim();
+            if !after_eq.is_empty() {
+                return Some(after_eq.to_string());
+            }
+        }
+    }
+    
+    // Check for function call pattern: `Some(StructName` or `vec![StructName`
+    // Find the last `(` or `[` and get what's after it
+    let last_open = trimmed.rfind(|c| c == '(' || c == '[');
+    if let Some(pos) = last_open {
+        let after_open = trimmed[pos + 1..].trim();
+        if !after_open.is_empty() {
+            return Some(after_open.to_string());
+        }
+    }
+    
+    // Bare struct literal: just `StructName` or `Enum::Variant`
+    // Get the last word/path
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if let Some(last) = words.last() {
+        return Some(last.to_string());
+    }
+    
+    None
+}
+
+/// Check if a string is PascalCase (starts with uppercase)
+fn is_pascal_case(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    
+    // Handle enum paths like Enum::Variant
+    let name = if s.contains("::") {
+        s.split("::").last().unwrap_or(s)
+    } else {
+        s
+    };
+    
+    // CRITICAL FIX: Check if name is empty after split
+    // This can happen with edge cases like "Foo::" where last() returns ""
+    if name.is_empty() {
+        return false;
+    }
+    
+    // Must start with uppercase letter
+    let first = match name.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    
+    if !first.is_uppercase() {
+        return false;
+    }
+    
+    // Rest should be alphanumeric or underscore
+    name.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// NEW: Extract function parameters from signature

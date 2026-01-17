@@ -1628,8 +1628,25 @@ impl AntiFailLogicChecker {
         // We track struct_literal_depth to handle multiline cases
         // ═══════════════════════════════════════════════════════════════════════
         
-        // Handle closes first for struct literal depth tracking
-        if closes > 0 && self.in_struct_literal_depth > 0 {
+        // ═══════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX: Handle struct literal depth CORRECTLY
+        // 
+        // BUG WAS: Decrementing depth for ALL closing braces, including those
+        //          from single-line balanced struct literals like:
+        //          `blobs = vec![BlobRef { hash = x }]`
+        //          This incorrectly reset depth to 0 while still inside an outer
+        //          multiline struct literal!
+        //
+        // FIX: Only decrement depth for closing braces that are NOT part of
+        //      single-line balanced struct literals.
+        // ═══════════════════════════════════════════════════════════════════════
+        
+        // For single-line balanced struct literals, don't change depth at all
+        let is_balanced_single_line = is_struct_literal_single && opens == closes && opens > 0;
+        
+        // Handle closes for struct literal depth tracking
+        // BUT SKIP for single-line balanced struct literals - they don't affect the depth!
+        if closes > 0 && self.in_struct_literal_depth > 0 && !is_balanced_single_line {
             self.in_struct_literal_depth = self.in_struct_literal_depth.saturating_sub(closes);
         }
         
