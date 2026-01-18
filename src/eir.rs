@@ -267,14 +267,46 @@ impl EffectContext {
         let mut panic_functions = HashSet::new();
         
         // Standard library I/O
-        for name in &["println", "print", "eprintln", "eprint", "writeln", "write"] {
+        // IMPROVED: Added more comprehensive I/O patterns
+        for name in &[
+            // Console I/O
+            "println", "print", "eprintln", "eprint", "writeln", "write",
+            // File/Stream I/O (method names that indicate I/O)
+            "read", "read_exact", "read_to_string", "read_to_end",
+            "write_all", "flush",
+        ] {
             io_functions.insert(name.to_string());
         }
         
         // Standard library allocations
-        for name in &["Vec::new", "Vec::with_capacity", "String::new", "String::from",
-                      "Box::new", "Rc::new", "Arc::new", "HashMap::new", "HashSet::new",
-                      "vec", "to_string", "to_owned", "clone", "collect"] {
+        // CRITICAL FIX: Removed `clone` and `collect` from this list.
+        // 
+        // Reason for removing `clone`:
+        //   `.clone()` on Copy types (i32, u64, bool, char, etc.) does NOT
+        //   allocate memory - it just copies bits. Only `.clone()` on heap-
+        //   allocated types (String, Vec, Box, etc.) performs allocation.
+        //   Since we can't determine the type at this stage, including `clone`
+        //   causes many false positives.
+        //
+        // Reason for removing `collect`:
+        //   `.collect()` can produce various outputs, some don't allocate.
+        //
+        // For strict effect tracking, users can explicitly declare `effects(alloc)`.
+        for name in &[
+            // Explicit constructors - definite heap allocation
+            "Vec::new", "Vec::with_capacity",
+            "String::new", "String::from", "String::with_capacity",
+            "Box::new", "Rc::new", "Arc::new",
+            "HashMap::new", "HashMap::with_capacity",
+            "HashSet::new", "HashSet::with_capacity",
+            "BTreeMap::new", "BTreeSet::new",
+            "VecDeque::new", "LinkedList::new", "BinaryHeap::new",
+            // Macros that allocate
+            "vec", "format",
+            // Methods that definitely allocate new heap memory
+            "to_string", "to_owned", "to_vec",
+            "into_boxed_slice", "into_boxed_str",
+        ] {
             alloc_functions.insert(name.to_string());
         }
         
@@ -378,18 +410,42 @@ impl<'a> EffectInference<'a> {
             // FUNCTION CALL
             HirExpr::Call { target, args } => self.infer_call(target, args),
             
-            // STRUCT LITERAL: alloc + field effects
+            // STRUCT LITERAL: propagate field effects only
+            // CRITICAL FIX: Struct literals do NOT always allocate!
+            //
+            // Structs in Rust are stack-allocated by default:
+            //   let point = Point { x: 0, y: 0 };  // Stack allocated!
+            //
+            // Heap allocation only happens explicitly:
+            //   let point = Box::new(Point { x: 0, y: 0 });  // Heap via Box
+            //   let points = vec![Point { x: 0, y: 0 }];     // Heap via Vec
+            //
+            // Therefore, struct construction itself is NOT an alloc effect.
+            // Alloc effect comes from Box::new, Vec::new, etc. which wrap it.
             HirExpr::Struct { fields, .. } => {
-                let mut effects = EffectSet::singleton(Effect::Alloc);
+                let mut effects = EffectSet::new();  // No automatic alloc!
                 for (_, e) in fields {
                     effects.extend(&self.infer_expr(e));
                 }
                 effects
             }
             
-            // TUPLE/ARRAY: alloc + element effects
+            // TUPLE/ARRAY: propagate element effects only
+            // CRITICAL FIX: Tuples and fixed-size arrays are stack-allocated!
+            //
+            // Tuples are always stack-allocated:
+            //   let pair = (1, 2);  // Stack allocated!
+            //
+            // Fixed-size arrays are also stack-allocated:
+            //   let arr = [1, 2, 3];  // Stack allocated!
+            //
+            // Heap allocation only happens with Vec:
+            //   let vec = vec![1, 2, 3];  // Heap via vec! macro -> Vec::new
+            //
+            // The vec! macro is already tracked as alloc via "vec" in alloc_functions.
+            // Array/Tuple literals themselves are NOT alloc effects.
             HirExpr::Tuple(elems) | HirExpr::Array(elems) => {
-                let mut effects = EffectSet::singleton(Effect::Alloc);
+                let mut effects = EffectSet::new();  // No automatic alloc!
                 for e in elems {
                     effects.extend(&self.infer_expr(e));
                 }

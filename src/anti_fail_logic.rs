@@ -1018,23 +1018,74 @@ impl EffectAnalyzer {
         }
         
         // Fallback to pattern matching
+        // IMPROVED: Added comprehensive I/O patterns for various categories
         let io_patterns = [
+            // === CONSOLE I/O ===
             "println!", "print!", "eprintln!", "eprint!",
-            "std::io", "File::", "stdin()", "stdout()", "stderr()",
-            ".read(", ".write(", ".flush(",
+            "stdin()", "stdout()", "stderr()",
+            
+            // === FILE I/O ===
+            "std::io", "File::", "OpenOptions::",
+            ".read(", ".read_exact(", ".read_to_string(", ".read_to_end(",
+            ".write(", ".write_all(", ".flush(",
             "fs::read", "fs::write", "fs::create", "fs::open",
+            "fs::remove", "fs::rename", "fs::copy",
+            "fs::create_dir", "fs::remove_dir", "fs::read_dir",
+            "BufReader::", "BufWriter::",
+            
+            // === NETWORKING I/O ===
+            "TcpStream::", "TcpListener::", "UdpSocket::",
+            "std::net::", "ToSocketAddrs",
+            ".connect(", ".bind(", ".listen(", ".accept(",
+            ".send(", ".recv(", ".send_to(", ".recv_from(",
+            
+            // === ENVIRONMENT I/O ===
+            "std::env::var", "std::env::args", "std::env::current_dir",
+            "std::env::set_var", "std::env::remove_var",
+            "env::var", "env::args", "env::current_dir",
+            
+            // === PROCESS I/O ===
+            "std::process::", "Command::", "Child::",
+            ".spawn(", ".output(", ".status(",
+            
+            // === PATH OPERATIONS (may do filesystem checks) ===
+            ".canonicalize(", ".metadata(", ".symlink_metadata(",
+            ".exists()", ".is_file()", ".is_dir()",
         ];
         
         io_patterns.iter().any(|p| line.contains(p))
     }
     
     fn detect_alloc_effect(&self, line: &str) -> bool {
+        // CRITICAL FIX: Removed `.clone()` and `.collect()` from alloc patterns
+        //
+        // Reason for removing `.clone()`:
+        //   `.clone()` on Copy types (i32, u64, bool, char, etc.) does NOT
+        //   allocate memory - it just copies bits on the stack. Only `.clone()`
+        //   on heap-allocated types (String, Vec, Box, etc.) performs allocation.
+        //   Since we can't determine the type at this stage (no type inference),
+        //   including `.clone()` causes many false positives.
+        //
+        // Reason for removing `.collect()`:
+        //   `.collect()` can produce various outputs, some that don't allocate
+        //   (e.g., collecting into `()`, summing with `Sum`, etc.).
+        //
+        // For strict effect tracking, users can explicitly declare `effects(alloc)`
+        // when they know they're cloning heap types or collecting into containers.
         let alloc_patterns = [
+            // Explicit constructors - definite heap allocation
             "Vec::new", "Vec::with_capacity",
-            "String::new", "String::from", ".to_string()", ".to_owned()",
+            "String::new", "String::from", "String::with_capacity",
             "Box::new", "Rc::new", "Arc::new",
-            "HashMap::new", "HashSet::new", "BTreeMap::new", "BTreeSet::new",
-            "vec!", ".clone()", ".collect()",
+            "HashMap::new", "HashMap::with_capacity",
+            "HashSet::new", "HashSet::with_capacity",
+            "BTreeMap::new", "BTreeSet::new",
+            "VecDeque::new", "LinkedList::new", "BinaryHeap::new",
+            // Macros that allocate
+            "vec!", "format!",
+            // Methods that definitely allocate new heap memory
+            ".to_string()", ".to_owned()", ".to_vec()",
+            ".into_boxed_slice()", ".into_boxed_str()",
         ];
         
         alloc_patterns.iter().any(|p| line.contains(p))
@@ -1214,21 +1265,70 @@ impl EffectAnalyzer {
     }
     
     fn is_keyword_or_macro(&self, name: &str) -> bool {
-        let keywords = [
+        // CRITICAL FIX: Separated keywords from type constructors
+        //
+        // Type constructors like String::from(), Vec::new(), etc. are VALID function
+        // calls that should be tracked for effect analysis. Including them here would
+        // prevent proper effect tracking.
+        //
+        // This list should ONLY contain:
+        // 1. Rust keywords (cannot be function names)
+        // 2. Macros (have ! in actual usage, but we check the base name)
+        // 3. Boolean literals
+        // 4. Option/Result variants (these are enum constructors, not functions)
+        
+        const KEYWORDS: &[&str] = &[
+            // Rust keywords
             "if", "else", "match", "while", "for", "loop", "fn", "let", "mut",
             "struct", "enum", "impl", "trait", "pub", "mod", "use", "return",
             "break", "continue", "where", "async", "await", "move", "ref",
-            "println", "print", "eprintln", "eprint", "vec", "format",
-            "panic", "assert", "assert_eq", "assert_ne", "debug_assert",
-            "Some", "None", "Ok", "Err", "true", "false",
-            "String", "Vec", "Box", "Rc", "Arc", "HashMap", "HashSet",
+            "const", "static", "type", "unsafe", "extern", "crate", "self",
+            "super", "dyn", "as", "in",
         ];
-        keywords.contains(&name)
+        
+        const MACROS: &[&str] = &[
+            // Common macros (base names without !)
+            "println", "print", "eprintln", "eprint", "dbg",
+            "vec", "format", "write", "writeln",
+            "panic", "assert", "assert_eq", "assert_ne",
+            "debug_assert", "debug_assert_eq", "debug_assert_ne",
+            "todo", "unimplemented", "unreachable",
+            "include_str", "include_bytes", "concat", "stringify",
+            "env", "cfg", "compile_error",
+        ];
+        
+        const SPECIAL_CONSTRUCTORS: &[&str] = &[
+            // Option/Result variants - these are enum constructors, not function calls
+            "Some", "None", "Ok", "Err",
+            // Boolean literals
+            "true", "false",
+        ];
+        
+        // NOTE: Intentionally NOT including type names like "String", "Vec", "Box",
+        // "Rc", "Arc", "HashMap", "HashSet" here because calls like String::from()
+        // or Vec::new() ARE function calls that need effect tracking!
+        
+        KEYWORDS.contains(&name) ||
+        MACROS.contains(&name) ||
+        SPECIAL_CONSTRUCTORS.contains(&name)
     }
     
     fn is_type_constructor(&self, name: &str) -> bool {
-        // Check if first char is uppercase (likely a type constructor)
-        name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+        // IMPROVED: More accurate type constructor detection
+        //
+        // We only want to skip PURE type constructors that don't have effects,
+        // NOT associated functions like String::from() or Vec::new().
+        //
+        // This function checks if `name` is a type name being used as a 
+        // constructor call, like `Point(1, 2)` for tuple structs.
+        //
+        // Associated functions (Type::method) are handled separately because
+        // the `::` causes the type name to be cleared before we see the method.
+        //
+        // For now, we're conservative and don't skip anything here.
+        // The effect detection will handle type-associated methods correctly
+        // through pattern matching on known allocating/IO/panic functions.
+        false
     }
     
     fn detect_closure_start(&self, line: &str) -> bool {

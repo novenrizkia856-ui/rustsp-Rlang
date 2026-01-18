@@ -215,22 +215,56 @@ pub fn detect_effects_from_source(
 }
 
 fn detect_io_pattern(line: &str) -> bool {
+    // IMPROVED: Added comprehensive I/O patterns
     let patterns = [
+        // Console I/O
         "println!", "print!", "eprintln!", "eprint!",
-        "std::io", "File::", "stdin()", "stdout()", "stderr()",
-        ".read(", ".write(", ".flush(",
+        "stdin()", "stdout()", "stderr()",
+        
+        // File I/O
+        "std::io", "File::", "OpenOptions::",
+        ".read(", ".read_exact(", ".read_to_string(", ".read_to_end(",
+        ".write(", ".write_all(", ".flush(",
         "fs::read", "fs::write", "fs::create", "fs::open",
+        "fs::remove", "fs::rename", "fs::copy",
+        "fs::create_dir", "fs::remove_dir", "fs::read_dir",
+        "BufReader::", "BufWriter::",
+        
+        // Networking I/O
+        "TcpStream::", "TcpListener::", "UdpSocket::",
+        "std::net::", ".connect(", ".bind(", ".listen(", ".accept(",
+        ".send(", ".recv(",
+        
+        // Environment I/O
+        "std::env::var", "std::env::args", "env::var", "env::args",
+        
+        // Process I/O
+        "std::process::", "Command::", ".spawn(", ".output(",
     ];
     patterns.iter().any(|p| line.contains(p))
 }
 
 fn detect_alloc_pattern(line: &str) -> bool {
+    // CRITICAL FIX: Removed `.clone()` and `.collect()` from patterns
+    //
+    // Reason: `.clone()` on Copy types does NOT allocate.
+    //         `.collect()` may not allocate depending on output type.
+    //
+    // For strict tracking, users should declare `effects(alloc)` explicitly.
     let patterns = [
+        // Explicit constructors - definite heap allocation
         "Vec::new", "Vec::with_capacity",
-        "String::new", "String::from", ".to_string()", ".to_owned()",
+        "String::new", "String::from", "String::with_capacity",
         "Box::new", "Rc::new", "Arc::new",
-        "HashMap::new", "HashSet::new", "BTreeMap::new", "BTreeSet::new",
-        "vec!", ".clone()", ".collect()",
+        "HashMap::new", "HashMap::with_capacity",
+        "HashSet::new", "HashSet::with_capacity",
+        "BTreeMap::new", "BTreeSet::new",
+        "VecDeque::new", "LinkedList::new", "BinaryHeap::new",
+        // Macros that allocate
+        "vec!", "format!",
+        // Methods that definitely allocate new heap memory
+        ".to_string()", ".to_owned()", ".to_vec()",
+        ".into_boxed_slice()", ".into_boxed_str()",
     ];
     patterns.iter().any(|p| line.contains(p))
 }
