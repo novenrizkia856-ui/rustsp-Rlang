@@ -248,8 +248,28 @@ fn needs_semicolon(trimmed: &str) -> bool {
         return false;
     }
     
-    if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with("*") {
+    if trimmed.starts_with("//") || trimmed.starts_with("/*") {
         return false;
+    }
+    
+    // CRITICAL FIX: Only skip block comment continuation lines like `* comment text`
+    // Do NOT skip dereference statements like `*bal = value` which NEED semicolons!
+    // Block comment continuation: `*` followed by space, end of line, or non-identifier char
+    // Dereference: `*` followed by identifier char (letter, _, etc.)
+    if trimmed.starts_with('*') {
+        // Check what follows the asterisk
+        let after_star = &trimmed[1..];
+        if after_star.is_empty() {
+            // Just `*` alone - block comment continuation
+            return false;
+        }
+        let first_char = after_star.chars().next().unwrap();
+        // If followed by space or another `*` or `/`, it's a comment
+        // If followed by letter/underscore, it's a dereference expression - needs semicolon!
+        if first_char == ' ' || first_char == '*' || first_char == '/' {
+            return false;
+        }
+        // Otherwise it's likely a dereference like `*bal = ...` - continue to return true
     }
     
     if trimmed.starts_with('#') { return false; }
