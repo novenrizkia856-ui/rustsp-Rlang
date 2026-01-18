@@ -623,13 +623,34 @@ Just as Rust has a borrow checker for memory, RustS+ has an effect checker for p
 
 ### Effect Types
 
-| Effect | Syntax | Description | Propagatable |
-|--------|--------|-------------|--------------|
-| `io` | `effects(io)` | I/O operations (println, read, write) | ✅ Yes |
-| `alloc` | `effects(alloc)` | Memory allocation (Vec::new, Box::new) | ✅ Yes |
-| `panic` | `effects(panic)` | May panic (unwrap, expect, panic!) | ✅ Yes |
-| `read(x)` | `effects(read x)` | Read from parameter x | ❌ No |
-| `write(x)` | `effects(write x)` | Write/mutate parameter x | ❌ No |
+| Effect | Syntax | Description | Propagatable | Examples |
+|--------|--------|-------------|--------------|----------|
+| `io` | `effects(io)` | I/O operations | ✅ Yes | `println!`, `File::open`, `TcpStream::connect`, `env::var` |
+| `alloc` | `effects(alloc)` | Heap memory allocation | ✅ Yes | `Vec::new()`, `Box::new()`, `String::from()`, `format!` |
+| `panic` | `effects(panic)` | May panic at runtime | ✅ Yes | `.unwrap()`, `.expect()`, `panic!`, `assert!` |
+| `read(x)` | `effects(read x)` | Read from parameter x | ❌ No | `x.field`, passing `x` to function |
+| `write(x)` | `effects(write x)` | Write/mutate parameter x | ❌ No | `x.field = value`, `*x = value` |
+
+#### Important Notes on Effect Detection
+
+**What IS detected as `alloc`:**
+- Explicit heap constructors: `Vec::new()`, `Box::new()`, `String::from()`, `HashMap::new()`
+- Allocating macros: `vec!`, `format!`
+- Methods that create new heap objects: `.to_string()`, `.to_owned()`, `.to_vec()`
+
+**What is NOT detected as `alloc` (by design):**
+- `.clone()` — Because cloning Copy types (i32, bool, etc.) doesn't allocate
+- `.collect()` — Because output type varies; may not allocate
+- Struct literals — `Point { x: 0, y: 0 }` is stack-allocated, not heap
+- Tuple literals — `(1, 2, 3)` is stack-allocated
+- Fixed arrays — `[1, 2, 3]` is stack-allocated
+
+**What IS detected as `io`:**
+- Console: `println!`, `print!`, `stdin()`, `stdout()`
+- File: `File::open`, `fs::read`, `fs::write`, `BufReader`
+- Network: `TcpStream::connect`, `UdpSocket::bind`, `.send()`, `.recv()`
+- Environment: `env::var`, `env::args`, `env::current_dir`
+- Process: `Command::new`, `.spawn()`, `.output()`
 
 ### Effect Lifecycle
 
@@ -672,27 +693,31 @@ RustS+ uses the Effect Inference Algorithm that runs on top of the HIR. Each exp
 
 | Expression/Statement | Inferred Effect | Reasoning |
 |---------------------|-------------------|----------|
-| `42`, `"hello"`, `true` | ∅ (none) | Literals produce no effect |
-| `x` (read variable) | `read(x)` | Reading a binding produces a read |
-| `w.field` | `read(w)` | Field access = read owner object |
+| `42`, `true` | ∅ (none) | Numeric/boolean literals produce no effect |
+| `"hello"` | ∅ (none) | String literals in code are static, not heap |
+| `x` (read param) | `read(x)` | Reading a parameter produces a read effect |
+| `x` (read local) | ∅ (none) | Reading a local variable has no effect |
+| `Point { x: 0, y: 0 }` | ∅ (none) | Struct literals are stack-allocated |
+| `(1, 2, 3)` | ∅ (none) | Tuple literals are stack-allocated |
+| `[1, 2, 3]` | ∅ (none) | Fixed array literals are stack-allocated |
+| `w.field` | `read(w)` if param | Field access = read owner object |
 | `w.field = 3` | `write(w)` | Field mutation = owner mutation |
 | `w = new_w` | ∅ (none) | Rebinding ≠ content mutation |
-| `println!(...)` | `io` | I/O operations (AST-level patterns) |
-| `Vec::new()` | `alloc` | Memory allocation |
+| `println!(...)` | `io` | I/O operations |
+| `Vec::new()` | `alloc` | Explicit heap allocation |
+| `Box::new(x)` | `alloc` | Explicit heap allocation |
+| `x.clone()` | ∅ (none)* | *May or may not allocate depending on type |
 | `.unwrap()` | `panic` | May panic |
-| `f(args...)` | `effects(f) ∪effects(args)` | Combined caller + callee |
-| `if c { a } else { b }` | `effects(c) ∪effects(a) ∪effects(b)` | Union of all branches |
+| `f(args...)` | `effects(f) ∪ effects(args)` | Combined caller + callee |
+| `if c { a } else { b }` | `effects(c) ∪ effects(a) ∪ effects(b)` | Union of all branches |
 
-**Key Insight:** A mutation to a **field** (`w.x = 3`) is treated as a mutation to the **owner object** (`write(w)`). This is because changing the field changes the *state* of the entire object.
+**Key Insights:**
 
-```rust
-fn update_balance(acc Account, delta i64) effects(write acc) Account {
-    // acc.balance = ... produces write(acc)
-    // because field mutation = owner mutation
-    acc.balance = acc.balance + delta
-    acc
-}
-```
+1. **Field Mutation = Owner Mutation:** A mutation to a **field** (`w.x = 3`) is treated as a mutation to the **owner object** (`write(w)`). This is because changing the field changes the *state* of the entire object.
+
+2. **Stack vs Heap:** Struct, tuple, and array literals are **stack-allocated** by default in Rust. Only explicit heap constructors (`Vec::new`, `Box::new`, etc.) produce `alloc` effects.
+
+3. **Conservative on `.clone()`:** The compiler does NOT automatically flag `.clone()` as alloc because cloning Copy types (i32, u64, bool) doesn't allocate. For strict tracking, declare `effects(alloc)` explicitly when cloning heap types.
 
 ### Effect Dependency Graph
 
@@ -718,6 +743,63 @@ RustS+ builds a **dependency graph** for cross-function effect analysis:
    │   (pure)     │
    └──────────────┘
 ```
+
+### Stack vs Heap: Why It Matters
+
+RustS+ distinguishes between **stack-allocated** and **heap-allocated** data structures. This is critical for accurate effect detection:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    MEMORY ALLOCATION IN RUST                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  STACK (No alloc effect)              HEAP (alloc effect)           │
+│  ─────────────────────                ──────────────────            │
+│  • Fixed-size, known at compile       • Dynamic size                │
+│  • Fast allocation (just move SP)     • Slower allocation           │
+│  • Automatic cleanup                  • Needs explicit management   │
+│                                                                      │
+│  Examples:                            Examples:                      │
+│  • let x = 42;                        • let v = Vec::new();         │
+│  • let p = Point { x: 0, y: 0 };      • let s = String::from("x"); │
+│  • let t = (1, 2, 3);                 • let b = Box::new(42);       │
+│  • let a = [1, 2, 3];                 • let v = vec![1, 2, 3];      │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Why RustS+ Doesn't Flag Struct Literals as `alloc`
+
+```rust
+// ✅ This is PURE - no alloc effect needed
+fn create_point() Point {
+    Point { x: 0, y: 0 }  // Stack-allocated!
+}
+
+// ✅ This REQUIRES alloc effect
+fn create_points() Vec[Point] effects(alloc) {
+    vec![
+        Point { x: 0, y: 0 },  // Point is stack, but Vec is heap
+        Point { x: 1, y: 1 },
+    ]
+}
+```
+
+#### The `.clone()` Dilemma
+
+```rust
+// ✅ No alloc - i32 is Copy, clone just copies bits
+fn double(x i32) i32 {
+    x.clone() + x  // No heap allocation!
+}
+
+// ⚠️ Alloc - String is heap type, clone allocates new heap memory
+fn duplicate(s String) String effects(alloc) {
+    s.clone()  // User declares alloc because they know String is heap
+}
+```
+
+**Philosophy:** RustS+ trusts the programmer to know their types. Rather than producing false positives for every `.clone()`, it requires explicit declaration when the programmer knows heap allocation occurs.
 
 ---
 
@@ -1392,27 +1474,76 @@ pub fn strip_effects_clause(sig: &str) -> String {
 ### Effect Detection Implementation
 
 ```rust
-// Effect detection patterns
-fn detect_io_effect(line: &str) -> bool {
-    line.contains("println!") ||
-    line.contains("print!") ||
-    line.contains("eprintln!") ||
-    // ... more patterns
-}
+// Effect detection patterns - ACCURATE VERSION
+// Note: Detection is conservative to avoid false positives
 
-fn detect_write_effect(line: &str, param: &str) -> bool {
-    // param.field = value
-    let pattern = format!("{}.* =", param);
-    // ... regex matching
+fn detect_io_effect(line: &str) -> bool {
+    let io_patterns = [
+        // Console I/O
+        "println!", "print!", "eprintln!", "eprint!",
+        "stdin()", "stdout()", "stderr()",
+        // File I/O
+        "File::", "fs::read", "fs::write", "fs::open",
+        "BufReader::", "BufWriter::",
+        // Network I/O
+        "TcpStream::", "TcpListener::", "UdpSocket::",
+        ".connect(", ".bind(", ".listen(",
+        // Environment I/O
+        "env::var", "env::args",
+        // Process I/O
+        "Command::", ".spawn(", ".output(",
+    ];
+    io_patterns.iter().any(|p| line.contains(p))
 }
 
 fn detect_alloc_effect(line: &str) -> bool {
-    line.contains("Vec::new") ||
-    line.contains("Box::new") ||
-    line.contains("String::new") ||
-    // ... more patterns
+    // IMPORTANT: .clone() and .collect() are NOT included!
+    // - .clone() on Copy types doesn't allocate
+    // - .collect() output varies
+    // For strict tracking, declare effects(alloc) explicitly
+    let alloc_patterns = [
+        "Vec::new", "Vec::with_capacity",
+        "String::new", "String::from", "String::with_capacity",
+        "Box::new", "Rc::new", "Arc::new",
+        "HashMap::new", "HashSet::new", "BTreeMap::new",
+        "vec!", "format!",
+        ".to_string()", ".to_owned()", ".to_vec()",
+    ];
+    alloc_patterns.iter().any(|p| line.contains(p))
+}
+
+fn detect_panic_effect(line: &str) -> bool {
+    let panic_patterns = [
+        "panic!", ".unwrap()", ".expect(",
+        "assert!", "assert_eq!", "assert_ne!",
+        "unreachable!", "unimplemented!", "todo!",
+    ];
+    panic_patterns.iter().any(|p| line.contains(p))
+}
+
+fn detect_write_effect(line: &str, param: &str) -> bool {
+    // Detects: param.field = value
+    // Does NOT detect: field = param.value (struct field init)
+    let pattern = format!("{}.", param);
+    if line.contains(&pattern) {
+        // Check for assignment after field access
+        // ... field mutation detection logic
+    }
+    false
 }
 ```
+
+#### What's NOT Detected (By Design)
+
+| Pattern | Why Not Detected |
+|---------|------------------|
+| `.clone()` | Copy types don't allocate; user declares if needed |
+| `.collect()` | Output type varies; may not allocate |
+| `Point { x: 0 }` | Stack-allocated struct literal |
+| `(1, 2, 3)` | Stack-allocated tuple |
+| `[1, 2, 3]` | Stack-allocated fixed array |
+
+This conservative approach **eliminates false positives** while maintaining strict effect tracking for definite effects.
 
 ### Scope Analysis Algorithm
 
