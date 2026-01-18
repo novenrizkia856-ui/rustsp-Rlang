@@ -120,6 +120,15 @@ fn transform_generic_brackets(type_str: &str) -> String {
         "Serialize", "Deserialize",
         // Common external crates
         "Lazy", "OnceCell", "OnceLock",
+        // Chrono date/time types (CRITICAL for DateTime[Utc], etc.)
+        "DateTime", "NaiveDateTime", "NaiveDate", "NaiveTime",
+        "Date", "Local", "FixedOffset",
+        // Tokio/async types
+        "JoinHandle", "Receiver", "Sender", "UnboundedReceiver", "UnboundedSender",
+        // Common Result/Error wrappers
+        "anyhow", "Error",
+        // Parking lot types
+        "RwLockReadGuard", "RwLockWriteGuard", "MutexGuard",
     ];
     
     let mut result = trimmed.to_string();
