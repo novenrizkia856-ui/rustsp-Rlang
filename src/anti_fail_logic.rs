@@ -382,6 +382,21 @@ pub fn extract_assignment_target(line: &str) -> String {
     // Get left side of =
     let left_side = trimmed[..eq_pos].trim();
     
+    // ═══════════════════════════════════════════════════════════════════════
+    // CRITICAL FIX: Skip FIELD ACCESS like `obj.field = value`
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // `res.ok = false` is a FIELD MUTATION, not a variable assignment!
+    // - It does NOT create a new variable `res`
+    // - It does NOT shadow outer variable `res`
+    // - It mutates the `ok` field of existing variable `res`
+    //
+    // This should be handled by mutation tracking, not assignment tracking.
+    // ═══════════════════════════════════════════════════════════════════════
+    if left_side.contains('.') {
+        return String::new();
+    }
+    
     // If left side contains `::`, it's NOT an assignment target
     // (it's a struct field init like `Tx::Variant { field = value }`)
     if left_side.contains("::") {
@@ -727,6 +742,9 @@ struct Scope {
     active_effects: HashSet<Effect>,
     /// Is this a closure/lambda scope?
     is_closure: bool,
+    /// CRITICAL FIX: Is this a control flow scope (if/while/for/match)?
+    /// Control flow scopes allow mutation of outer variables without `outer` keyword
+    is_control_flow: bool,
 }
 
 impl Scope {
@@ -739,7 +757,14 @@ impl Scope {
             start_line,
             active_effects: HashSet::new(),
             is_closure: false,
+            is_control_flow: false,
         }
+    }
+    
+    fn new_control_flow(depth: usize, is_expression_context: bool, start_line: usize) -> Self {
+        let mut scope = Scope::new(depth, is_expression_context, start_line);
+        scope.is_control_flow = true;
+        scope
     }
     
     fn new_closure(depth: usize, start_line: usize) -> Self {
@@ -1473,6 +1498,18 @@ pub struct AntiFailLogicChecker {
     function_depth: usize,
     strict_mode: bool,
     
+    // CRITICAL FIX: Track scope level when entering function
+    // This is used to properly reset scopes when exiting function
+    function_scope_level: usize,
+    
+    // CRITICAL FIX: Track if function body `{` has been seen
+    // For multi-line signatures like:
+    //   pub fn foo(
+    //       param: Type
+    //   ) Self {       <-- function body starts HERE, not at "pub fn foo("
+    // We need to update function_depth when we see this `{`
+    function_body_started: bool,
+    
     // Effect system
     function_table: HashMap<String, FunctionInfo>,
     current_function_info: Option<FunctionInfo>,
@@ -1502,6 +1539,8 @@ impl AntiFailLogicChecker {
             in_function: false,
             function_depth: 0,
             strict_mode: true,
+            function_scope_level: 0,
+            function_body_started: false,
             function_table: HashMap::new(),
             current_function_info: None,
             effect_analyzer: EffectAnalyzer::new(),
@@ -1679,7 +1718,27 @@ impl AntiFailLogicChecker {
             let is_control_flow = self.check_control_flow_start(trimmed, line_num);
             let is_closure = self.detect_closure(trimmed);
             
-            if is_closure {
+            // ═══════════════════════════════════════════════════════════════════════
+            // CRITICAL FIX: Handle multi-line function signatures
+            // ═══════════════════════════════════════════════════════════════════════
+            //
+            // For multi-line signatures like:
+            //   pub fn foo(        <-- enter_function() called, function_body_started = false
+            //       param: Type
+            //   ) Self {           <-- This `{` is the function body opener!
+            //
+            // When we see the function body `{`:
+            // 1. Set function_body_started = true
+            // 2. Update function_depth to include this brace
+            // 3. Do NOT create an extra scope (function scope already exists)
+            // ═══════════════════════════════════════════════════════════════════════
+            
+            if !self.function_body_started && !is_closure && !is_control_flow {
+                // This `{` is the function body opener for a multi-line signature
+                self.function_body_started = true;
+                self.function_depth = self.brace_depth + opens;
+                // Do NOT create scope - function scope was already created in enter_function()
+            } else if is_closure {
                 self.effect_analyzer.enter_closure(self.brace_depth + opens, line_num);
             } else if !is_control_flow && !self.is_definition(trimmed) && 
                       !is_struct_literal_single && !is_struct_literal_start &&
@@ -1796,7 +1855,33 @@ impl AntiFailLogicChecker {
     
     fn enter_function(&mut self, line_num: usize, opens: usize, line: &str) {
         self.in_function = true;
-        self.function_depth = self.brace_depth + opens;
+        
+        // CRITICAL FIX: Handle multi-line function signatures
+        // 
+        // For single-line: `pub fn foo() {`
+        //   → opens = 1, function_body_started = true
+        //   → function_depth = brace_depth + 1
+        //
+        // For multi-line: `pub fn foo(`
+        //   → opens = 0, function_body_started = false
+        //   → function_depth will be set later when we see `{`
+        //
+        self.function_body_started = opens > 0;
+        
+        if opens > 0 {
+            // Single-line function: `{` is on the same line
+            self.function_depth = self.brace_depth + opens;
+        } else {
+            // Multi-line function: `{` will come later
+            // Set function_depth to current brace_depth for now
+            // It will be updated when we see the body `{`
+            self.function_depth = self.brace_depth;
+        }
+        
+        // CRITICAL FIX: Record scope level BEFORE entering function scope
+        // This is used to properly pop scopes when exiting function
+        self.function_scope_level = self.scopes.len();
+        
         self.enter_scope(false, line_num);
         
         // Extract function name and setup effect analyzer
@@ -1825,6 +1910,18 @@ impl AntiFailLogicChecker {
         self.function_depth = 0;
         self.function_vars.clear();
         self.reassigned_vars.clear();
+        self.function_body_started = false;  // CRITICAL FIX: Reset for next function
+        
+        // CRITICAL FIX: Pop all scopes that were pushed inside this function
+        // This prevents cross-function variable leakage
+        while self.scopes.len() > self.function_scope_level {
+            self.scopes.pop();
+        }
+        self.function_scope_level = 0;
+        
+        // CRITICAL FIX: Reset struct literal depth when exiting function
+        // Any unclosed struct literals from this function should be reset
+        self.in_struct_literal_depth = 0;
     }
     
     //=========================================================================
@@ -2444,6 +2541,64 @@ impl AntiFailLogicChecker {
     fn is_struct_literal_start(&self, line: &str) -> bool {
         let trimmed = line.trim();
         
+        // ═══════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX: Exclude function body openers from struct literal detection
+        // ═══════════════════════════════════════════════════════════════════════
+        //
+        // Lines like `) Self {` or `) Result[T] {` are function return type + body,
+        // NOT struct literals! "Self" is uppercase but this is a function body opener.
+        //
+        // Patterns to EXCLUDE:
+        // - `) Self {`           - multi-line fn signature ending
+        // - `) ReturnType {`     - multi-line fn signature ending  
+        // - `) -> ReturnType {`  - Rust-style return type
+        // - `fn name(...) {`     - single-line function
+        // - `pub fn name(...) {` - single-line public function
+        // - `impl Block {`       - impl block
+        // - `struct Foo {`       - struct definition
+        // - `enum Foo {`         - enum definition
+        // - `trait Foo {`        - trait definition
+        // ═══════════════════════════════════════════════════════════════════════
+        
+        // Lines starting with `)` are function body openers, not struct literals
+        if trimmed.starts_with(')') {
+            return false;
+        }
+        
+        // Lines containing `fn ` are function definitions
+        if trimmed.contains("fn ") {
+            return false;
+        }
+        
+        // CRITICAL FIX: Exclude impl/struct/enum/trait/mod definitions
+        // These have PascalCase names but are NOT struct literals!
+        if trimmed.starts_with("impl ") || trimmed.starts_with("impl<") {
+            return false;
+        }
+        if trimmed.starts_with("struct ") || trimmed.starts_with("pub struct ") {
+            return false;
+        }
+        if trimmed.starts_with("enum ") || trimmed.starts_with("pub enum ") {
+            return false;
+        }
+        if trimmed.starts_with("trait ") || trimmed.starts_with("pub trait ") {
+            return false;
+        }
+        if trimmed.starts_with("mod ") || trimmed.starts_with("pub mod ") {
+            return false;
+        }
+        if trimmed.starts_with("union ") || trimmed.starts_with("pub union ") {
+            return false;
+        }
+        
+        // Lines with `->` before `{` are function return types (Rust syntax)
+        if let Some(brace_pos) = trimmed.find('{') {
+            let before_brace = &trimmed[..brace_pos];
+            if before_brace.contains("->") {
+                return false;
+            }
+        }
+        
         // Must contain `{` but NOT `}` (multiline start)
         let has_open = trimmed.contains('{');
         let has_close = trimmed.contains('}');
@@ -2464,6 +2619,17 @@ impl AntiFailLogicChecker {
         }
         
         let before_brace = trimmed[..brace_pos].trim();
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX: Check for assignment pattern BEFORE struct name
+        // ═══════════════════════════════════════════════════════════════════════
+        //
+        // For `header = BlockHeader {`, we need to identify that:
+        // 1. There's an assignment (`header = `)
+        // 2. The struct name is `BlockHeader`, not `header`
+        //
+        // We should look for `= TypeName {` pattern
+        // ═══════════════════════════════════════════════════════════════════════
         
         // Check if there's a type name before `{`
         if let Some(last_word) = before_brace.split_whitespace().last() {
@@ -2500,14 +2666,69 @@ impl AntiFailLogicChecker {
     /// - `[Type { field = value }, ...]` (struct in array)
     ///
     /// These should NOT create new scope for variable tracking.
+    /// 
+    /// CRITICAL: This function detects SINGLE-LINE struct literals only!
+    /// For multiline struct literals like:
+    ///   header = BlockHeader {
+    ///       field = value
+    ///   }
+    /// Use is_struct_literal_start() instead, which returns TRUE for the opening line.
     fn is_struct_or_enum_literal(&self, line: &str) -> bool {
         let trimmed = line.trim();
         
-        // Must contain both `{` and `}` to be a complete literal on one line
+        // ═══════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX: Exclude function body openers (same as is_struct_literal_start)
+        // ═══════════════════════════════════════════════════════════════════════
+        if trimmed.starts_with(')') {
+            return false;
+        }
+        if trimmed.contains("fn ") {
+            return false;
+        }
+        
+        // CRITICAL FIX: Exclude impl/struct/enum/trait/mod definitions
+        if trimmed.starts_with("impl ") || trimmed.starts_with("impl<") {
+            return false;
+        }
+        if trimmed.starts_with("struct ") || trimmed.starts_with("pub struct ") {
+            return false;
+        }
+        if trimmed.starts_with("enum ") || trimmed.starts_with("pub enum ") {
+            return false;
+        }
+        if trimmed.starts_with("trait ") || trimmed.starts_with("pub trait ") {
+            return false;
+        }
+        if trimmed.starts_with("mod ") || trimmed.starts_with("pub mod ") {
+            return false;
+        }
+        if trimmed.starts_with("union ") || trimmed.starts_with("pub union ") {
+            return false;
+        }
+        
+        if let Some(brace_pos) = trimmed.find('{') {
+            let before_brace = &trimmed[..brace_pos];
+            if before_brace.contains("->") {
+                return false;
+            }
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX: Must contain BOTH `{` AND `}` to be a single-line literal!
+        // ═══════════════════════════════════════════════════════════════════════
+        // 
+        // This is the key distinction between:
+        //   - Single-line: `x = Type { field = value }` (has both { and })
+        //   - Multiline start: `x = Type {` (has { but NOT })
+        //
+        // For multiline starts, is_struct_literal_start() handles detection,
+        // and in_struct_literal_depth tracks the nested field lines.
+        // ═══════════════════════════════════════════════════════════════════════
         let has_open = trimmed.contains('{');
         let has_close = trimmed.contains('}');
         
-        if !has_open {
+        // Must have BOTH open AND close braces to be a single-line literal
+        if !has_open || !has_close {
             return false;
         }
         
@@ -2523,6 +2744,15 @@ impl AntiFailLogicChecker {
         }
         
         let before_brace = &trimmed[..brace_pos].trim();
+        
+        // Check brace balance - must be balanced for single-line literal
+        let open_count = trimmed.chars().filter(|c| *c == '{').count();
+        let close_count = trimmed.chars().filter(|c| *c == '}').count();
+        
+        if open_count != close_count {
+            // Unbalanced - this is NOT a complete single-line literal
+            return false;
+        }
         
         // Pattern 1: `= Type {` or `= SomeType {` (assignment with struct literal)
         // The part before `{` should end with a type name (uppercase)
@@ -2549,19 +2779,9 @@ impl AntiFailLogicChecker {
         }
         
         // Pattern 2: Complete literal on one line with matching braces
-        // If both `{` and `}` exist and they're balanced, likely a literal
-        if has_close {
-            let open_count = trimmed.chars().filter(|c| *c == '{').count();
-            let close_count = trimmed.chars().filter(|c| *c == '}').count();
-            
-            // If perfectly balanced on one line, it's a literal
-            if open_count == close_count && open_count > 0 {
-                // Extra check: make sure there's something before `{`
-                // and it's not just whitespace
-                if !before_brace.is_empty() {
-                    return true;
-                }
-            }
+        // Already checked balance above, so just verify there's content before `{`
+        if !before_brace.is_empty() {
+            return true;
         }
         
         false
@@ -2701,6 +2921,13 @@ impl AntiFailLogicChecker {
     fn enter_scope(&mut self, is_expression_context: bool, line_num: usize) {
         let new_depth = self.scopes.len();
         self.scopes.push(Scope::new(new_depth, is_expression_context, line_num));
+    }
+    
+    /// Enter a control flow scope (if/while/for/match)
+    /// Control flow scopes allow mutation of outer variables without `outer` keyword
+    fn enter_control_flow_scope(&mut self, is_expression_context: bool, line_num: usize) {
+        let new_depth = self.scopes.len();
+        self.scopes.push(Scope::new_control_flow(new_depth, is_expression_context, line_num));
     }
     
     fn handle_close_brace(&mut self) {

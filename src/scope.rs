@@ -563,6 +563,10 @@ impl ScopeAnalyzer {
         // NEW: Track if we're in a function definition (for parameter detection)
         let mut in_function_signature = false;
         let mut current_function_line: Option<usize> = None;
+        // CRITICAL FIX: Track pending function def for multi-line signatures
+        let mut pending_function_def = false;
+        let mut pending_function_params: Vec<(String, Option<String>)> = Vec::new();
+        let mut pending_function_line: usize = 0;
         
         //=====================================================================
         // CRITICAL FIX: Track struct literal mode
@@ -625,22 +629,55 @@ impl ScopeAnalyzer {
                 && !trimmed.starts_with("enum ")
                 && !trimmed.starts_with("pub enum ");
             
+            // Count braces (moved up for function scope handling)
+            let opens = trimmed.matches('{').count();
+            let closes = trimmed.matches('}').count();
+            
             // NEW: Extract function parameters
+            // CRITICAL FIX: Push function scope BEFORE declaring parameters
+            // so parameters are in the function's scope, not the parent (impl) scope
+            // Track if we pushed a function scope in this iteration
+            let mut function_scope_pushed = false;
+            
             if is_function_def {
                 in_function_signature = true;
                 current_function_line = Some(line_num);
                 
                 // Parse parameters from function signature
-                if let Some(params) = extract_function_params(trimmed) {
+                let params = extract_function_params(trimmed).unwrap_or_default();
+                
+                if opens > 0 {
+                    // Single-line function def with `{` - push scope and declare params now
+                    let new_level = stack.scopes.len();
+                    stack.scopes.push(Scope::new(new_level));
+                    function_scope_pushed = true;
+                    
                     for (param_name, param_type) in params {
                         stack.declare_param(&param_name, param_type, line_num);
                     }
+                    in_function_signature = false;
+                } else {
+                    // Multi-line function def - `{` comes later
+                    // Store params for later when we see `{`
+                    pending_function_def = true;
+                    pending_function_params = params;
+                    pending_function_line = line_num;
                 }
             }
             
-            // Count braces
-            let opens = trimmed.matches('{').count();
-            let closes = trimmed.matches('}').count();
+            // Handle pending function def when we see `{`
+            if pending_function_def && opens > 0 && !is_function_def {
+                // Push function scope and declare stored params
+                let new_level = stack.scopes.len();
+                stack.scopes.push(Scope::new(new_level));
+                
+                for (param_name, param_type) in pending_function_params.drain(..) {
+                    stack.declare_param(&param_name, param_type, pending_function_line);
+                }
+                pending_function_def = false;
+                in_function_signature = false;
+                function_scope_pushed = true;
+            }
             
             //=================================================================
             // CRITICAL FIX: Update struct_literal_depth for closing braces
@@ -734,16 +771,21 @@ impl ScopeAnalyzer {
             }
             
             // Push for `{` - determine if bare or control flow or function or closure
-            for _ in 0..opens {
+            // CRITICAL FIX: Skip function_def case here because we already pushed
+            // the function scope earlier (before declaring parameters)
+            for i in 0..opens {
+                // Skip the first brace if we already pushed a function scope
+                if i == 0 && function_scope_pushed {
+                    continue;
+                }
+                
                 if is_closure {
                     stack.push_closure(); // NEW: Closure scope
                 } else if is_control_flow_line || pending_control_flow {
                     stack.push(); // Control flow block - allows mutation
                 } else if is_function_def {
-                    // Function body
-                    let new_level = stack.scopes.len();
-                    stack.scopes.push(Scope::new(new_level));
-                    in_function_signature = false;
+                    // Function scope already pushed before parameter declaration
+                    // Do nothing here - just skip
                 } else {
                     stack.push_bare(); // Bare block
                 }
