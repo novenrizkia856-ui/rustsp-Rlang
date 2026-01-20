@@ -360,6 +360,53 @@ pub fn parse_rusts_assignment_ext(line: &str) -> Option<(String, Option<String>,
         return None;
     }
     
+    // CRITICAL FIX: Handle RustS+ style type annotations like `var Type[T]`
+    // Must check for space-separated `var Type` BEFORE rejecting lines with `[`
+    // because the type might contain `[` like `Vec[T]`
+    
+    // Check if left contains space (potential RustS+ style: `var Type`)
+    if left.contains(' ') {
+        // RustS+ style: var Type (no colon)
+        // Split by first space to get var_name and type
+        let space_pos = left.find(' ').unwrap();
+        let vname = left[..space_pos].trim();
+        let vtype = left[space_pos + 1..].trim();
+        
+        // Validate: vname must be valid identifier
+        let vname_valid = !vname.is_empty() 
+            && vname.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+            && vname.chars().all(|c| c.is_alphanumeric() || c == '_');
+        
+        // Type typically starts with uppercase, or is a known generic like Vec[, Option[, etc.
+        // Also handle reference types like &Type, &mut Type
+        let vtype_valid = !vtype.is_empty() && (
+            vtype.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+            || vtype.starts_with("Vec[") || vtype.starts_with("Vec<")
+            || vtype.starts_with("Option[") || vtype.starts_with("Option<")
+            || vtype.starts_with("Result[") || vtype.starts_with("Result<")
+            || vtype.starts_with("HashMap[") || vtype.starts_with("HashMap<")
+            || vtype.starts_with("HashSet[") || vtype.starts_with("HashSet<")
+            || vtype.starts_with("BTreeMap[") || vtype.starts_with("BTreeMap<")
+            || vtype.starts_with("BTreeSet[") || vtype.starts_with("BTreeSet<")
+            || vtype.starts_with("Box[") || vtype.starts_with("Box<")
+            || vtype.starts_with("Arc[") || vtype.starts_with("Arc<")
+            || vtype.starts_with("Rc[") || vtype.starts_with("Rc<")
+            || vtype.starts_with('&')  // Reference types
+            || vtype.starts_with('(')  // Tuple types
+            || vtype.starts_with('[')  // Slice/array types
+            || vtype == "i8" || vtype == "i16" || vtype == "i32" || vtype == "i64" || vtype == "i128"
+            || vtype == "u8" || vtype == "u16" || vtype == "u32" || vtype == "u64" || vtype == "u128"
+            || vtype == "f32" || vtype == "f64"
+            || vtype == "bool" || vtype == "char" || vtype == "usize" || vtype == "isize"
+        );
+        
+        if vname_valid && vtype_valid {
+            return Some((vname.to_string(), Some(vtype.to_string()), right.to_string(), is_outer, is_explicit_mut));
+        }
+    }
+    
+    // For simple identifiers (no space), reject if contains special chars
+    // These are likely not assignments but other constructs
     if left.contains('(') || left.contains('[') || left.contains('{') {
         return None;
     }

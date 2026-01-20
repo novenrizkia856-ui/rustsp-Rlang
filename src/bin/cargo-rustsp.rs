@@ -222,7 +222,7 @@ fn find_rss_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
 }
 
 /// Compile a single .rss file to .rs
-fn compile_rss(rustsp: &str, input: &Path, output: &Path, quiet: bool) -> Result<(), String> {
+fn compile_rss(rustsp: &str, input: &Path, output: &Path, _quiet: bool) -> Result<(), String> {
     let result = Command::new(rustsp)
         .arg(input)
         .arg("--emit-rs")
@@ -234,10 +234,10 @@ fn compile_rss(rustsp: &str, input: &Path, output: &Path, quiet: bool) -> Result
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
         let stdout = String::from_utf8_lossy(&result.stdout);
-        if !quiet {
-            if !stderr.is_empty() { eprintln!("{}", stderr); }
-            if !stdout.is_empty() { eprintln!("{}", stdout); }
-        }
+        // CRITICAL FIX: ALWAYS print errors, even in quiet mode
+        // Errors should never be silenced - only progress messages should be quiet
+        if !stderr.is_empty() { eprintln!("{}", stderr); }
+        if !stdout.is_empty() { eprintln!("{}", stdout); }
         return Err(format!("Compilation failed: {}", input.display()));
     }
     
@@ -250,6 +250,9 @@ fn compile_rss(rustsp: &str, input: &Path, output: &Path, quiet: bool) -> Result
 
 /// Preprocess all .rss files in the project IN-PLACE
 /// Returns the tracker that will auto-cleanup on drop
+/// 
+/// CRITICAL FIX: Process ALL files and collect ALL errors before stopping.
+/// This ensures developers see all RustS+ errors at once, not just the first one.
 fn preprocess_project(
     project_root: &Path, 
     force: bool, 
@@ -276,16 +279,25 @@ fn preprocess_project(
     let mut compiled = 0;
     let mut cached = 0;
     
+    // CRITICAL FIX: Collect ALL errors instead of stopping on first error
+    let mut all_errors: Vec<(PathBuf, String)> = Vec::new();
+    let mut failed_files: Vec<PathBuf> = Vec::new();
+    
     for rss_path in &rss_files {
         let rs_path = rss_path.with_extension("rs");
         
         // Read and hash content
-        let content = fs::read_to_string(rss_path)
-            .map_err(|e| format!("Failed to read {}: {}", rss_path.display(), e))?;
+        let content = match fs::read_to_string(rss_path) {
+            Ok(c) => c,
+            Err(e) => {
+                all_errors.push((rss_path.clone(), format!("Failed to read: {}", e)));
+                continue;
+            }
+        };
         let content_hash = hash_content(&content);
         
-        // Always need to generate for this run (even if cached hash matches)
-        // because we delete .rs files after each run
+        // CRITICAL FIX: ALWAYS recompile if content changed, even if .rs exists
+        // The old .rs might be stale (from before RustS+ errors were introduced)
         let needs_compile = force || 
                            cache.needs_rebuild(rss_path, content_hash) ||
                            !rs_path.exists();
@@ -297,20 +309,78 @@ fn preprocess_project(
                 eprintln!("   {}Compiling{} {}", ansi::DIM, ansi::RESET, display_path.display());
             }
             
-            compile_rss(&rustsp, rss_path, &rs_path, quiet)?;
-            cache.update(rss_path.clone(), content_hash);
-            compiled += 1;
+            // CRITICAL FIX: Don't use ? operator - collect error and continue
+            match compile_rss(&rustsp, rss_path, &rs_path, quiet) {
+                Ok(()) => {
+                    cache.update(rss_path.clone(), content_hash);
+                    compiled += 1;
+                    tracker.track(rs_path);
+                }
+                Err(e) => {
+                    all_errors.push((rss_path.clone(), e));
+                    failed_files.push(rss_path.clone());
+                    // DON'T track failed files - no .rs was generated
+                    // DON'T update cache - file needs recompile next time
+                    continue;
+                }
+            }
         } else {
-            cached += 1;
+            // CRITICAL FIX: Even for cached files, verify the .rs file exists
+            // If it doesn't (e.g., manual deletion), force recompile
+            if !rs_path.exists() {
+                if !quiet {
+                    let display_path = rss_path.strip_prefix(project_root)
+                        .unwrap_or(rss_path);
+                    eprintln!("   {}Compiling{} {} (cache miss)", ansi::DIM, ansi::RESET, display_path.display());
+                }
+                
+                match compile_rss(&rustsp, rss_path, &rs_path, quiet) {
+                    Ok(()) => {
+                        compiled += 1;
+                        tracker.track(rs_path);
+                    }
+                    Err(e) => {
+                        all_errors.push((rss_path.clone(), e));
+                        failed_files.push(rss_path.clone());
+                        continue;
+                    }
+                }
+            } else {
+                cached += 1;
+                tracker.track(rs_path);
+            }
         }
-        
-        // Track this file for cleanup (regardless of whether we compiled or used cache)
-        // The .rs file exists now, so we need to clean it up
-        tracker.track(rs_path);
     }
     
-    // Save cache
+    // Save cache (only for successful compiles)
     let _ = cache.save();
+    
+    // CRITICAL FIX: If ANY errors occurred, show ALL of them and fail
+    if !all_errors.is_empty() {
+        eprintln!("\n{}╔═══════════════════════════════════════════════════════════════╗{}", 
+            ansi::BOLD_RED, ansi::RESET);
+        eprintln!("{}║   RUSTS+ COMPILATION ERRORS ({} file(s) failed)               ║{}",
+            ansi::BOLD_RED, all_errors.len(), ansi::RESET);
+        eprintln!("{}╚═══════════════════════════════════════════════════════════════╝{}\n",
+            ansi::BOLD_RED, ansi::RESET);
+        
+        // Errors were already printed by compile_rss, just show summary
+        eprintln!("{}Failed files:{}", ansi::BOLD_RED, ansi::RESET);
+        for path in &failed_files {
+            let display_path = path.strip_prefix(project_root).unwrap_or(path);
+            eprintln!("  • {}", display_path.display());
+        }
+        eprintln!();
+        
+        // Clean up any .rs files that WERE generated before failing
+        // This prevents partial compilation
+        tracker.cleanup();
+        
+        return Err(format!(
+            "{} RustS+ file(s) failed to compile. Fix all errors above and try again.",
+            all_errors.len()
+        ));
+    }
     
     if !quiet {
         eprintln!("{}  Preprocessed{} {} compiled, {} cached", 

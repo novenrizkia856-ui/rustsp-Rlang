@@ -213,9 +213,16 @@ fn needs_semicolon(trimmed: &str) -> bool {
     if trimmed.is_empty() { return false; }
     if trimmed.ends_with(';') { return false; }
     
-    // CRITICAL FIX: use/pub use statements ALWAYS need semicolons, even if they end with }
-    // Example: `use std::collections::{HashMap, HashSet}` ends with } but needs ;
+    // CRITICAL FIX: use/pub use statements need semicolons ONLY if COMPLETE
+    // - `use std::collections::{HashMap, HashSet}` ends with } → needs ;
+    // - `use std::io::Result` simple import → needs ;
+    // - `pub use module::{` multi-line start → NO semicolon (handled by UseImportMode)
     if trimmed.starts_with("use ") || trimmed.starts_with("pub use ") {
+        // Multi-line use import start: ends with { but no } → don't add semicolon
+        if trimmed.ends_with('{') && !trimmed.contains('}') {
+            return false;
+        }
+        // Complete use statement → needs semicolon
         return true;
     }
     
@@ -575,6 +582,99 @@ impl ArrayModeStack {
     fn exit(&mut self) -> Option<ArrayModeEntry> {
         self.stack.pop()
     }
+}
+
+//===========================================================================
+// USE IMPORT MODE CONTEXT
+// Tracks when we are inside a multi-line use import block:
+//   pub use module::{
+//       Item1
+//       Item2
+//   }
+// In use import mode: items get commas, closing } gets semicolon.
+//===========================================================================
+
+#[derive(Debug, Clone)]
+struct UseImportMode {
+    active: bool,
+    start_brace_depth: usize, // Brace depth when we entered
+    is_pub: bool,             // Whether it's `pub use` or just `use`
+}
+
+impl UseImportMode {
+    fn new() -> Self {
+        UseImportMode { 
+            active: false, 
+            start_brace_depth: 0,
+            is_pub: false,
+        }
+    }
+    
+    fn enter(&mut self, brace_depth: usize, is_pub: bool) {
+        self.active = true;
+        self.start_brace_depth = brace_depth;
+        self.is_pub = is_pub;
+    }
+    
+    fn is_active(&self) -> bool {
+        self.active
+    }
+    
+    /// Check if we should exit (brace closes the use block)
+    fn should_exit(&self, current_brace_depth: usize) -> bool {
+        self.active && current_brace_depth <= self.start_brace_depth
+    }
+    
+    fn exit(&mut self) {
+        self.active = false;
+    }
+}
+
+/// Check if line starts a multi-line use import block
+/// Pattern: `use path::{` or `pub use path::{` where line ends with `{` 
+/// but doesn't have a closing `}` on the same line
+fn is_multiline_use_import_start(trimmed: &str) -> Option<bool> {
+    // Must start with use or pub use
+    let is_pub = trimmed.starts_with("pub use ");
+    let is_use = trimmed.starts_with("use ");
+    
+    if !is_pub && !is_use {
+        return None;
+    }
+    
+    // Must contain `{` but NOT `}` (multi-line)
+    if !trimmed.contains('{') {
+        return None;
+    }
+    
+    // If has both `{` and `}`, it's a single-line import - no special handling needed
+    if trimmed.contains('}') {
+        return None;
+    }
+    
+    // It's a multi-line use import start
+    Some(is_pub)
+}
+
+/// Transform a use import item line - add comma if needed
+/// Input:  "    ItemName"  -> "    ItemName,"
+/// Input:  "    Item1"     -> "    Item1,"
+fn transform_use_import_item(line: &str) -> String {
+    let trimmed = line.trim();
+    
+    // Skip empty lines, comments, closing brace
+    if trimmed.is_empty() || trimmed.starts_with("//") || trimmed == "}" {
+        return line.to_string();
+    }
+    
+    // Skip if already has comma or is the opening/closing
+    if trimmed.ends_with(',') || trimmed.ends_with('{') || trimmed == "}" {
+        return line.to_string();
+    }
+    
+    // Add comma
+    let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+    format!("{}{},", leading_ws, trimmed)
 }
 
 /// Detect if line starts a struct literal: `varname = StructName {`
@@ -1820,6 +1920,10 @@ pub fn parse_rusts(source: &str) -> String {
     // MATCH MODE - for RustS+ match syntax transformation
     let mut match_mode = MatchModeStack::new();
     
+    // USE IMPORT MODE - for multiline use import blocks
+    // Tracks `pub use module::{ Item1 Item2 }` to add commas between items
+    let mut use_import_mode = UseImportMode::new();
+    
     // IF EXPRESSION ASSIGNMENT MODE - tracks `x = if cond {` for semicolon at end
     let mut if_expr_assignment_depth: Option<usize> = None;
     
@@ -2024,6 +2128,38 @@ pub fn parse_rusts(source: &str) -> String {
             // Empty line breaks any continuation
             prev_line_was_continuation = false;
             output_lines.push(String::new());
+            continue;
+        }
+        
+        //=======================================================================
+        // USE IMPORT MODE EXIT CHECK - closing brace of use { } block
+        //=======================================================================
+        if use_import_mode.is_active() && trimmed == "}" {
+            if use_import_mode.should_exit(brace_depth) {
+                use_import_mode.exit();
+                // Closing brace of use block needs semicolon
+                output_lines.push(format!("{}}};", leading_ws));
+                continue;
+            }
+        }
+        
+        //=======================================================================
+        // USE IMPORT MODE ACTIVE - transform items to add commas
+        //=======================================================================
+        if use_import_mode.is_active() {
+            let transformed = transform_use_import_item(&clean_line);
+            output_lines.push(transformed);
+            continue;
+        }
+        
+        //=======================================================================
+        // USE IMPORT MODE START - detect `pub use path::{` or `use path::{`
+        //=======================================================================
+        if let Some(is_pub) = is_multiline_use_import_start(trimmed) {
+            // Enter use import mode - brace_depth is AFTER this line's { is counted
+            use_import_mode.enter(brace_depth, is_pub);
+            // Output the opening line as-is (no semicolon yet!)
+            output_lines.push(format!("{}{}", leading_ws, trimmed));
             continue;
         }
         
@@ -3058,7 +3194,50 @@ pub fn parse_rusts(source: &str) -> String {
                     let val_part = rest[eq_pos + 1..].trim().trim_end_matches(';');
                     
                     // Check for type annotation
-                    let (var_name, type_annotation) = if var_part.contains(':') {
+                    // CRITICAL: Check RustS+ style (space) FIRST before Rust style (colon)
+                    // because colon might be part of :: in path like crate::types::Address
+                    let (var_name, type_annotation) = if var_part.contains(' ') {
+                        // RustS+ style: var Type (no colon separator)
+                        // Split by first space to get var_name and type
+                        let space_pos = var_part.find(' ').unwrap();
+                        let vname = var_part[..space_pos].trim();
+                        let vtype = var_part[space_pos + 1..].trim();
+                        
+                        // Validate: vname must be valid identifier, vtype must look like a type
+                        let vname_valid = !vname.is_empty() 
+                            && vname.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+                            && vname.chars().all(|c| c.is_alphanumeric() || c == '_');
+                        
+                        // Type typically starts with uppercase, or is a known generic like Vec[, Option[, etc.
+                        // Also handle reference types like &Type, &mut Type
+                        let vtype_valid = !vtype.is_empty() && (
+                            vtype.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                            || vtype.starts_with("Vec[") || vtype.starts_with("Vec<")
+                            || vtype.starts_with("Option[") || vtype.starts_with("Option<")
+                            || vtype.starts_with("Result[") || vtype.starts_with("Result<")
+                            || vtype.starts_with("HashMap[") || vtype.starts_with("HashMap<")
+                            || vtype.starts_with("HashSet[") || vtype.starts_with("HashSet<")
+                            || vtype.starts_with("BTreeMap[") || vtype.starts_with("BTreeMap<")
+                            || vtype.starts_with("BTreeSet[") || vtype.starts_with("BTreeSet<")
+                            || vtype.starts_with("Box[") || vtype.starts_with("Box<")
+                            || vtype.starts_with("Arc[") || vtype.starts_with("Arc<")
+                            || vtype.starts_with("Rc[") || vtype.starts_with("Rc<")
+                            || vtype.starts_with('&')  // Reference types
+                            || vtype.starts_with('(')  // Tuple types
+                            || vtype.starts_with('[')  // Slice/array types
+                            || vtype == "i8" || vtype == "i16" || vtype == "i32" || vtype == "i64" || vtype == "i128"
+                            || vtype == "u8" || vtype == "u16" || vtype == "u32" || vtype == "u64" || vtype == "u128"
+                            || vtype == "f32" || vtype == "f64"
+                            || vtype == "bool" || vtype == "char" || vtype == "usize" || vtype == "isize"
+                        );
+                        
+                        if vname_valid && vtype_valid {
+                            (vname, format!(": {}", vtype))
+                        } else {
+                            (var_part, String::new())
+                        }
+                    } else if var_part.contains(':') && !var_part.contains("::") {
+                        // Rust style: var: Type (only if colon is NOT part of ::)
                         let parts: Vec<&str> = var_part.splitn(2, ':').collect();
                         if parts.len() == 2 {
                             (parts[0].trim(), format!(": {}", parts[1].trim()))
@@ -3066,6 +3245,7 @@ pub fn parse_rusts(source: &str) -> String {
                             (var_part, String::new())
                         }
                     } else {
+                        // No type annotation
                         (var_part, String::new())
                     };
                     
@@ -3466,7 +3646,50 @@ fn fix_bare_mut_declaration(line: &str) -> String {
             let val_part = rest[eq_pos + 1..].trim();
             
             // Handle type annotation if present
-            let (var_name, type_annotation) = if var_part.contains(':') {
+            // CRITICAL: Check RustS+ style (space) FIRST before Rust style (colon)
+            // because colon might be part of :: in path like crate::types::Address
+            let (var_name, type_annotation) = if var_part.contains(' ') {
+                // RustS+ style: var Type (no colon separator)
+                // Split by first space to get var_name and type
+                let space_pos = var_part.find(' ').unwrap();
+                let vname = var_part[..space_pos].trim();
+                let vtype = var_part[space_pos + 1..].trim();
+                
+                // Validate: vname must be valid identifier, vtype must look like a type
+                let vname_valid = !vname.is_empty() 
+                    && vname.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+                    && vname.chars().all(|c| c.is_alphanumeric() || c == '_');
+                
+                // Type typically starts with uppercase, or is a known generic like Vec[, Option[, etc.
+                // Also handle reference types like &Type, &mut Type
+                let vtype_valid = !vtype.is_empty() && (
+                    vtype.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                    || vtype.starts_with("Vec[") || vtype.starts_with("Vec<")
+                    || vtype.starts_with("Option[") || vtype.starts_with("Option<")
+                    || vtype.starts_with("Result[") || vtype.starts_with("Result<")
+                    || vtype.starts_with("HashMap[") || vtype.starts_with("HashMap<")
+                    || vtype.starts_with("HashSet[") || vtype.starts_with("HashSet<")
+                    || vtype.starts_with("BTreeMap[") || vtype.starts_with("BTreeMap<")
+                    || vtype.starts_with("BTreeSet[") || vtype.starts_with("BTreeSet<")
+                    || vtype.starts_with("Box[") || vtype.starts_with("Box<")
+                    || vtype.starts_with("Arc[") || vtype.starts_with("Arc<")
+                    || vtype.starts_with("Rc[") || vtype.starts_with("Rc<")
+                    || vtype.starts_with('&')  // Reference types
+                    || vtype.starts_with('(')  // Tuple types
+                    || vtype.starts_with('[')  // Slice/array types
+                    || vtype == "i8" || vtype == "i16" || vtype == "i32" || vtype == "i64" || vtype == "i128"
+                    || vtype == "u8" || vtype == "u16" || vtype == "u32" || vtype == "u64" || vtype == "u128"
+                    || vtype == "f32" || vtype == "f64"
+                    || vtype == "bool" || vtype == "char" || vtype == "usize" || vtype == "isize"
+                );
+                
+                if vname_valid && vtype_valid {
+                    (vname, format!(": {}", vtype))
+                } else {
+                    (var_part, String::new())
+                }
+            } else if var_part.contains(':') && !var_part.contains("::") {
+                // Rust style: var: Type (only if colon is NOT part of ::)
                 let parts: Vec<&str> = var_part.splitn(2, ':').collect();
                 if parts.len() == 2 {
                     (parts[0].trim(), format!(": {}", parts[1].trim()))
@@ -3474,6 +3697,7 @@ fn fix_bare_mut_declaration(line: &str) -> String {
                     (var_part, String::new())
                 }
             } else {
+                // No type annotation
                 (var_part, String::new())
             };
             
@@ -4087,5 +4311,55 @@ fn apply_tx(w Wallet, tx Transaction) Wallet {
         let close = output.matches('}').count();
         assert_eq!(open, close, 
             "Integration: Braces must be balanced: {}", output);
+    }
+    
+    /// Test multi-line pub use import block transformation
+    /// Items should have commas, closing brace should have semicolon
+    #[test]
+    fn test_multiline_use_import() {
+        let input = r#"pub use quorum_da::{
+    QuorumDA
+    QuorumError
+    ValidatorInfo
+}"#;
+        let output = parse_rusts(input);
+        
+        // Items should have commas
+        assert!(output.contains("QuorumDA,"), 
+            "Multi-line use: QuorumDA should have comma: {}", output);
+        assert!(output.contains("QuorumError,"), 
+            "Multi-line use: QuorumError should have comma: {}", output);
+        assert!(output.contains("ValidatorInfo,"), 
+            "Multi-line use: ValidatorInfo should have comma: {}", output);
+        
+        // Closing brace should have semicolon
+        assert!(output.contains("};"), 
+            "Multi-line use: closing brace should have semicolon: {}", output);
+        
+        // Opening should NOT have semicolon after {
+        assert!(!output.contains("{;"), 
+            "Multi-line use: opening should NOT have semicolon after brace: {}", output);
+    }
+    
+    /// Test single-line use import is unchanged
+    #[test]
+    fn test_singleline_use_import() {
+        let input = "use std::collections::{HashMap, HashSet}";
+        let output = parse_rusts(input);
+        
+        // Single-line use should have semicolon at end
+        assert!(output.contains("};") || output.ends_with(";"), 
+            "Single-line use should have semicolon: {}", output);
+    }
+    
+    /// Test simple use import
+    #[test]
+    fn test_simple_use_import() {
+        let input = "use std::io::Result";
+        let output = parse_rusts(input);
+        
+        // Simple use should have semicolon
+        assert!(output.contains("Result;") || output.trim().ends_with(";"), 
+            "Simple use should have semicolon: {}", output);
     }
 }
