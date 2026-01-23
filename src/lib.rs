@@ -134,6 +134,13 @@ pub fn parse_rusts(source: &str) -> String {
     let struct_registry = first_pass_result.struct_registry;
     let enum_registry = first_pass_result.enum_registry;
     
+    // CRITICAL: Scan all lines for mutating method calls (.push(), .insert(), etc.)
+    // This must happen AFTER first pass but BEFORE second pass
+    // so that `needs_mut` returns correct results
+    for line in &lines {
+        tracker.scan_for_mutating_methods(line);
+    }
+    
     let mut output_lines: Vec<String> = Vec::new();
     
     // Parser state
@@ -616,7 +623,8 @@ pub fn parse_rusts(source: &str) -> String {
         if let Some((var_name, struct_name)) = detect_struct_literal_start(trimmed, &struct_registry) {
             let scope_needs_mut = scope_analyzer.needs_mut(&var_name, line_num);
             let borrowed_mut = tracker.is_mut_borrowed(&var_name);
-            let needs_mut = scope_needs_mut || borrowed_mut;
+            let mutated_via_method = tracker.is_mutated_via_method(&var_name);
+            let needs_mut = scope_needs_mut || borrowed_mut || mutated_via_method;
             let let_keyword = if needs_mut { "let mut" } else { "let" };
             
             if trimmed.ends_with('}') {
@@ -639,7 +647,8 @@ pub fn parse_rusts(source: &str) -> String {
         if let Some((var_name, enum_path)) = detect_enum_literal_start(trimmed) {
             let scope_needs_mut = scope_analyzer.needs_mut(&var_name, line_num);
             let borrowed_mut = tracker.is_mut_borrowed(&var_name);
-            let needs_mut = scope_needs_mut || borrowed_mut;
+            let mutated_via_method = tracker.is_mutated_via_method(&var_name);
+            let needs_mut = scope_needs_mut || borrowed_mut || mutated_via_method;
             let let_keyword = if needs_mut { "let mut" } else { "let" };
             
             if trimmed.ends_with('}') {
@@ -745,8 +754,9 @@ pub fn parse_rusts(source: &str) -> String {
             let is_mutation = scope_analyzer.is_mut(line_num);
             let is_shadowing = tracker.is_shadowing(&var_name, line_num);
             let borrowed_mut = tracker.is_mut_borrowed(&var_name);
+            let mutated_via_method = tracker.is_mutated_via_method(&var_name);
             let scope_needs_mut = scope_analyzer.needs_mut(&var_name, line_num);
-            let needs_mut = borrowed_mut || scope_needs_mut;
+            let needs_mut = borrowed_mut || mutated_via_method || scope_needs_mut;
             let needs_let = is_decl || (!is_mutation && !is_param) || is_shadowing;
             
             array_mode.enter(
@@ -1019,8 +1029,9 @@ fn process_match_arm_body_line(
         let is_decl = scope_analyzer.is_decl(line_num);
         let is_mutation = scope_analyzer.is_mut(line_num);
         let borrowed_mut = tracker.is_mut_borrowed(&var_name);
+        let mutated_via_method = tracker.is_mutated_via_method(&var_name);
         let scope_needs_mut = scope_analyzer.needs_mut(&var_name, line_num);
-        let needs_mut = is_explicit_mut || borrowed_mut || scope_needs_mut;
+        let needs_mut = is_explicit_mut || borrowed_mut || mutated_via_method || scope_needs_mut;
         
         let mut expanded_value = expand_value(&value, var_type.as_deref());
         expanded_value = transform_array_access_clone(&expanded_value);
@@ -1120,8 +1131,9 @@ fn process_assignment(
     let is_decl = scope_analyzer.is_decl(line_num);
     let is_mutation = scope_analyzer.is_mut(line_num);
     let borrowed_mut = tracker.is_mut_borrowed(var_name);
+    let mutated_via_method = tracker.is_mutated_via_method(var_name);
     let scope_needs_mut = scope_analyzer.needs_mut(var_name, line_num);
-    let needs_mut = is_explicit_mut || borrowed_mut || scope_needs_mut;
+    let needs_mut = is_explicit_mut || borrowed_mut || mutated_via_method || scope_needs_mut;
     
     let mut expanded_value = expand_value(value, var_type);
     expanded_value = transform_array_access_clone(&expanded_value);

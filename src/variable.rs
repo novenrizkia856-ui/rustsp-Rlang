@@ -33,6 +33,8 @@ pub struct VariableTracker {
     scope_mutability: HashMap<(String, usize), bool>,
     // Track variables that are borrowed as &mut anywhere in the code
     mut_borrowed_vars: std::collections::HashSet<String>,
+    // Track variables that have mutating methods called on them (.push(), .insert(), etc.)
+    mutated_via_method: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +55,7 @@ impl VariableTracker {
             assignments: Vec::new(),
             scope_mutability: HashMap::new(),
             mut_borrowed_vars: std::collections::HashSet::new(),
+            mutated_via_method: std::collections::HashSet::new(),
         }
     }
 
@@ -177,6 +180,11 @@ impl VariableTracker {
             return true;
         }
         
+        // Check if variable has mutating methods called on it (.push(), .insert(), etc.)
+        if self.mutated_via_method.contains(var_name) {
+            return true;
+        }
+        
         // Check if this line is a first assignment of any scope for this variable
         // and if that scope needs mutability
         if let Some(&is_mut) = self.scope_mutability.get(&(var_name.to_string(), line_num)) {
@@ -234,6 +242,66 @@ impl VariableTracker {
     /// Mark a variable as being borrowed mutably
     pub fn mark_mut_borrowed(&mut self, var_name: &str) {
         self.mut_borrowed_vars.insert(var_name.to_string());
+    }
+    
+    /// Scan a line for mutating method calls like .push(), .insert(), etc.
+    /// These require the variable to be declared as `mut`
+    pub fn scan_for_mutating_methods(&mut self, line: &str) {
+        let trimmed = line.trim();
+        
+        // Skip empty lines and comments
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            return;
+        }
+        
+        // List of mutating methods that require &mut self
+        const MUTATING_METHODS: &[&str] = &[
+            // Vec methods
+            ".push(", ".pop()", ".insert(", ".remove(", ".clear()", 
+            ".append(", ".truncate(", ".resize(", ".extend(",
+            ".sort(", ".sort_by(", ".sort_by_key(", ".reverse()",
+            ".drain(", ".retain(", ".dedup(", ".swap(",
+            ".split_off(", ".swap_remove(",
+            // HashMap/HashSet methods
+            ".entry(", ".or_insert(", ".and_modify(",
+            // String methods
+            ".push_str(",
+            // Common mutation patterns
+            ".get_mut(",
+        ];
+        
+        // Compound assignment operators that indicate mutation
+        const COMPOUND_ASSIGNS: &[&str] = &[
+            " += ", " -= ", " *= ", " /= ", " %= ",
+            " &= ", " |= ", " ^= ", " <<= ", " >>= ",
+        ];
+        
+        // Check for mutating methods: var.method(...)
+        for method in MUTATING_METHODS {
+            if let Some(pos) = trimmed.find(method) {
+                // Extract variable name before the method call
+                let before_method = &trimmed[..pos];
+                if let Some(var_name) = extract_var_name_before_dot(before_method) {
+                    self.mutated_via_method.insert(var_name);
+                }
+            }
+        }
+        
+        // Check for compound assignments: var += value
+        for op in COMPOUND_ASSIGNS {
+            if let Some(pos) = trimmed.find(op) {
+                let before_op = trimmed[..pos].trim();
+                // Handle simple variable or field access
+                if let Some(var_name) = extract_root_var(before_op) {
+                    self.mutated_via_method.insert(var_name);
+                }
+            }
+        }
+    }
+    
+    /// Check if a variable is mutated via method calls
+    pub fn is_mutated_via_method(&self, var_name: &str) -> bool {
+        self.mutated_via_method.contains(var_name)
     }
 
     pub fn is_first_assignment(&self, var_name: &str, line_num: usize) -> bool {
@@ -437,6 +505,61 @@ pub fn parse_rusts_assignment(line: &str) -> Option<(String, Option<String>, Str
     parse_rusts_assignment_ext(line).map(|(name, typ, val, _, _)| (name, typ, val))
 }
 
+/// Extract variable name from expression before a dot
+/// Examples:
+/// - "result" -> Some("result")
+/// - "self.items" -> Some("self") (root var)
+/// - "items[0]" -> Some("items")
+fn extract_var_name_before_dot(expr: &str) -> Option<String> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    
+    // If it contains a dot, we want the root variable
+    let root = extract_root_var(trimmed)?;
+    Some(root)
+}
+
+/// Extract the root variable from an expression
+/// Examples:
+/// - "result" -> Some("result")
+/// - "self.items" -> Some("self")
+/// - "items[0].field" -> Some("items")
+/// - "(*ptr)" -> Some("ptr")
+fn extract_root_var(expr: &str) -> Option<String> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    
+    // Handle dereference: (*ptr) -> ptr
+    let cleaned = if trimmed.starts_with("(*") && trimmed.ends_with(')') {
+        &trimmed[2..trimmed.len()-1]
+    } else if trimmed.starts_with('*') {
+        &trimmed[1..]
+    } else {
+        trimmed
+    };
+    
+    // Find the root variable (before any . or [)
+    let root: String = cleaned
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    
+    if root.is_empty() {
+        return None;
+    }
+    
+    // Validate it's an identifier
+    if is_valid_identifier(&root) {
+        Some(root)
+    } else {
+        None
+    }
+}
+
 pub fn is_valid_identifier(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -565,5 +688,68 @@ mod tests {
         // (this is for type tracking, not for output generation)
         let result = VariableTracker::infer_type("\"hello\"");
         assert_eq!(result, Some("String".to_string()));
+    }
+    
+    //=========================================================================
+    // MUTATING METHOD DETECTION TESTS
+    //=========================================================================
+    
+    #[test]
+    fn test_scan_for_mutating_methods_push() {
+        let mut tracker = VariableTracker::new();
+        tracker.scan_for_mutating_methods("result.push(value)");
+        assert!(tracker.is_mutated_via_method("result"),
+            "result should be marked as mutated via .push()");
+    }
+    
+    #[test]
+    fn test_scan_for_mutating_methods_insert() {
+        let mut tracker = VariableTracker::new();
+        tracker.scan_for_mutating_methods("map.insert(key, value)");
+        assert!(tracker.is_mutated_via_method("map"),
+            "map should be marked as mutated via .insert()");
+    }
+    
+    #[test]
+    fn test_scan_for_mutating_methods_clear() {
+        let mut tracker = VariableTracker::new();
+        tracker.scan_for_mutating_methods("items.clear()");
+        assert!(tracker.is_mutated_via_method("items"),
+            "items should be marked as mutated via .clear()");
+    }
+    
+    #[test]
+    fn test_scan_for_compound_assignment() {
+        let mut tracker = VariableTracker::new();
+        tracker.scan_for_mutating_methods("counter += 1");
+        assert!(tracker.is_mutated_via_method("counter"),
+            "counter should be marked as mutated via +=");
+    }
+    
+    #[test]
+    fn test_scan_for_field_mutation() {
+        let mut tracker = VariableTracker::new();
+        tracker.scan_for_mutating_methods("self.items.push(x)");
+        assert!(tracker.is_mutated_via_method("self"),
+            "self should be marked as mutated via .push() on field");
+    }
+    
+    #[test]
+    fn test_extract_root_var() {
+        assert_eq!(extract_root_var("result"), Some("result".to_string()));
+        assert_eq!(extract_root_var("self.items"), Some("self".to_string()));
+        assert_eq!(extract_root_var("items[0]"), Some("items".to_string()));
+    }
+    
+    #[test]
+    fn test_needs_mut_with_mutating_method() {
+        let mut tracker = VariableTracker::new();
+        // First, track an assignment
+        tracker.track_assignment(1, "result", None, "Vec::new()", false);
+        // Then scan for mutating method
+        tracker.scan_for_mutating_methods("result.push(value)");
+        // Should need mut
+        assert!(tracker.needs_mut("result", 1),
+            "result should need mut because .push() is called");
     }
 }
