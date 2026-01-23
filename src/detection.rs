@@ -98,6 +98,116 @@ fn has_enum_variant_pattern(s: &str) -> bool {
 }
 
 //===========================================================================
+// ASSIGNMENT OPERATOR DETECTION HELPER
+// Finds true assignment `=` that is NOT part of comparison or compound operators
+//===========================================================================
+
+/// Find position of standalone assignment `=` in a string.
+/// Returns None if no standalone `=` exists.
+/// 
+/// Rejects:
+/// - `==`, `!=`, `<=`, `>=` (comparison operators)
+/// - `+=`, `-=`, `*=`, `/=`, `%=` (compound assignment)
+/// - `&=`, `|=`, `^=` (bitwise compound)
+/// - `<<=`, `>>=` (shift compound)
+/// - `=>` (fat arrow / match arm)
+/// - `=` inside string literals or nested structures
+fn find_assignment_eq_position(s: &str) -> Option<usize> {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    
+    // Track nested structures
+    let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
+    let mut in_string = false;
+    let mut prev_char = ' ';
+    
+    for i in 0..len {
+        let c = chars[i];
+        
+        // Handle string literals
+        if c == '"' && prev_char != '\\' {
+            in_string = !in_string;
+            prev_char = c;
+            continue;
+        }
+        
+        if in_string {
+            prev_char = c;
+            continue;
+        }
+        
+        // Track nesting
+        match c {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+        
+        // Only look for `=` at top level (not nested)
+        if c == '=' && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+            let prev = if i > 0 { chars[i - 1] } else { ' ' };
+            let next = if i + 1 < len { chars[i + 1] } else { ' ' };
+            
+            // Reject comparison operators: `==`, `!=`, `<=`, `>=`
+            if next == '=' {
+                prev_char = c;
+                continue;
+            }
+            if prev == '!' || prev == '=' || prev == '<' || prev == '>' {
+                prev_char = c;
+                continue;
+            }
+            
+            // Reject fat arrow: `=>`
+            if next == '>' {
+                prev_char = c;
+                continue;
+            }
+            
+            // Reject compound assignments: `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`
+            if prev == '+' || prev == '-' || prev == '*' || prev == '/' || prev == '%' 
+               || prev == '&' || prev == '|' || prev == '^' {
+                prev_char = c;
+                continue;
+            }
+            
+            // Found a standalone assignment `=`
+            return Some(i);
+        }
+        
+        prev_char = c;
+    }
+    
+    None
+}
+
+/// Check if line starts with control flow keyword that should never be detected as literal
+fn is_control_flow_start(s: &str) -> bool {
+    let trimmed = s.trim();
+    trimmed.starts_with("if ") 
+        || trimmed.starts_with("if(")
+        || trimmed.starts_with("while ") 
+        || trimmed.starts_with("while(")
+        || trimmed.starts_with("for ") 
+        || trimmed.starts_with("match ")
+        || trimmed.starts_with("loop ")
+        || trimmed.starts_with("loop{")
+        || trimmed.starts_with("return ")
+        || trimmed.starts_with("return(")
+        || trimmed.starts_with("break ")
+        || trimmed.starts_with("break;")
+        || trimmed.starts_with("continue")
+        || trimmed.starts_with("unsafe ")
+        || trimmed.starts_with("async ")
+}
+
+//===========================================================================
 // STRUCT LITERAL DETECTION
 //===========================================================================
 
@@ -111,16 +221,26 @@ pub fn detect_struct_literal_start(line: &str, registry: &StructRegistry) -> Opt
         return None;
     }
     
+    // CRITICAL FIX: EXCLUDE control flow statements
+    // Bug: `if self.status != SyncStatus::Idle {` was detected as struct literal
+    if is_control_flow_start(trimmed) {
+        return None;
+    }
+    
     // CRITICAL FIX: Use string-aware brace detection
     if !trimmed.contains('=') || !contains_brace_outside_string(trimmed) {
         return None;
     }
     
-    let parts: Vec<&str> = trimmed.splitn(2, '=').collect();
-    if parts.len() != 2 { return None; }
+    // CRITICAL FIX: Find TRUE assignment `=` (not comparison operators)
+    // Bug: `splitn(2, '=')` would split on first `=` even if it's part of `!=`
+    let eq_pos = match find_assignment_eq_position(trimmed) {
+        Some(pos) => pos,
+        None => return None, // No standalone `=` found
+    };
     
-    let var_name = parts[0].trim();
-    let rhs = parts[1].trim();
+    let var_name = trimmed[..eq_pos].trim();
+    let rhs = trimmed[eq_pos + 1..].trim();
     
     // CRITICAL FIX: Find brace outside strings in RHS
     let brace_pos = match find_brace_outside_string(rhs) {
@@ -155,6 +275,12 @@ pub fn detect_bare_struct_literal(line: &str, registry: &StructRegistry) -> Opti
     
     // CRITICAL FIX: EXCLUDE function definitions and other Rust blocks
     if is_rust_block_start(trimmed) {
+        return None;
+    }
+    
+    // CRITICAL FIX: EXCLUDE control flow statements
+    // Safety: control flow should never be detected as struct literal
+    if is_control_flow_start(trimmed) {
         return None;
     }
     
@@ -206,6 +332,13 @@ pub fn detect_bare_enum_literal(line: &str) -> Option<String> {
     
     // CRITICAL FIX: EXCLUDE function definitions and other Rust blocks
     if is_rust_block_start(trimmed) {
+        return None;
+    }
+    
+    // CRITICAL FIX: EXCLUDE control flow statements
+    // Bug: `if let SyncStatus::SyncingHeaders { ... } = &self.status {` was detected
+    // because `{` after SyncingHeaders comes BEFORE `=`, making it look like bare enum literal
+    if is_control_flow_start(trimmed) {
         return None;
     }
     
@@ -270,6 +403,16 @@ pub fn detect_enum_literal_start(line: &str) -> Option<(String, String)> {
         return None;
     }
     
+    // CRITICAL FIX: EXCLUDE control flow statements
+    // Bug: `if self.status != SyncStatus::Idle {` was incorrectly detected because
+    // splitn(2, '=') split on the `=` inside `!=`, giving:
+    //   var_name = "if self.status !"
+    //   rhs = " SyncStatus::Idle {"
+    // Then it found `::` and `{` in rhs and treated it as enum literal!
+    if is_control_flow_start(trimmed) {
+        return None;
+    }
+    
     // EXCLUDE match arms: `Event::Data { id, body } =>`
     if trimmed.contains("=>") {
         return None;
@@ -285,11 +428,15 @@ pub fn detect_enum_literal_start(line: &str) -> Option<(String, String)> {
         return None;
     }
     
-    let parts: Vec<&str> = trimmed.splitn(2, '=').collect();
-    if parts.len() != 2 { return None; }
+    // CRITICAL FIX: Find TRUE assignment `=` (not part of comparison operators)
+    // Bug: splitn(2, '=') would split on FIRST `=`, even if part of `!=`, `==`, etc.
+    let eq_pos = match find_assignment_eq_position(trimmed) {
+        Some(pos) => pos,
+        None => return None, // No standalone `=` found - not an assignment
+    };
     
-    let var_name = parts[0].trim();
-    let rhs = parts[1].trim();
+    let var_name = trimmed[..eq_pos].trim();
+    let rhs = trimmed[eq_pos + 1..].trim();
     
     // CRITICAL FIX: Find brace outside strings in RHS
     let brace_pos = match find_brace_outside_string(rhs) {
@@ -327,17 +474,24 @@ pub fn detect_enum_literal_start(line: &str) -> Option<(String, String)> {
 pub fn detect_array_literal_start(line: &str) -> Option<(String, Option<String>, String)> {
     let trimmed = line.trim();
     
+    // CRITICAL FIX: EXCLUDE control flow statements
+    if is_control_flow_start(trimmed) {
+        return None;
+    }
+    
     // Must have = and [
     if !trimmed.contains('=') || !trimmed.contains('[') {
         return None;
     }
     
-    // Split by first =
-    let parts: Vec<&str> = trimmed.splitn(2, '=').collect();
-    if parts.len() != 2 { return None; }
+    // CRITICAL FIX: Find TRUE assignment `=` (not part of comparison operators)
+    let eq_pos = match find_assignment_eq_position(trimmed) {
+        Some(pos) => pos,
+        None => return None,
+    };
     
-    let left = parts[0].trim();
-    let rhs = parts[1].trim();
+    let left = trimmed[..eq_pos].trim();
+    let rhs = trimmed[eq_pos + 1..].trim();
     
     // CRITICAL FIX: RHS can start with [ OR vec![
     // Determine the content after the opening bracket
@@ -455,6 +609,75 @@ mod tests {
         // Should not match match arms
         let result = detect_enum_literal_start("Event::Data { id } =>");
         assert!(result.is_none());
+    }
+    
+    #[test]
+    fn test_comparison_operators_not_detected_as_enum_literal() {
+        // CRITICAL: These should NOT be detected as enum literals!
+        // Bug was: `if self.status != SyncStatus::Idle {` was incorrectly detected
+        // because splitn(2, '=') split on `=` inside `!=`
+        
+        let result = detect_enum_literal_start("if self.status != SyncStatus::Idle {");
+        assert!(result.is_none(), "!= should not trigger enum literal detection");
+        
+        let result = detect_enum_literal_start("if x == SyncStatus::Synced {");
+        assert!(result.is_none(), "== should not trigger enum literal detection");
+        
+        let result = detect_enum_literal_start("while count <= SyncStatus::Max {");
+        assert!(result.is_none(), "<= should not trigger enum literal detection");
+        
+        let result = detect_enum_literal_start("if level >= SyncStatus::High {");
+        assert!(result.is_none(), ">= should not trigger enum literal detection");
+        
+        // But TRUE assignment should still work
+        let result = detect_enum_literal_start("self.status = SyncStatus::Synced {");
+        assert!(result.is_some(), "true assignment should be detected");
+    }
+    
+    #[test]
+    fn test_control_flow_not_detected_as_literal() {
+        let registry = StructRegistry::new();
+        
+        // if statements
+        assert!(detect_struct_literal_start("if condition = User {", &registry).is_none());
+        assert!(detect_enum_literal_start("if let SyncStatus::Idle = status {").is_none());
+        
+        // while statements
+        assert!(detect_struct_literal_start("while running = Status {", &registry).is_none());
+        
+        // for statements
+        assert!(detect_struct_literal_start("for item = Items {", &registry).is_none());
+        
+        // match statements
+        assert!(detect_struct_literal_start("match x = Value {", &registry).is_none());
+        
+        // return statements
+        assert!(detect_struct_literal_start("return result = Ok {", &registry).is_none());
+    }
+    
+    #[test]
+    fn test_find_assignment_eq_position() {
+        // Simple assignment
+        assert_eq!(find_assignment_eq_position("x = 10"), Some(2));
+        assert_eq!(find_assignment_eq_position("self.status = SyncStatus::Idle"), Some(12));
+        
+        // Comparison operators - should return None
+        assert!(find_assignment_eq_position("x == 10").is_none());
+        assert!(find_assignment_eq_position("x != 10").is_none());
+        assert!(find_assignment_eq_position("x <= 10").is_none());
+        assert!(find_assignment_eq_position("x >= 10").is_none());
+        
+        // Compound assignments - should return None
+        assert!(find_assignment_eq_position("x += 10").is_none());
+        assert!(find_assignment_eq_position("x -= 10").is_none());
+        assert!(find_assignment_eq_position("x *= 10").is_none());
+        
+        // Fat arrow - should return None  
+        assert!(find_assignment_eq_position("x => y").is_none());
+        
+        // Mixed - has both comparison and assignment
+        // `status = if x != y { a } else { b }` - should find the FIRST assignment
+        assert_eq!(find_assignment_eq_position("status = x"), Some(7));
     }
     
     #[test]

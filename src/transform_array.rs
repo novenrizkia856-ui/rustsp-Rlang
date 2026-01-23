@@ -7,7 +7,7 @@
 //! - Single-line enum variants: `Event::Data { id = 1, body = b }`
 //! - Multi-line literals (handled by literal_mode in main parser)
 
-use crate::transform_literal::{find_field_eq, is_string_literal};
+use crate::transform_literal::{find_field_eq, is_string_literal, transform_nested_struct_value};
 
 /// Transform an array element line
 /// 
@@ -147,6 +147,7 @@ fn transform_fields(fields: &str) -> String {
 }
 
 /// Transform a single field: `field = value` -> `field: value`
+/// CRITICAL FIX: Also recursively transforms nested struct values!
 fn transform_single_field(field: &str) -> String {
     let trimmed = field.trim();
     
@@ -159,8 +160,20 @@ fn transform_single_field(field: &str) -> String {
         return trimmed.to_string();
     }
     
-    // Already has colon (Rust syntax) - pass through
+    // Already has colon (Rust syntax) - but might have nested struct with = in value
     if trimmed.contains(':') && !trimmed.contains("::") {
+        // Check if there's a nested struct that needs transformation
+        if trimmed.contains('{') && trimmed.contains('=') {
+            if let Some(colon_pos) = trimmed.find(':') {
+                // Make sure it's not followed by another : (path separator)
+                if colon_pos + 1 < trimmed.len() && trimmed.chars().nth(colon_pos + 1) != Some(':') {
+                    let name = trimmed[..colon_pos].trim();
+                    let value = trimmed[colon_pos + 1..].trim();
+                    let transformed_value = transform_nested_struct_value(value);
+                    return format!("{}: {}", name, transformed_value);
+                }
+            }
+        }
         return trimmed.to_string();
     }
     
@@ -173,6 +186,9 @@ fn transform_single_field(field: &str) -> String {
         let transformed_value = if is_string_literal(value) {
             let inner = &value[1..value.len()-1];
             format!("String::from(\"{}\")", inner)
+        } else if value.contains('{') && value.contains('=') {
+            // CRITICAL FIX: Recursively transform nested struct values!
+            transform_nested_struct_value(value)
         } else {
             value.to_string()
         };

@@ -386,6 +386,20 @@ pub fn parse_rusts_assignment_ext(line: &str) -> Option<(String, Option<String>,
         return None;
     }
     
+    // =========================================================================
+    // CRITICAL FIX: Reject control flow statements BEFORE checking for `=`
+    // These are NEVER assignments, even if they contain `=` somewhere
+    // Bug: `if self.status != SyncStatus::Idle {` was detected as assignment
+    // because `!= ` contains `= ` as substring!
+    // =========================================================================
+    if remaining.starts_with("if ") || remaining.starts_with("while ") 
+       || remaining.starts_with("for ") || remaining.starts_with("match ")
+       || remaining.starts_with("loop ") || remaining.starts_with("unsafe ")
+       || remaining.starts_with("return ") || remaining.starts_with("break ")
+       || remaining.starts_with("continue") {
+        return None;
+    }
+    
     if remaining.is_empty() || remaining == "{" || remaining == "}" || remaining == "}" || remaining.ends_with(',') {
         return None;
     }
@@ -394,35 +408,18 @@ pub fn parse_rusts_assignment_ext(line: &str) -> Option<(String, Option<String>,
         return None;
     }
     
-    if remaining.contains("==") || remaining.contains("!=") || remaining.contains("<=") 
-       || remaining.contains(">=") || remaining.contains("+=") || remaining.contains("-=")
-       || remaining.contains("*=") || remaining.contains("/=") || remaining.contains("=>") {
-        if !remaining.contains("= ") && !remaining.contains(" =") {
-            return None;
-        }
-        
-        let eq_pos = remaining.find('=').unwrap();
-        if eq_pos > 0 {
-            let before_eq = &remaining[..eq_pos];
-            let after_eq_char = remaining.chars().nth(eq_pos + 1);
-            if matches!(after_eq_char, Some('=') | Some('>')) {
-                return None;
-            }
-            if before_eq.ends_with('!') || before_eq.ends_with('<') || before_eq.ends_with('>')
-               || before_eq.ends_with('+') || before_eq.ends_with('-') || before_eq.ends_with('*')
-               || before_eq.ends_with('/') {
-                return None;
-            }
-        }
-    }
+    // =========================================================================
+    // CRITICAL FIX: Use helper function to find standalone assignment `=`
+    // The old logic had a bug where `"!= "` contains `"= "` as substring,
+    // causing lines like `if x != y {` to be incorrectly parsed as assignments.
+    // =========================================================================
+    let eq_pos = match find_standalone_assignment_eq(remaining) {
+        Some(pos) => pos,
+        None => return None, // No standalone `=` found - not an assignment
+    };
     
-    let parts: Vec<&str> = remaining.splitn(2, '=').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    
-    let left = parts[0].trim();
-    let right = parts[1].trim().trim_end_matches(';');
+    let left = remaining[..eq_pos].trim();
+    let right = remaining[eq_pos + 1..].trim().trim_end_matches(';');
     
     if left.is_empty() || right.is_empty() {
         return None;
@@ -498,6 +495,99 @@ pub fn parse_rusts_assignment_ext(line: &str) -> Option<(String, Option<String>,
     }
     
     Some((left.to_string(), None, right.to_string(), is_outer, is_explicit_mut))
+}
+
+/// Find the position of a standalone assignment `=` that's NOT part of an operator.
+/// 
+/// Returns None if no such `=` exists (meaning the line is NOT an assignment).
+/// 
+/// This function properly handles:
+/// - `==` (equality comparison)
+/// - `!=` (not equal) - CRITICAL: `"!= "` contains `"= "` as substring!
+/// - `<=` (less than or equal)
+/// - `>=` (greater than or equal)  
+/// - `=>` (fat arrow / match arm)
+/// - `+=`, `-=`, `*=`, `/=`, `%=` (compound assignment)
+/// - `&=`, `|=`, `^=` (bitwise compound)
+/// - `<<=`, `>>=` (shift compound)
+/// - Nested structures (braces, brackets, parens)
+/// - String literals
+fn find_standalone_assignment_eq(s: &str) -> Option<usize> {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    
+    // Track nested structures - MUST specify type for saturating_sub to work
+    let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
+    let mut in_string = false;
+    let mut prev_char = ' ';
+    
+    for i in 0..len {
+        let c = chars[i];
+        
+        // Handle string literals
+        if c == '"' && prev_char != '\\' {
+            in_string = !in_string;
+            prev_char = c;
+            continue;
+        }
+        
+        if in_string {
+            prev_char = c;
+            continue;
+        }
+        
+        // Track nesting
+        match c {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+        
+        // Only look for `=` at top level (not nested)
+        if c == '=' && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+            // Get characters before and after
+            let prev = if i > 0 { chars[i - 1] } else { ' ' };
+            let next = if i + 1 < len { chars[i + 1] } else { ' ' };
+            
+            // Reject if part of an operator
+            
+            // Check NEXT char: `==`, `=>`
+            if next == '=' || next == '>' {
+                prev_char = c;
+                continue;
+            }
+            
+            // Check PREV char: `!=`, `<=`, `>=`, `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`
+            if prev == '!' || prev == '<' || prev == '>' 
+               || prev == '+' || prev == '-' || prev == '*' || prev == '/' || prev == '%' 
+               || prev == '&' || prev == '|' || prev == '^' {
+                prev_char = c;
+                continue;
+            }
+            
+            // Check for `<<=` and `>>=` (prev is < or > and the one before that is also < or >)
+            if i >= 2 {
+                let prev_prev = chars[i - 2];
+                if (prev == '<' && prev_prev == '<') || (prev == '>' && prev_prev == '>') {
+                    prev_char = c;
+                    continue;
+                }
+            }
+            
+            // This is a standalone assignment `=`
+            return Some(i);
+        }
+        
+        prev_char = c;
+    }
+    
+    None
 }
 
 /// Original parse function for backward compatibility (no outer/mut info)
@@ -751,5 +841,80 @@ mod tests {
         // Should need mut
         assert!(tracker.needs_mut("result", 1),
             "result should need mut because .push() is called");
+    }
+    
+    // =========================================================================
+    // CRITICAL BUG FIX TESTS: Comparison operators not detected as assignment
+    // =========================================================================
+    
+    #[test]
+    fn test_not_equals_not_assignment() {
+        // CRITICAL: This must NOT be detected as assignment
+        // This was the main bug - `!= ` contains `= ` as substring
+        let result = parse_rusts_assignment_ext("if self.status != SyncStatus::Idle {");
+        assert!(result.is_none(), "!= should not be detected as assignment");
+    }
+    
+    #[test]
+    fn test_comparison_operators_not_assignment() {
+        assert!(parse_rusts_assignment_ext("if x == 10 {").is_none(), "== should not be assignment");
+        assert!(parse_rusts_assignment_ext("if x != 10 {").is_none(), "!= should not be assignment");
+        assert!(parse_rusts_assignment_ext("if x <= 10 {").is_none(), "<= should not be assignment");
+        assert!(parse_rusts_assignment_ext("if x >= 10 {").is_none(), ">= should not be assignment");
+        assert!(parse_rusts_assignment_ext("while x != y {").is_none(), "!= in while should not be assignment");
+    }
+    
+    #[test]
+    fn test_compound_operators_not_assignment() {
+        // Compound assignments are handled differently, not through this function
+        assert!(parse_rusts_assignment_ext("x += 1").is_none(), "+= should not match");
+        assert!(parse_rusts_assignment_ext("x -= 1").is_none(), "-= should not match");
+    }
+    
+    #[test]
+    fn test_fat_arrow_not_assignment() {
+        assert!(parse_rusts_assignment_ext("Pattern => value").is_none(), "=> should not be assignment");
+        assert!(parse_rusts_assignment_ext("Ok(_) => result").is_none());
+    }
+    
+    #[test]
+    fn test_control_flow_not_assignment() {
+        assert!(parse_rusts_assignment_ext("if condition {").is_none());
+        assert!(parse_rusts_assignment_ext("while condition {").is_none());
+        assert!(parse_rusts_assignment_ext("for x in iter {").is_none());
+        assert!(parse_rusts_assignment_ext("match expr {").is_none());
+        assert!(parse_rusts_assignment_ext("return value").is_none());
+    }
+    
+    #[test]
+    fn test_valid_simple_assignment_still_works() {
+        let result = parse_rusts_assignment_ext("x = 10");
+        assert!(result.is_some());
+        let (name, _, value, _, _) = result.unwrap();
+        assert_eq!(name, "x");
+        assert_eq!(value, "10");
+    }
+    
+    #[test]
+    fn test_find_standalone_assignment_eq() {
+        // Should find `=` in simple assignment
+        assert_eq!(find_standalone_assignment_eq("x = 10"), Some(2));
+        
+        // Should NOT find `=` in comparisons (these return None)
+        assert!(find_standalone_assignment_eq("x == 10").is_none());
+        assert!(find_standalone_assignment_eq("x != 10").is_none());
+        assert!(find_standalone_assignment_eq("x <= 10").is_none());
+        assert!(find_standalone_assignment_eq("x >= 10").is_none());
+        
+        // Should NOT find `=` in compound assignments
+        assert!(find_standalone_assignment_eq("x += 1").is_none());
+        assert!(find_standalone_assignment_eq("x -= 1").is_none());
+        
+        // Should NOT find `=` in fat arrow
+        assert!(find_standalone_assignment_eq("x => y").is_none());
+        
+        // Should find `=` in assignment with comparison on RHS
+        let pos = find_standalone_assignment_eq("result = x != y");
+        assert_eq!(pos, Some(7)); // position of first `=`
     }
 }

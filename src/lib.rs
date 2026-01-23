@@ -86,6 +86,7 @@ use helpers::{
     strip_inline_comment,
     ends_with_continuation_operator, needs_semicolon,
     transform_struct_field_slice_to_vec,
+    is_field_access, is_tuple_pattern,
 };
 use modes::{
     LiteralKind, LiteralModeStack, ArrayModeStack, UseImportMode,
@@ -616,7 +617,9 @@ pub fn parse_rusts(source: &str) -> String {
                 }
             }
             
-            if needs_semicolon(&transformed) && !is_tail {
+            // CRITICAL FIX: Do NOT add semicolon when inside multiline expression (e.g., function call arguments)
+            // Bug: `e` in multiline println was getting `;` added, breaking the code
+            if needs_semicolon(&transformed) && !is_tail && !inside_multiline_expr {
                 output_lines.push(format!("{}{};", leading_ws, transformed));
             } else {
                 output_lines.push(format!("{}{}", leading_ws, transformed));
@@ -685,49 +688,94 @@ pub fn parse_rusts(source: &str) -> String {
         
         // STRUCT LITERAL START
         if let Some((var_name, struct_name)) = detect_struct_literal_start(trimmed, &struct_registry) {
+            // CRITICAL FIX: Check if var_name is a field access (e.g., self.field)
+            // Field assignments should NOT get `let` prefix!
+            let is_field = is_field_access(&var_name);
+            let is_tuple = is_tuple_pattern(&var_name);
+            
             let scope_needs_mut = scope_analyzer.needs_mut(&var_name, line_num);
             let borrowed_mut = tracker.is_mut_borrowed(&var_name);
             let mutated_via_method = tracker.is_mutated_via_method(&var_name);
             let needs_mut = scope_needs_mut || borrowed_mut || mutated_via_method;
-            let let_keyword = if needs_mut { "let mut" } else { "let" };
+            
+            // Determine if we need `let` keyword
+            let needs_let = !is_field;
+            let let_keyword = if !needs_let {
+                ""
+            } else if needs_mut {
+                "let mut "
+            } else {
+                "let "
+            };
             
             if trimmed.ends_with('}') {
-                let transformed = transform_single_line_struct_literal(trimmed, &var_name);
-                let transformed = if needs_mut {
-                    transformed.replacen("let ", "let mut ", 1)
+                // Single-line struct literal
+                if is_field {
+                    // Field assignment - no let, transform fields
+                    let transformed = transform_bare_struct_literal(trimmed);
+                    output_lines.push(format!("{}{}", leading_ws, transformed));
                 } else {
-                    transformed
-                };
-                output_lines.push(format!("{}{}", leading_ws, transformed));
+                    let transformed = transform_single_line_struct_literal(trimmed, &var_name);
+                    let transformed = if needs_mut && needs_let {
+                        transformed.replacen("let ", "let mut ", 1)
+                    } else {
+                        transformed
+                    };
+                    output_lines.push(format!("{}{}", leading_ws, transformed));
+                }
                 continue;
             }
             
-            literal_mode.enter(LiteralKind::Struct, prev_depth + opens, true);
-            output_lines.push(format!("{}{} {} = {} {{", leading_ws, let_keyword, var_name, struct_name));
+            literal_mode.enter(LiteralKind::Struct, prev_depth + opens, needs_let);
+            output_lines.push(format!("{}{}{} = {} {{", leading_ws, let_keyword, var_name, struct_name));
             continue;
         }
         
         // ENUM STRUCT VARIANT LITERAL
         if let Some((var_name, enum_path)) = detect_enum_literal_start(trimmed) {
+            // CRITICAL FIX: Check if var_name is a field access (e.g., self.status)
+            // Field assignments should NOT get `let` prefix!
+            let is_field = is_field_access(&var_name);
+            let is_tuple = is_tuple_pattern(&var_name);
+            
             let scope_needs_mut = scope_analyzer.needs_mut(&var_name, line_num);
             let borrowed_mut = tracker.is_mut_borrowed(&var_name);
             let mutated_via_method = tracker.is_mutated_via_method(&var_name);
             let needs_mut = scope_needs_mut || borrowed_mut || mutated_via_method;
-            let let_keyword = if needs_mut { "let mut" } else { "let" };
+            
+            // Determine if we need `let` keyword
+            // - Field access: NO let (it's a mutation)
+            // - Tuple pattern: YES let (it's a binding)  
+            // - Simple identifier: YES let (it's a declaration)
+            let needs_let = !is_field;
+            let let_keyword = if !needs_let {
+                ""
+            } else if needs_mut {
+                "let mut "
+            } else {
+                "let "
+            };
             
             if trimmed.ends_with('}') {
-                let transformed = transform_single_line_enum_literal(trimmed, &var_name, &enum_path);
-                let transformed = if needs_mut {
-                    transformed.replacen("let ", "let mut ", 1)
+                // Single-line enum literal
+                if is_field {
+                    // Field assignment - no let, transform fields
+                    let transformed = transform_bare_struct_literal(trimmed);
+                    output_lines.push(format!("{}{}", leading_ws, transformed));
                 } else {
-                    transformed
-                };
-                output_lines.push(format!("{}{}", leading_ws, transformed));
+                    let transformed = transform_single_line_enum_literal(trimmed, &var_name, &enum_path);
+                    let transformed = if needs_mut && needs_let {
+                        transformed.replacen("let ", "let mut ", 1)
+                    } else {
+                        transformed
+                    };
+                    output_lines.push(format!("{}{}", leading_ws, transformed));
+                }
                 continue;
             }
             
-            literal_mode.enter(LiteralKind::EnumVariant, prev_depth + opens, true);
-            output_lines.push(format!("{}{} {} = {} {{", leading_ws, let_keyword, var_name, enum_path));
+            literal_mode.enter(LiteralKind::EnumVariant, prev_depth + opens, needs_let);
+            output_lines.push(format!("{}{}{} = {} {{", leading_ws, let_keyword, var_name, enum_path));
             continue;
         }
         
@@ -810,6 +858,15 @@ pub fn parse_rusts(source: &str) -> String {
                     continue;
                 }
             }
+        }
+        
+        // CONST/STATIC DECLARATION
+        // RustS+: `const NAME TYPE = VALUE` → Rust: `const NAME: TYPE = VALUE;`
+        // RustS+: `static NAME TYPE = VALUE` → Rust: `static NAME: TYPE = VALUE;`
+        // Must be handled BEFORE is_rust_native check
+        if let Some(transformed) = transform_const_or_static(trimmed) {
+            output_lines.push(format!("{}{}", leading_ws, transformed));
+            continue;
         }
         
         // Effect statement skip
@@ -896,6 +953,34 @@ pub fn parse_rusts(source: &str) -> String {
                 }
             }
             continue;
+        }
+        
+        // TUPLE DESTRUCTURING ASSIGNMENT
+        // Pattern: `(a, b) = value` → `let (a, b) = value;`
+        // Must be handled BEFORE regular assignment parser
+        if trimmed.starts_with('(') && trimmed.contains(')') && trimmed.contains('=') {
+            // Find the closing paren and check if = follows
+            if let Some(paren_close) = trimmed.find(')') {
+                let after_paren = trimmed[paren_close + 1..].trim();
+                if after_paren.starts_with('=') && !after_paren.starts_with("==") && !after_paren.starts_with("=>") {
+                    let tuple_part = &trimmed[..=paren_close];
+                    let value_part = after_paren[1..].trim().trim_end_matches(';');
+                    
+                    // Verify it's a valid tuple pattern
+                    if is_tuple_pattern(tuple_part) {
+                        // Transform: add `let` and semicolon
+                        let mut expanded_value = expand_value(value_part, None);
+                        expanded_value = transform_array_access_clone(&expanded_value);
+                        if current_fn_ctx.is_inside() {
+                            expanded_value = transform_string_concat(&expanded_value, &current_fn_ctx);
+                        }
+                        expanded_value = transform_call_args(&expanded_value, &fn_registry);
+                        
+                        output_lines.push(format!("{}let {} = {};", leading_ws, tuple_part, expanded_value));
+                        continue;
+                    }
+                }
+            }
         }
         
         // RUSTS+ ASSIGNMENT
@@ -1036,6 +1121,99 @@ fn update_multiline_depth(depth: &mut i32, trimmed: &str) {
     }
 }
 
+/// Transform RustS+ const/static declarations to Rust syntax.
+/// 
+/// RustS+ syntax: `const NAME TYPE = VALUE` (no colon between name and type)
+/// Rust syntax:   `const NAME: TYPE = VALUE;` (colon required, semicolon at end)
+/// 
+/// Handles:
+/// - `const NAME TYPE = VALUE` → `const NAME: TYPE = VALUE;`
+/// - `static NAME TYPE = VALUE` → `static NAME: TYPE = VALUE;`
+/// - `pub const NAME TYPE = VALUE` → `pub const NAME: TYPE = VALUE;`
+/// - `pub static NAME TYPE = VALUE` → `pub static NAME: TYPE = VALUE;`
+/// - `pub static mut NAME TYPE = VALUE` → `pub static mut NAME: TYPE = VALUE;`
+/// 
+/// Returns None if:
+/// - Not a const/static declaration
+/// - Already in Rust syntax (has colon before `=`)
+fn transform_const_or_static(trimmed: &str) -> Option<String> {
+    // Quick check: must contain const or static
+    if !trimmed.contains("const ") && !trimmed.contains("static ") {
+        return None;
+    }
+    
+    // Must contain `=` for value assignment
+    if !trimmed.contains('=') {
+        return None;
+    }
+    
+    // Parse the declaration
+    // Pattern: [pub] [static [mut] | const] NAME TYPE = VALUE
+    
+    let mut rest = trimmed;
+    let mut prefix = String::new();
+    
+    // Check for `pub`
+    if rest.starts_with("pub ") {
+        prefix.push_str("pub ");
+        rest = rest.strip_prefix("pub ").unwrap().trim();
+    }
+    
+    // Check for `const` or `static`
+    let keyword = if rest.starts_with("const ") {
+        rest = rest.strip_prefix("const ").unwrap().trim();
+        "const"
+    } else if rest.starts_with("static mut ") {
+        rest = rest.strip_prefix("static mut ").unwrap().trim();
+        "static mut"
+    } else if rest.starts_with("static ") {
+        rest = rest.strip_prefix("static ").unwrap().trim();
+        "static"
+    } else {
+        return None;
+    };
+    
+    // Now rest should be: `NAME TYPE = VALUE` or `NAME: TYPE = VALUE`
+    
+    // Find the `=` sign
+    let eq_pos = rest.find('=')?;
+    let before_eq = rest[..eq_pos].trim();
+    let after_eq = rest[eq_pos + 1..].trim();
+    
+    // Check if already in Rust syntax (has colon before =)
+    // This includes patterns like `NAME: TYPE` or `NAME: &'static str`
+    if before_eq.contains(':') {
+        // Already Rust syntax - just ensure semicolon at end
+        let trimmed_input = trimmed.trim_end_matches(';');
+        return Some(format!("{};", trimmed_input));
+    }
+    
+    // RustS+ syntax: NAME TYPE (space-separated, no colon)
+    // Find the NAME (first identifier) and TYPE (rest before =)
+    let parts: Vec<&str> = before_eq.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    
+    let name = parts[0];
+    // Type is everything after the name
+    let type_str = parts[1..].join(" ");
+    
+    // Validate name is a valid identifier
+    let first_char = name.chars().next()?;
+    if name.is_empty() || (!first_char.is_alphabetic() && first_char != '_') {
+        return None;
+    }
+    
+    // Transform type (Vec[T] → Vec<T>)
+    let transformed_type = helpers::transform_generic_brackets(&type_str);
+    
+    // Value without trailing semicolon (we'll add our own)
+    let value = after_eq.trim_end_matches(';');
+    
+    Some(format!("{}{} {}: {} = {};", prefix, keyword, name, transformed_type, value))
+}
+
 fn check_before_closing_brace(lines: &[&str], line_num: usize) -> bool {
     for future_line in lines.iter().skip(line_num + 1) {
         let ft = strip_inline_comment(future_line);
@@ -1102,19 +1280,21 @@ fn inject_derive_clone(output_lines: &mut Vec<String>, leading_ws: &str) {
 }
 
 fn is_rust_native_line(trimmed: &str) -> bool {
-    trimmed.starts_with("let ") 
-        || trimmed.starts_with("const ") 
-        || trimmed.starts_with("static ")
+    // NOTE: const and static are NOT included here because RustS+ uses different syntax:
+    // RustS+: `const NAME TYPE = VALUE` (no colon)
+    // Rust:   `const NAME: TYPE = VALUE;` (has colon)
+    // These are handled separately by transform_const_or_static()
+    trimmed.starts_with("let ")
         || trimmed.starts_with("use ")
-        || trimmed.starts_with("mod ") 
-        || trimmed.starts_with("impl ") 
-        || trimmed.starts_with("trait ") 
+        || trimmed.starts_with("mod ")
+        || trimmed.starts_with("impl ")
+        || trimmed.starts_with("trait ")
         || trimmed.starts_with("type ")
-        || trimmed.starts_with("//") 
-        || trimmed.starts_with("/*") 
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
         || trimmed.starts_with("*")
-        || trimmed.starts_with('#') 
-        || trimmed == "{" 
+        || trimmed.starts_with('#')
+        || trimmed == "{"
         || trimmed == "}"
         || trimmed.starts_with("if ")
         || trimmed.starts_with("else")
@@ -1201,6 +1381,10 @@ fn process_match_arm_body_line(
     opens: usize,
 ) -> Option<String> {
     if let Some((var_name, var_type, value, is_outer, is_explicit_mut)) = parse_rusts_assignment_ext(clean_line) {
+        // CRITICAL FIX: Check if var_name is a field access
+        // Field assignments should NOT get `let` prefix!
+        let is_field = is_field_access(&var_name);
+        
         let is_decl = scope_analyzer.is_decl(line_num);
         let is_mutation = scope_analyzer.is_mut(line_num);
         let borrowed_mut = tracker.is_mut_borrowed(&var_name);
@@ -1218,16 +1402,18 @@ fn process_match_arm_body_line(
         
         let is_param = current_fn_ctx.params.contains_key(&var_name);
         let is_shadowing = tracker.is_shadowing(&var_name, line_num);
-        let should_have_let = is_decl || (!is_mutation && !is_param) || is_shadowing;
+        // Field access never gets `let`
+        let should_have_let = !is_field && (is_decl || (!is_mutation && !is_param) || is_shadowing);
         
         let is_struct_literal_start = expanded_value.trim().ends_with('{');
         let semi = if is_struct_literal_start { "" } else { ";" };
         
         if is_struct_literal_start {
-            literal_mode.enter(LiteralKind::Struct, prev_depth + opens, true);
+            literal_mode.enter(LiteralKind::Struct, prev_depth + opens, should_have_let);
         }
         
-        let result = if is_outer {
+        let result = if is_outer || is_field {
+            // Field access or outer - no let
             format!("{}{} = {}{}", leading_ws, var_name, expanded_value, semi)
         } else if is_explicit_mut {
             let type_annotation = var_type.as_ref().map(|t| format!(": {}", t)).unwrap_or_default();

@@ -388,6 +388,72 @@ pub fn is_valid_identifier(s: &str) -> bool {
     s.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
+/// Check if a string is a field access pattern (e.g., `self.field`, `obj.field`)
+/// These should NOT get `let` prefix as they are mutations, not declarations.
+/// 
+/// Examples:
+/// - `self.status` → true (field access)
+/// - `obj.field` → true (field access)
+/// - `x` → false (simple identifier)
+/// - `(a, b)` → false (tuple pattern)
+pub fn is_field_access(name: &str) -> bool {
+    let trimmed = name.trim();
+    
+    // Must contain `.` but not start with `..` (spread operator)
+    if !trimmed.contains('.') || trimmed.starts_with("..") {
+        return false;
+    }
+    
+    // Check that there's a valid identifier before the dot
+    if let Some(dot_pos) = trimmed.find('.') {
+        let before_dot = &trimmed[..dot_pos];
+        // The part before dot should be a valid identifier
+        is_valid_identifier(before_dot)
+    } else {
+        false
+    }
+}
+
+/// Check if a string is a tuple destructuring pattern (e.g., `(a, b)`, `(x, y, z)`)
+/// These need `let` prefix for tuple binding.
+///
+/// Examples:
+/// - `(a, b)` → true
+/// - `(current, target)` → true  
+/// - `x` → false
+/// - `self.field` → false
+pub fn is_tuple_pattern(name: &str) -> bool {
+    let trimmed = name.trim();
+    
+    // Must start with `(` and end with `)`
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return false;
+    }
+    
+    // Extract content between parentheses
+    let inner = &trimmed[1..trimmed.len()-1];
+    
+    // Must have at least one comma (tuple has 2+ elements)
+    if !inner.contains(',') {
+        return false;
+    }
+    
+    // All parts should be valid identifiers or wildcards
+    let parts: Vec<&str> = inner.split(',').collect();
+    for part in parts {
+        let p = part.trim();
+        if p.is_empty() {
+            return false;
+        }
+        // Allow _ (wildcard) or valid identifier
+        if p != "_" && !is_valid_identifier(p) {
+            return false;
+        }
+    }
+    
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

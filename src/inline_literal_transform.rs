@@ -4,7 +4,7 @@
 //! literals, as well as inline field transformation.
 
 use std::collections::HashMap;
-use crate::transform_literal::{find_field_eq, is_valid_field_name, is_string_literal, should_clone_field_value};
+use crate::transform_literal::{find_field_eq, is_valid_field_name, is_string_literal, should_clone_field_value, transform_nested_struct_value};
 
 /// Transform single-line struct literal: `u = User { id = 1, name = "x" }`
 pub fn transform_single_line_struct_literal(line: &str, var_name: &str) -> String {
@@ -215,6 +215,9 @@ pub fn transform_single_literal_field_with_clone(field: &str, add_clone: bool) -
             let mut transformed_value = if is_string_literal(value) {
                 let inner = &value[1..value.len()-1];
                 format!("String::from(\"{}\")", inner)
+            } else if value.contains('{') && value.contains('=') {
+                // CRITICAL FIX: Recursively transform nested struct values!
+                transform_nested_struct_value(value)
             } else {
                 value.to_string()
             };
