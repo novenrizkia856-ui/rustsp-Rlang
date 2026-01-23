@@ -1,6 +1,6 @@
 changelog
 
-2.add a formal system:
+add a formal system:
 RustS+ going forward must not be treated as “a language with new syntax,” but as a formal system for guaranteeing the correctness of program meaning. Its development architecture starts from the premise that Rust has already solved the problem of memory correctness, while RustS+ addresses a higher-level problem: correctness of intent, state, and effects on the real world. Therefore, the entire RustS+ toolchain must be oriented toward semantic analysis, not merely textual transformation. The official RustS+ pipeline is built on a sequence of formal IRs: from .rss to AST (structure), then to HIR (meaning and scope), then to EIR (effect contracts), and only then lowered to Rust. With this architecture, RustS+ is no longer a “regex compiler,” but a semantic compiler that formally understands what a program does.
 
 At the center of this system lies a two-layer type system: the first layer is Rust’s type system (i32, struct, enum, borrow, generics), and the second layer is the Effect Capability System. Every value has not only a data type, but also rights over reality: whether it may be read (read x), written (write x), perform I/O, allocate memory, or panic. The write(x) capability is treated as a linear resource, like &mut T in Rust: it cannot be duplicated and may only be owned by a single party at a time. This makes changes to world state exclusive, explicit, and verifiable, just like memory mutation in Rust.
@@ -17,6 +17,13 @@ With this foundation, RustS+ is ready to enter production in the same way Rust o
 
 In essence, RustS+ evolves not by adding features, but by deepening the meaning that the compiler can verify. With formal IRs, a capability-based type system, and linear effect ownership, RustS+ becomes a language that is not only memory-safe, but reality-safe. Once this foundation is solid, only then can it expand like Rust did: from DSDN to the entire world of systems that must not fail.
 
-1.fixed all translations from rustsp to rust
-2.Simplification of the toolchain architecture to act as a wrapper for the original Cargo Rust
-3.other stabilization
+
+Effect detection based on TYPE SIGNATURE:
+- Function has EffectSignature in TypeEnv
+- Function calls to → effect lookup from signature
+- ROBUST! Effect type is included, not string
+
+
+-fixed all translations from rustsp to rust
+-Simplification of the toolchain architecture to act as a wrapper for the original Cargo Rust
+-other stabilization

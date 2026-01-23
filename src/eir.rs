@@ -57,6 +57,13 @@
 //! ```
 
 use std::collections::{HashMap, HashSet, BTreeSet};
+
+// Re-export TypeEnv and TypeDrivenInference for type-driven effect inference
+// This is the Phase 1.1 implementation of the RustS+ roadmap
+pub use crate::type_env::{
+    TypeEnv, TypeEnvBuilder, TypeDrivenInference, 
+    FunctionType, EffectSignature, ParamEffect,
+};
 use crate::ast::{Span, Spanned, Ident, Literal, EffectDecl};
 use crate::hir::{
     BindingId, BindingInfo, HirExpr, HirStmt, HirBlock, HirFnDef,
@@ -360,6 +367,35 @@ impl EffectContext {
     
     pub fn is_panic_function(&self, name: &str) -> bool {
         self.panic_functions.contains(name)
+    }
+    
+    /// Create EffectContext from TypeEnv (bridge for type-driven inference)
+    ///
+    /// This allows gradual migration from pattern-based to type-driven inference.
+    /// The TypeEnv provides the authoritative function signatures, and this
+    /// method creates a compatible EffectContext for existing code.
+    pub fn from_type_env(type_env: &TypeEnv, bindings: HashMap<BindingId, BindingInfo>) -> Self {
+        let mut ctx = EffectContext::new(bindings);
+        
+        // Transfer function effects from TypeEnv
+        for func in type_env.all_functions() {
+            ctx.register_function(&func.name, func.effect_sig.effects.clone());
+        }
+        
+        ctx
+    }
+    
+    /// Merge function effects from TypeEnv into this context
+    ///
+    /// Use this when you have an existing EffectContext and want to
+    /// augment it with type information from a TypeEnv.
+    pub fn merge_from_type_env(&mut self, type_env: &TypeEnv) {
+        for func in type_env.all_functions() {
+            // Only add if not already present (user-defined takes precedence)
+            if !self.function_effects.contains_key(&func.name) {
+                self.register_function(&func.name, func.effect_sig.effects.clone());
+            }
+        }
     }
 }
 

@@ -24,6 +24,7 @@ pub mod ast;
 pub mod hir;
 pub mod eir;
 pub mod parser;
+pub mod type_env;  // Phase 1.1: Type-driven effect inference
 
 pub mod source_map;
 
@@ -48,6 +49,12 @@ pub use ast::{Span, Spanned, EffectDecl};
 pub use hir::{BindingId, BindingInfo, ScopeResolver, HirModule};
 pub use eir::{Effect, EffectSet, EffectContext, EffectInference};
 pub use parser::{Lexer, FunctionParser, extract_function_signatures};
+
+// Re-export Type Environment for type-driven inference (Phase 1.1)
+pub use type_env::{
+    TypeEnv, TypeEnvBuilder, TypeDrivenInference,
+    FunctionType, EffectSignature, ParamEffect,
+};
 
 use variable::{VariableTracker, parse_rusts_assignment_ext, expand_value};
 use scope::ScopeAnalyzer;

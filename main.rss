@@ -1,0 +1,365 @@
+//! RustS+ Effect System Test File
+//! 
+//! This file tests the Phase 1.1 Type-Driven Effect Inference
+//! Compile with: rustsp compile test_effects.rss -o test_effects.rs
+//!
+//! Expected: All effect declarations should match detected effects
+
+//=============================================================================
+// PURE FUNCTIONS (No Effects)
+//=============================================================================
+
+/// Pure function - no side effects
+/// Should compile without any effect declaration
+fn pure_add(a i32, b i32) i32 {
+    a + b
+}
+
+/// Pure function with complex logic
+fn fibonacci(n u64) u64 {
+    if n <= 1 {
+        n
+    } else {
+        fibonacci(n - 1) + fibonacci(n - 2)
+    }
+}
+
+/// Pure function returning struct (stack allocated, no alloc!)
+fn create_point(x i32, y i32) Point {
+    Point { x: x, y: y }
+}
+
+//=============================================================================
+// I/O EFFECTS
+//=============================================================================
+
+/// Function with IO effect - prints to console
+fn log_message(msg String) effects(io) {
+    println!("{}", msg)
+}
+
+/// Multiple IO operations
+fn interactive_greeting(name String) effects(io) {
+    println!("Hello, {}!", name)
+    println!("Welcome to RustS+!")
+}
+
+/// IO with return value
+fn prompt_and_log(question String) effects(io) String {
+    println!("{}", question)
+    question
+}
+
+//=============================================================================
+// ALLOCATION EFFECTS
+//=============================================================================
+
+/// Creates a new Vec - heap allocation
+fn create_empty_vec() effects(alloc) Vec[i32] {
+    Vec::new()
+}
+
+/// Creates Vec with capacity
+fn create_vec_with_capacity(cap usize) effects(alloc) Vec[String] {
+    Vec::with_capacity(cap)
+}
+
+/// Creates a new String from &str
+fn string_from_str(s &str) effects(alloc) String {
+    String::from(s)
+}
+
+/// Creates a boxed value
+fn boxed_value(x i32) effects(alloc) Box[i32] {
+    Box::new(x)
+}
+
+/// Multiple allocations
+fn create_collections() effects(alloc) (Vec[i32], String, HashMap[String, i32]) {
+    items = Vec::new()
+    name = String::from("test")
+    map = HashMap::new()
+    (items, name, map)
+}
+
+/// to_string() allocates
+fn number_to_string(n i32) effects(alloc) String {
+    n.to_string()
+}
+
+//=============================================================================
+// PANIC EFFECTS
+//=============================================================================
+
+/// May panic with unwrap
+fn unsafe_unwrap(opt Option[i32]) effects(panic) i32 {
+    opt.unwrap()
+}
+
+/// May panic with expect
+fn unsafe_expect(opt Option[String]) effects(panic) String {
+    opt.expect("Value required!")
+}
+
+/// Assert may panic
+fn assert_positive(n i32) effects(panic) {
+    assert!(n > 0)
+}
+
+/// Multiple panic sources
+fn dangerous_operations(a Option[i32], b Option[i32]) effects(panic) i32 {
+    x = a.unwrap()
+    y = b.expect("b must exist")
+    assert!(x > 0)
+    x + y
+}
+
+//=============================================================================
+// PARAMETER READ EFFECTS
+//=============================================================================
+
+/// Reads from account parameter
+fn get_balance(acc Account) effects(read(acc)) i64 {
+    acc.balance
+}
+
+/// Reads from multiple parameters
+fn calculate_total(acc1 Account, acc2 Account) effects(read(acc1), read(acc2)) i64 {
+    acc1.balance + acc2.balance
+}
+
+/// Read with computation
+fn compute_interest(acc Account, rate f64) effects(read(acc)) f64 {
+    acc.balance as f64 * rate
+}
+
+//=============================================================================
+// PARAMETER WRITE EFFECTS
+//=============================================================================
+
+/// Writes to account parameter (mutation)
+fn deposit(acc Account, amount i64) effects(write(acc)) Account {
+    acc.balance += amount
+    acc
+}
+
+/// Multiple writes
+fn transfer_internal(from Account, to Account, amount i64) effects(write(from), write(to)) {
+    from.balance -= amount
+    to.balance += amount
+}
+
+/// Write with validation
+fn withdraw_safe(acc Account, amount i64) effects(write(acc), panic) Account {
+    assert!(acc.balance >= amount)
+    acc.balance -= amount
+    acc
+}
+
+//=============================================================================
+// COMBINED EFFECTS
+//=============================================================================
+
+/// IO + Alloc: Log and return formatted string
+fn format_and_log(data i32) effects(io, alloc) String {
+    msg = format!("Data: {}", data)
+    println!("{}", msg)
+    msg
+}
+
+/// IO + Panic: Dangerous logging
+fn log_required(opt Option[String]) effects(io, panic) {
+    msg = opt.unwrap()
+    println!("{}", msg)
+}
+
+/// Alloc + Panic: Create or panic
+fn create_or_fail(should_create bool) effects(alloc, panic) Vec[i32] {
+    assert!(should_create)
+    Vec::new()
+}
+
+/// Read + Write: Transform account
+fn double_balance(acc Account) effects(read(acc), write(acc)) Account {
+    current = acc.balance
+    acc.balance = current * 2
+    acc
+}
+
+/// Full combo: IO + Alloc + Write + Panic
+fn complex_operation(acc Account, name String) effects(io, alloc, write(acc), panic) String {
+    assert!(acc.balance > 0)
+    acc.balance -= 1
+    result = format!("Processed: {}", name)
+    println!("{}", result)
+    result
+}
+
+//=============================================================================
+// EFFECT PROPAGATION (Caller must declare callee's effects)
+//=============================================================================
+
+/// Calls log_message which has io effect
+/// Therefore this function must also declare io
+fn wrapper_log(msg String) effects(io) {
+    log_message(msg)
+}
+
+/// Calls create_empty_vec which has alloc effect
+fn wrapper_alloc() effects(alloc) Vec[i32] {
+    create_empty_vec()
+}
+
+/// Calls multiple effectful functions
+fn combined_wrapper(msg String) effects(io, alloc) Vec[i32] {
+    log_message(msg)
+    create_empty_vec()
+}
+
+/// Nested call chain
+/// NOTE: .to_string() allocates, so we need alloc effect!
+fn deep_call_chain(acc Account, amount i64) effects(write(acc), io, alloc) Account {
+    result = deposit(acc, amount)  // write(acc) propagates
+    log_message("Deposit complete".to_string())  // io propagates + alloc from to_string()
+    result
+}
+
+//=============================================================================
+// STRUCT DEFINITIONS (for testing)
+//=============================================================================
+
+struct Point {
+    x i32,
+    y i32,
+}
+
+struct Account {
+    id u64,
+    balance i64,
+    owner String,
+}
+
+struct Wallet {
+    accounts Vec[Account],
+    total_balance i64,
+}
+
+//=============================================================================
+// METHODS ON STRUCTS
+//=============================================================================
+
+impl Account {
+    /// Constructor - allocates String for owner
+    fn new(id u64, owner String) effects(alloc) Account {
+        Account {
+            id: id,
+            balance: 0,
+            owner: owner,
+        }
+    }
+    
+    /// Pure getter
+    fn get_id(self) u64 {
+        self.id
+    }
+    
+    /// Mutating method
+    fn add_funds(self, amount i64) effects(write(self)) {
+        self.balance += amount
+    }
+    
+    /// Method with IO
+    fn print_balance(self) effects(io, read(self)) {
+        println!("Balance: {}", self.balance)
+    }
+}
+
+impl Wallet {
+    /// Creates new wallet with allocation
+    fn new() effects(alloc) Wallet {
+        Wallet {
+            accounts: Vec::new(),
+            total_balance: 0,
+        }
+    }
+    
+    /// Adds account - mutates wallet, allocates in vec
+    fn add_account(self, acc Account) effects(write(self), alloc) {
+        self.total_balance += acc.balance
+        self.accounts.push(acc)
+    }
+}
+
+//=============================================================================
+// CLOSURES AND HIGHER-ORDER FUNCTIONS
+//=============================================================================
+
+/// Function taking closure - closure's effects propagate
+fn map_accounts(accounts Vec[Account], f fn(Account) Account) effects(alloc) Vec[Account] {
+    result = Vec::new()
+    for acc in accounts {
+        result.push(f(acc))
+    }
+    result
+}
+
+/// Uses closure with io effect
+fn log_all_balances(accounts Vec[Account]) effects(io, read(accounts)) {
+    for acc in accounts {
+        println!("Account {}: {}", acc.id, acc.balance)
+    }
+}
+
+//=============================================================================
+// ERROR HANDLING PATTERNS
+//=============================================================================
+
+/// Returns Result instead of panicking - no panic effect needed!
+/// BUT: Creating error String allocates, so we need alloc effect
+fn safe_divide(a i32, b i32) effects(alloc) Result[i32, String] {
+    if b == 0 {
+        Err(String::from("Division by zero"))
+    } else {
+        Ok(a / b)
+    }
+}
+
+/// Propagates Result - still no panic
+fn calculate_ratio(x i32, y i32, z i32) effects(alloc) Result[i32, String] {
+    first = safe_divide(x, y)?
+    safe_divide(first, z)
+}
+
+/// Uses ? operator - may allocate error string
+fn process_data(input Option[i32]) effects(alloc) Result[i32, String] {
+    value = input.ok_or(String::from("No input"))?
+    Ok(value * 2)
+}
+
+//=============================================================================
+// MAIN FUNCTION
+//=============================================================================
+
+/// Main entry point - can have any effects
+fn main() effects(io, alloc, panic) {
+    // Pure operations
+    sum = pure_add(10, 20)
+    fib = fibonacci(10)
+    
+    // IO
+    log_message(String::from("Starting RustS+ Effect Test"))
+    
+    // Allocation
+    numbers = create_empty_vec()
+    name = string_from_str("RustS+")
+    
+    // Create account
+    acc = Account::new(1, String::from("Alice"))
+    acc.add_funds(1000)
+    acc.print_balance()
+    
+    // Combined operations
+    result = complex_operation(acc, String::from("test"))
+    
+    println!("Test completed successfully!")
+}
