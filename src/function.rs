@@ -33,6 +33,8 @@ pub struct FunctionSignature {
     pub is_pub: bool,
     pub is_single_line: bool,
     pub single_line_expr: Option<String>,
+    /// Parameters that have `write` effect - these need `mut` in Rust output
+    pub write_params: Vec<String>,
 }
 
 /// Result of parsing a function line
@@ -142,6 +144,7 @@ fn find_matching_bracket(s: &str) -> Option<usize> {
 /// Effect annotations MUST NOT appear in Rust output.
 /// 
 /// Also transforms RustS+ generic syntax: Vec[T] → Vec<T>
+/// Also transforms function pointer types: fn(T) R → fn(T) -> R
 /// 
 /// Examples:
 /// - `[Tx]` → `&[Tx]`
@@ -150,6 +153,7 @@ fn find_matching_bracket(s: &str) -> Option<usize> {
 /// - `Vec<T>` → `Vec<T>` (unchanged, already Rust syntax)
 /// - `&[T]` → `&[T]` (already borrowed, unchanged)
 /// - `effects(read x) T` → `T` (effects stripped)
+/// - `fn(Account) Account` → `fn(Account) -> Account` (function pointer)
 fn transform_param_type(type_str: &str) -> String {
     // L-05 CRITICAL: Strip effects clause FIRST before any other transformation
     let stripped = strip_effects_clause(type_str);
@@ -158,6 +162,10 @@ fn transform_param_type(type_str: &str) -> String {
     // CRITICAL: Transform generic brackets Vec[T] → Vec<T>
     let generic_transformed = transform_generic_brackets(trimmed);
     let trimmed = generic_transformed.as_str();
+    
+    // CRITICAL: Transform function pointer types fn(T) R → fn(T) -> R
+    let fn_transformed = transform_fn_pointer_type(trimmed);
+    let trimmed = fn_transformed.as_str();
     
     // If it's already a reference, leave it alone
     if trimmed.starts_with('&') {
@@ -965,6 +973,119 @@ pub fn strip_effects_clause(type_str: &str) -> String {
     }
 }
 
+/// Extract parameters with `write` effect from effects clause
+/// 
+/// Examples:
+/// - `effects(write acc)` → ["acc"]
+/// - `effects(write from, write to, io)` → ["from", "to"]
+/// - `effects(io, alloc)` → []
+/// - `effects(write(acc))` → ["acc"]  (parenthesized form)
+/// - `effects(write self)` → ["self"]
+pub fn extract_write_params(type_str: &str) -> Vec<String> {
+    let trimmed = type_str.trim();
+    
+    if !trimmed.starts_with("effects(") {
+        return Vec::new();
+    }
+    
+    // Find the matching closing paren for effects(...)
+    let mut paren_depth = 0;
+    let mut effects_end = 0;
+    
+    for (i, c) in trimmed.char_indices() {
+        match c {
+            '(' => paren_depth += 1,
+            ')' => {
+                paren_depth -= 1;
+                if paren_depth == 0 {
+                    effects_end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    if effects_end == 0 {
+        return Vec::new();
+    }
+    
+    // Extract the content inside effects(...)
+    let effects_content = &trimmed[8..effects_end]; // Skip "effects("
+    
+    let mut write_params = Vec::new();
+    
+    // Split by comma and look for "write" effects
+    for effect in effects_content.split(',') {
+        let effect = effect.trim();
+        
+        // Handle both forms:
+        // - "write acc" (space-separated)
+        // - "write(acc)" (parenthesized)
+        if effect.starts_with("write(") && effect.ends_with(')') {
+            // Parenthesized form: write(acc)
+            let param = effect[6..effect.len()-1].trim();
+            if !param.is_empty() {
+                write_params.push(param.to_string());
+            }
+        } else if effect.starts_with("write ") {
+            // Space-separated form: write acc
+            let param = effect[6..].trim();
+            if !param.is_empty() {
+                write_params.push(param.to_string());
+            }
+        }
+    }
+    
+    write_params
+}
+
+/// Transform function pointer types: fn(T) R → fn(T) -> R
+/// Also handles multiple params: fn(A, B) C → fn(A, B) -> C
+fn transform_fn_pointer_type(type_str: &str) -> String {
+    let trimmed = type_str.trim();
+    
+    // Must start with "fn("
+    if !trimmed.starts_with("fn(") {
+        return trimmed.to_string();
+    }
+    
+    // Find the closing paren
+    let mut depth = 0;
+    let mut paren_end = None;
+    
+    for (i, c) in trimmed.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    paren_end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    let paren_end = match paren_end {
+        Some(pos) => pos,
+        None => return trimmed.to_string(),
+    };
+    
+    // Get the part after the closing paren
+    let after_paren = trimmed[paren_end + 1..].trim();
+    
+    // If it's empty or already has ->, return as-is
+    if after_paren.is_empty() || after_paren.starts_with("->") {
+        return trimmed.to_string();
+    }
+    
+    // There's a return type without -> , add it
+    let fn_params = &trimmed[..paren_end + 1];
+    format!("{} -> {}", fn_params, after_paren)
+}
+
 fn parse_rustsplus_function(after_fn: &str, is_pub: bool) -> Result<FunctionSignature, String> {
     let mut rest = after_fn.trim();
     
@@ -995,6 +1116,10 @@ fn parse_rustsplus_function(after_fn: &str, is_pub: bool) -> Result<FunctionSign
     rest = rest[paren_end + 1..].trim();
     
     let parameters = parse_parameters(params_str)?;
+    
+    // CRITICAL FIX: Extract write params BEFORE stripping effects clause
+    // This allows us to know which params need `mut` in the Rust output
+    let write_params = extract_write_params(rest);
     
     let (return_type, is_single_line, single_line_expr) = if rest.is_empty() || rest == "{" {
         (None, false, None)
@@ -1038,6 +1163,7 @@ fn parse_rustsplus_function(after_fn: &str, is_pub: bool) -> Result<FunctionSign
     
     Ok(FunctionSignature {
         name, generics, parameters, return_type, is_pub, is_single_line, single_line_expr,
+        write_params,
     })
 }
 
@@ -1170,6 +1296,9 @@ pub fn signature_to_rust(sig: &FunctionSignature) -> String {
     result.push('(');
     let params: Vec<String> = sig.parameters.iter()
         .map(|p| {
+            // Check if this param needs `mut` due to write effect
+            let needs_mut = sig.write_params.contains(&p.name);
+            
             // CRITICAL FIX: Handle `self` parameter specially
             // RustS+: `self &` or `self &mut` 
             // Rust:   `&self` or `&mut self`
@@ -1178,8 +1307,16 @@ pub fn signature_to_rust(sig: &FunctionSignature) -> String {
                 if type_trimmed == "&mut" || type_trimmed.starts_with("&mut") {
                     return "&mut self".to_string();
                 } else if type_trimmed == "&" || type_trimmed.starts_with("&") {
+                    // CRITICAL: If write(self) is declared, use &mut self
+                    if needs_mut {
+                        return "&mut self".to_string();
+                    }
                     return "&self".to_string();
                 } else if type_trimmed.is_empty() {
+                    // CRITICAL: If write(self) is declared for owned self, use mut self
+                    if needs_mut {
+                        return "mut self".to_string();
+                    }
                     return "self".to_string();
                 } else {
                     // Custom self type like `self: Box<Self>`
@@ -1190,7 +1327,13 @@ pub fn signature_to_rust(sig: &FunctionSignature) -> String {
             // L-06: Transform bare slice type [T] to &[T] for parameters
             // Bare [T] is unsized and cannot be a function parameter in Rust
             let transformed_type = transform_param_type(&p.param_type);
-            format!("{}: {}", p.name, transformed_type)
+            
+            // CRITICAL: Add `mut` if this param has write effect
+            if needs_mut {
+                format!("mut {}: {}", p.name, transformed_type)
+            } else {
+                format!("{}: {}", p.name, transformed_type)
+            }
         })
         .collect();
     result.push_str(&params.join(", "));
@@ -1464,6 +1607,161 @@ mod tests {
                 panic!("L-05: Line with effects() should NOT be treated as Rust passthrough");
             }
             _ => {} // Any other result is fine
+        }
+    }
+    
+    //=========================================================================
+    // WRITE EFFECT TESTS
+    // Parameters with write(param) effect must get `mut` in Rust output
+    //=========================================================================
+    
+    #[test]
+    fn test_extract_write_params_basic() {
+        // effects(write acc) -> ["acc"]
+        let result = extract_write_params("effects(write acc) Account");
+        assert_eq!(result, vec!["acc"]);
+    }
+    
+    #[test]
+    fn test_extract_write_params_parenthesized() {
+        // effects(write(acc)) -> ["acc"]
+        let result = extract_write_params("effects(write(acc)) Account");
+        assert_eq!(result, vec!["acc"]);
+    }
+    
+    #[test]
+    fn test_extract_write_params_multiple() {
+        // effects(write from, write to) -> ["from", "to"]
+        let result = extract_write_params("effects(write from, write to, io) Account");
+        assert_eq!(result, vec!["from", "to"]);
+    }
+    
+    #[test]
+    fn test_extract_write_params_no_write() {
+        // effects(io, alloc) -> []
+        let result = extract_write_params("effects(io, alloc) Account");
+        assert!(result.is_empty());
+    }
+    
+    #[test]
+    fn test_extract_write_params_self() {
+        // effects(write self) -> ["self"]
+        let result = extract_write_params("effects(write self) {");
+        assert_eq!(result, vec!["self"]);
+    }
+    
+    #[test]
+    fn test_write_effect_adds_mut() {
+        // fn deposit(acc Account) effects(write acc) Account { 
+        // -> fn deposit(mut acc: Account) -> Account {
+        let line = "fn deposit(acc Account) effects(write acc) Account {";
+        match parse_function_line(line) {
+            FunctionParseResult::RustSPlusSignature(sig) => {
+                assert_eq!(sig.write_params, vec!["acc"]);
+                let rust = signature_to_rust(&sig);
+                assert!(rust.contains("mut acc: Account"),
+                    "Write effect must add mut to param, got: {}", rust);
+            }
+            _ => panic!("Expected RustSPlusSignature"),
+        }
+    }
+    
+    #[test]
+    fn test_write_effect_multiple_params() {
+        // fn transfer(from Account, to Account, amount i64) effects(write from, write to) {
+        let line = "fn transfer(from Account, to Account, amount i64) effects(write from, write to) {";
+        match parse_function_line(line) {
+            FunctionParseResult::RustSPlusSignature(sig) => {
+                assert_eq!(sig.write_params.len(), 2);
+                let rust = signature_to_rust(&sig);
+                assert!(rust.contains("mut from: Account"),
+                    "Write effect must add mut to from, got: {}", rust);
+                assert!(rust.contains("mut to: Account"),
+                    "Write effect must add mut to to, got: {}", rust);
+                assert!(rust.contains("amount: i64"),
+                    "Non-write param should not have mut, got: {}", rust);
+            }
+            _ => panic!("Expected RustSPlusSignature"),
+        }
+    }
+    
+    #[test]
+    fn test_write_effect_self() {
+        // fn add_funds(self, amount i64) effects(write self) { 
+        // -> fn add_funds(mut self, amount: i64) {
+        let line = "fn add_funds(self, amount i64) effects(write self) {";
+        match parse_function_line(line) {
+            FunctionParseResult::RustSPlusSignature(sig) => {
+                assert!(sig.write_params.contains(&"self".to_string()));
+                let rust = signature_to_rust(&sig);
+                assert!(rust.contains("mut self"),
+                    "Write effect on self must produce 'mut self', got: {}", rust);
+            }
+            _ => panic!("Expected RustSPlusSignature"),
+        }
+    }
+    
+    #[test]
+    fn test_write_effect_parenthesized_form() {
+        // effects(write(acc)) - parenthesized form
+        let line = "fn deposit(acc Account) effects(write(acc)) Account {";
+        match parse_function_line(line) {
+            FunctionParseResult::RustSPlusSignature(sig) => {
+                assert_eq!(sig.write_params, vec!["acc"]);
+                let rust = signature_to_rust(&sig);
+                assert!(rust.contains("mut acc: Account"),
+                    "Parenthesized write effect must add mut, got: {}", rust);
+            }
+            _ => panic!("Expected RustSPlusSignature"),
+        }
+    }
+    
+    //=========================================================================
+    // FUNCTION POINTER TYPE TESTS
+    // fn(T) R must become fn(T) -> R
+    //=========================================================================
+    
+    #[test]
+    fn test_transform_fn_pointer_basic() {
+        // fn(Account) Account -> fn(Account) -> Account
+        let result = transform_fn_pointer_type("fn(Account) Account");
+        assert_eq!(result, "fn(Account) -> Account");
+    }
+    
+    #[test]
+    fn test_transform_fn_pointer_multiple_params() {
+        // fn(A, B) C -> fn(A, B) -> C
+        let result = transform_fn_pointer_type("fn(A, B) C");
+        assert_eq!(result, "fn(A, B) -> C");
+    }
+    
+    #[test]
+    fn test_transform_fn_pointer_already_arrow() {
+        // fn(A) -> B (already correct) -> unchanged
+        let result = transform_fn_pointer_type("fn(A) -> B");
+        assert_eq!(result, "fn(A) -> B");
+    }
+    
+    #[test]
+    fn test_transform_fn_pointer_no_return() {
+        // fn(A) (no return type) -> unchanged
+        let result = transform_fn_pointer_type("fn(A)");
+        assert_eq!(result, "fn(A)");
+    }
+    
+    #[test]
+    fn test_fn_pointer_in_param() {
+        // fn map_accounts(accounts Vec[Account], f fn(Account) Account) Vec[Account]
+        let line = "fn map_accounts(accounts Vec[Account], f fn(Account) Account) Vec[Account] {";
+        match parse_function_line(line) {
+            FunctionParseResult::RustSPlusSignature(sig) => {
+                let rust = signature_to_rust(&sig);
+                assert!(rust.contains("fn(Account) -> Account"),
+                    "Function pointer type must have arrow, got: {}", rust);
+                assert!(rust.contains("Vec<Account>"),
+                    "Generics must be transformed, got: {}", rust);
+            }
+            _ => panic!("Expected RustSPlusSignature"),
         }
     }
 }
