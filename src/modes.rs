@@ -118,10 +118,17 @@ impl ArrayModeStack {
         self.stack.last()
     }
     
-    /// Check if we should exit (bracket depth went back to entry point)
+    /// Check if we should exit (bracket depth went BELOW entry point)
+    /// CRITICAL FIX: Use `<` not `<=` because intermediate lines with balanced 
+    /// nested brackets (like `[0x11u8; 64]`) would have same depth as start!
+    /// - Enter at depth 1 with `vec![`
+    /// - Element `(101, Hash::from_bytes([0x11u8; 64])),` has balanced [], depth stays 1
+    /// - With `<=`: 1 <= 1 = TRUE → premature exit! BUG!
+    /// - With `<`:  1 < 1 = FALSE → correct, continue
+    /// - Closing `]`: depth goes to 0, 0 < 1 = TRUE → correct exit!
     pub fn should_exit(&self, current_bracket_depth: usize) -> bool {
         if let Some(entry) = self.stack.last() {
-            current_bracket_depth <= entry.start_bracket_depth
+            current_bracket_depth < entry.start_bracket_depth
         } else {
             false
         }
@@ -263,6 +270,14 @@ mod tests {
         let current = stack.current().unwrap();
         assert_eq!(current.var_name, "arr");
         assert!(current.needs_let);
+        
+        // CRITICAL: Test that should_exit uses STRICT less-than
+        // start_bracket_depth = 1
+        // should_exit(1) should be FALSE (not exit on balanced nested brackets!)
+        // should_exit(0) should be TRUE (exit when depth goes below start)
+        assert!(!stack.should_exit(1), "should NOT exit at same depth (nested brackets case)");
+        assert!(!stack.should_exit(2), "should NOT exit at higher depth");
+        assert!(stack.should_exit(0), "should exit when depth below start");
         
         stack.exit();
         assert!(!stack.is_active());

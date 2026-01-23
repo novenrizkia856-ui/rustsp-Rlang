@@ -319,10 +319,10 @@ pub fn detect_enum_literal_start(line: &str) -> Option<(String, String)> {
 
 //===========================================================================
 // ARRAY LITERAL DETECTION
-// Detects array literal start: `var = [` where bracket is not closed on same line
+// Detects array literal start: `var = [` or `var = vec![` where bracket is not closed on same line
 //===========================================================================
 
-/// Detect if line starts an array literal: `varname = [` or `varname = [\n`
+/// Detect if line starts an array literal: `varname = [` or `varname = vec![`
 /// Returns (var_name, var_type, remaining_content) if matched
 pub fn detect_array_literal_start(line: &str) -> Option<(String, Option<String>, String)> {
     let trimmed = line.trim();
@@ -339,12 +339,27 @@ pub fn detect_array_literal_start(line: &str) -> Option<(String, Option<String>,
     let left = parts[0].trim();
     let rhs = parts[1].trim();
     
-    // RHS must start with [ (after trimming)
-    if !rhs.starts_with('[') {
+    // CRITICAL FIX: RHS can start with [ OR vec![
+    // Determine the content after the opening bracket
+    let (starts_array, after_bracket) = if rhs.starts_with('[') {
+        // Direct array: `[...]`
+        (true, &rhs[1..])
+    } else if rhs.starts_with("vec![") {
+        // Vec macro: `vec![...]`
+        (true, &rhs[5..])
+    } else if rhs.starts_with("Vec::from([") {
+        // Vec::from: `Vec::from([...])`
+        (true, &rhs[11..])
+    } else {
+        (false, rhs)
+    };
+    
+    if !starts_array {
         return None;
     }
     
-    // If the line ends with ], it's a single-line array - let normal handling take it
+    // If the line ends with ] or ];, it's a single-line array - let normal handling take it
+    // Count brackets in the ENTIRE rhs to check if complete
     let open_brackets = rhs.matches('[').count();
     let close_brackets = rhs.matches(']').count();
     if open_brackets == close_brackets && close_brackets > 0 {
@@ -367,9 +382,6 @@ pub fn detect_array_literal_start(line: &str) -> Option<(String, Option<String>,
     if !is_valid_identifier(&var_name) {
         return None;
     }
-    
-    // Content after [ (may be empty or have first element)
-    let after_bracket = &rhs[1..];
     
     Some((var_name, var_type, after_bracket.to_string()))
 }
@@ -526,5 +538,36 @@ mod tests {
         
         let result = detect_bare_struct_literal("format(\"user {} logged in\")");
         assert!(result.is_none());
+    }
+    
+    //=========================================================================
+    // VEC![ MACRO DETECTION TESTS
+    // Verify that vec![ is properly detected as array literal
+    //=========================================================================
+    
+    #[test]
+    fn test_detect_vec_macro_array_literal() {
+        // vec![ should be detected as array literal start
+        let result = detect_array_literal_start("arr = vec![");
+        assert!(result.is_some(), "vec![ should be detected as array literal");
+        let (var, var_type, after) = result.unwrap();
+        assert_eq!(var, "arr");
+        assert!(var_type.is_none());
+        assert!(after.is_empty());
+        
+        // vec![ with initial content
+        let result = detect_array_literal_start("items = vec![ SyncStatus::Idle,");
+        assert!(result.is_some(), "vec![ with content should be detected");
+        let (var, _, after) = result.unwrap();
+        assert_eq!(var, "items");
+        assert!(after.trim().starts_with("SyncStatus"));
+        
+        // Single-line vec![] should return None
+        let result = detect_array_literal_start("arr = vec![1, 2, 3]");
+        assert!(result.is_none(), "complete vec![] should not be detected");
+        
+        // Vec::from([ should also work
+        let result = detect_array_literal_start("data = Vec::from([");
+        assert!(result.is_some(), "Vec::from([ should be detected as array literal");
     }
 }

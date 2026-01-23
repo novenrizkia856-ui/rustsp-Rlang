@@ -547,26 +547,48 @@ pub fn parse_rusts(source: &str) -> String {
             
             // Bare struct/enum literal handling
             if let Some(struct_name) = detect_bare_struct_literal(trimmed, &struct_registry) {
-                if trimmed.ends_with('}') {
+                // CRITICAL FIX: Handle both `}` and `},` endings
+                let is_complete_single_line = trimmed.ends_with('}') || 
+                                              trimmed.ends_with("},") ||
+                                              trimmed.ends_with("};");
+                
+                if is_complete_single_line && opens == closes {
                     let transformed = transform_bare_struct_literal(trimmed);
                     output_lines.push(format!("{}{}", leading_ws, transformed));
                     continue;
                 }
                 
-                literal_mode.enter(LiteralKind::Struct, prev_depth + opens, false);
-                output_lines.push(format!("{}{} {{", leading_ws, struct_name));
+                if opens > closes {
+                    literal_mode.enter(LiteralKind::Struct, prev_depth + opens, false);
+                    output_lines.push(format!("{}{} {{", leading_ws, struct_name));
+                    continue;
+                }
+                
+                let transformed = transform_bare_struct_literal(trimmed);
+                output_lines.push(format!("{}{}", leading_ws, transformed));
                 continue;
             }
             
             if let Some(enum_path) = detect_bare_enum_literal(trimmed) {
-                if trimmed.ends_with('}') {
+                // CRITICAL FIX: Handle both `}` and `},` endings
+                let is_complete_single_line = trimmed.ends_with('}') || 
+                                              trimmed.ends_with("},") ||
+                                              trimmed.ends_with("};");
+                
+                if is_complete_single_line && opens == closes {
                     let transformed = transform_bare_struct_literal(trimmed);
                     output_lines.push(format!("{}{}", leading_ws, transformed));
                     continue;
                 }
                 
-                literal_mode.enter(LiteralKind::EnumVariant, prev_depth + opens, false);
-                output_lines.push(format!("{}{} {{", leading_ws, enum_path));
+                if opens > closes {
+                    literal_mode.enter(LiteralKind::EnumVariant, prev_depth + opens, false);
+                    output_lines.push(format!("{}{} {{", leading_ws, enum_path));
+                    continue;
+                }
+                
+                let transformed = transform_bare_struct_literal(trimmed);
+                output_lines.push(format!("{}{}", leading_ws, transformed));
                 continue;
             }
             
@@ -711,27 +733,57 @@ pub fn parse_rusts(source: &str) -> String {
         
         // BARE STRUCT LITERAL
         if let Some(struct_name) = detect_bare_struct_literal(trimmed, &struct_registry) {
-            if trimmed.ends_with('}') {
+            // CRITICAL FIX: Check for COMPLETE single-line literals
+            // Must handle both `}` and `},` endings (with trailing comma)
+            let is_complete_single_line = trimmed.ends_with('}') || 
+                                          trimmed.ends_with("},") ||
+                                          trimmed.ends_with("};");
+            
+            if is_complete_single_line && opens == closes {
                 let transformed = transform_bare_struct_literal(trimmed);
                 output_lines.push(format!("{}{}", leading_ws, transformed));
                 continue;
             }
             
-            literal_mode.enter(LiteralKind::Struct, prev_depth + opens, false);
-            output_lines.push(format!("{}{} {{", leading_ws, struct_name));
+            // Only enter literal mode if this is truly a multi-line start (opens > closes)
+            if opens > closes {
+                literal_mode.enter(LiteralKind::Struct, prev_depth + opens, false);
+                output_lines.push(format!("{}{} {{", leading_ws, struct_name));
+                continue;
+            }
+            
+            // If opens == closes but not matching complete patterns,
+            // just transform and output
+            let transformed = transform_bare_struct_literal(trimmed);
+            output_lines.push(format!("{}{}", leading_ws, transformed));
             continue;
         }
         
         // BARE ENUM STRUCT VARIANT LITERAL
         if let Some(enum_path) = detect_bare_enum_literal(trimmed) {
-            if trimmed.ends_with('}') {
+            // CRITICAL FIX: Check for COMPLETE single-line literals
+            // Must handle both `}` and `},` endings (with trailing comma)
+            let is_complete_single_line = trimmed.ends_with('}') || 
+                                          trimmed.ends_with("},") ||
+                                          trimmed.ends_with("};");
+            
+            if is_complete_single_line && opens == closes {
                 let transformed = transform_bare_struct_literal(trimmed);
                 output_lines.push(format!("{}{}", leading_ws, transformed));
                 continue;
             }
             
-            literal_mode.enter(LiteralKind::EnumVariant, prev_depth + opens, false);
-            output_lines.push(format!("{}{} {{", leading_ws, enum_path));
+            // Only enter literal mode if this is truly a multi-line start (opens > closes)
+            if opens > closes {
+                literal_mode.enter(LiteralKind::EnumVariant, prev_depth + opens, false);
+                output_lines.push(format!("{}{} {{", leading_ws, enum_path));
+                continue;
+            }
+            
+            // If opens == closes but not matching the complete patterns, 
+            // it might be invalid - just transform and output
+            let transformed = transform_bare_struct_literal(trimmed);
+            output_lines.push(format!("{}{}", leading_ws, transformed));
             continue;
         }
         
@@ -822,12 +874,23 @@ pub fn parse_rusts(source: &str) -> String {
                 String::new()
             };
             
+            // CRITICAL FIX: Detect if source uses vec![ and preserve it
+            let parts: Vec<&str> = trimmed.splitn(2, '=').collect();
+            let rhs = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            let array_open = if rhs.starts_with("vec![") {
+                "vec!["
+            } else if rhs.starts_with("Vec::from([") {
+                "Vec::from(["
+            } else {
+                "["
+            };
+            
             let after = after_bracket.trim();
             if after.is_empty() {
-                output_lines.push(format!("{}{}{}{} = [", leading_ws, let_keyword, var_name, type_annotation));
+                output_lines.push(format!("{}{}{}{} = {}", leading_ws, let_keyword, var_name, type_annotation, array_open));
             } else {
                 let transformed_first = transform_array_element(&format!("    {}", after));
-                output_lines.push(format!("{}{}{}{} = [", leading_ws, let_keyword, var_name, type_annotation));
+                output_lines.push(format!("{}{}{}{} = {}", leading_ws, let_keyword, var_name, type_annotation, array_open));
                 if !transformed_first.trim().is_empty() {
                     output_lines.push(transformed_first);
                 }
