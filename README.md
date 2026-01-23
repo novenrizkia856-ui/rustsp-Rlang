@@ -1545,6 +1545,42 @@ fn detect_write_effect(line: &str, param: &str) -> bool {
 
 This conservative approach **eliminates false positives** while maintaining strict effect tracking for definite effects.
 
+### 1.1 Type-Driven Effect Inference (Roadmap)
+
+**Current State:** Pattern-based detection (regex/string matching)  
+**Target:** Type-driven structural inference
+
+```rust
+// CURRENT: Heuristic detection
+fn detect_alloc_effect(line: &str) -> bool {
+    line.contains("Vec::new") || line.contains("Box::new")  // Fragile!
+}
+
+// TARGET: Type-based inference from HIR
+fn infer_effects(expr: &HirExpr, type_env: &TypeEnv) -> EffectSet {
+    match expr {
+        HirExpr::Call { func, args } => {
+            let func_type = type_env.lookup(func);
+            func_type.effect_signature()  // From type, not string!
+        }
+        HirExpr::FieldMut { base, .. } => {
+            if type_env.is_param(base) {
+                EffectSet::write(base.binding_id())
+            } else {
+                EffectSet::empty()
+            }
+        }
+        // ...
+    }
+}
+```
+
+**Deliverables:**
+- [ ] Type environment untuk semua expressions
+- [ ] Effect signature di function types
+- [ ] Inference algorithm yang structural
+- [ ] Unit tests untuk setiap inference rule
+
 ### Scope Analysis Algorithm
 
 ```rust
