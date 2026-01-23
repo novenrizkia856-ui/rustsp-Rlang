@@ -2,3 +2,5 @@
 /Cargo.lock
 *.pdb
 /testing
+main_rusts_temp.rs
+main_1.rss
