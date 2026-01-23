@@ -255,16 +255,14 @@ pub fn parse_rusts(source: &str) -> String {
             }
         }
         
-        // Calculate depths
+        // Calculate depths - CRITICAL: Must ignore braces inside string literals!
         let prev_depth = brace_depth;
-        let opens = trimmed.matches('{').count();
-        let closes = trimmed.matches('}').count();
+        let (opens, closes) = count_braces_outside_strings(trimmed);
         brace_depth += opens;
         brace_depth = brace_depth.saturating_sub(closes);
         
         let prev_bracket_depth = bracket_depth;
-        let bracket_opens = trimmed.matches('[').count();
-        let bracket_closes = trimmed.matches(']').count();
+        let (bracket_opens, bracket_closes) = count_brackets_outside_strings(trimmed);
         bracket_depth += bracket_opens;
         bracket_depth = bracket_depth.saturating_sub(bracket_closes);
         
@@ -323,23 +321,67 @@ pub fn parse_rusts(source: &str) -> String {
             }
         }
         
+        // ARRAY MODE - with nested literal support for multi-line elements
         if array_mode.is_active() {
-            let transformed = transform_array_element(&clean_line);
-            output_lines.push(transformed);
-            continue;
+            // CRITICAL FIX: If also in literal mode, let literal mode handle it
+            // This allows multi-line struct/enum literals inside arrays to work
+            if literal_mode.is_active() {
+                // Fall through to literal mode handling below
+            } else {
+                // Check if this line starts a multi-line struct/enum literal
+                // Pattern: `Enum::Variant {` or `StructName {` where { is not closed
+                let starts_multiline_literal = if opens > closes {
+                    // Has unclosed brace - could be struct or enum literal start
+                    if trimmed.contains("::") {
+                        // Potential enum variant: SyncStatus::SyncingHeaders {
+                        detect_bare_enum_literal(trimmed).is_some()
+                    } else {
+                        // Potential struct literal: User {
+                        detect_bare_struct_literal(trimmed, &struct_registry).is_some()
+                    }
+                } else {
+                    false
+                };
+                
+                if starts_multiline_literal {
+                    // Transform the start line and enter literal mode
+                    let transformed = transform_array_element(&clean_line);
+                    output_lines.push(transformed);
+                    
+                    // Enter literal mode for the fields
+                    let kind = if trimmed.contains("::") { 
+                        LiteralKind::EnumVariant 
+                    } else { 
+                        LiteralKind::Struct 
+                    };
+                    // is_assignment=false because it's an array element, not assignment
+                    literal_mode.enter(kind, prev_depth + opens, false);
+                    continue;
+                }
+                
+                // Regular array element (single-line)
+                let transformed = transform_array_element(&clean_line);
+                output_lines.push(transformed);
+                continue;
+            }
         }
         
-        // LITERAL MODE
-        if literal_mode.is_active() && trimmed == "}" {
+        // LITERAL MODE CLOSING
+        // Handle both "}" and "}," (user may or may not include comma)
+        if literal_mode.is_active() && (trimmed == "}" || trimmed == "},") {
             if literal_mode.should_exit(brace_depth) {
                 let was_assignment = literal_mode.current_is_assignment();
                 literal_mode.exit();
-                let suffix = if literal_mode.is_active() { 
-                    "," 
+                
+                // CRITICAL FIX: When inside array, closing literal needs comma
+                let suffix = if array_mode.is_active() {
+                    ","  // Inside array - element needs comma
+                } else if literal_mode.is_active() { 
+                    ","  // Nested literal - needs comma
                 } else if was_assignment {
-                    ";"
+                    ";"  // Assignment - needs semicolon
                 } else {
-                    ""
+                    ""   // Bare literal (return expression)
                 };
                 output_lines.push(format!("{}}}{}", leading_ws, suffix));
                 continue;
@@ -831,6 +873,77 @@ pub fn parse_rusts(source: &str) -> String {
 // HELPER FUNCTIONS
 //===========================================================================
 
+/// Count opening and closing braces OUTSIDE of string literals
+/// This is CRITICAL to avoid counting format placeholders like {} in "hello {} world"
+fn count_braces_outside_strings(s: &str) -> (usize, usize) {
+    let mut opens = 0;
+    let mut closes = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    
+    for c in s.chars() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        
+        if c == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+        
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        
+        if !in_string {
+            match c {
+                '{' => opens += 1,
+                '}' => closes += 1,
+                _ => {}
+            }
+        }
+    }
+    
+    (opens, closes)
+}
+
+/// Count opening and closing brackets OUTSIDE of string literals
+fn count_brackets_outside_strings(s: &str) -> (usize, usize) {
+    let mut opens = 0;
+    let mut closes = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    
+    for c in s.chars() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        
+        if c == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+        
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        
+        if !in_string {
+            match c {
+                '[' => opens += 1,
+                ']' => closes += 1,
+                _ => {}
+            }
+        }
+    }
+    
+    (opens, closes)
+}
+
 fn update_multiline_depth(depth: &mut i32, trimmed: &str) {
     let mut in_string = false;
     let mut escape_next = false;
@@ -888,8 +1001,7 @@ fn detect_arm_has_if_expr(lines: &[&str], line_num: usize, start_depth: usize) -
         let ft = strip_inline_comment(future_line);
         let ft_trim = ft.trim();
         
-        let ft_opens = ft_trim.matches('{').count();
-        let ft_closes = ft_trim.matches('}').count();
+        let (ft_opens, ft_closes) = count_braces_outside_strings(ft_trim);
         
         temp_depth += ft_opens;
         temp_depth = temp_depth.saturating_sub(ft_closes);

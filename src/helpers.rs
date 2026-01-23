@@ -258,8 +258,50 @@ pub fn transform_macro_calls(line: &str) -> String {
         "module_path", "compile_error",
     ];
     
+    // CRITICAL: Path-qualified macros like anyhow::bail, anyhow::anyhow
+    // These must be transformed to anyhow::bail!, anyhow::anyhow! etc.
+    const PATH_MACROS: &[&str] = &[
+        "anyhow::bail",
+        "anyhow::anyhow",
+        "anyhow::ensure",
+        "anyhow::format_err",
+        "log::info",
+        "log::debug",
+        "log::warn",
+        "log::error",
+        "log::trace",
+        "tracing::info",
+        "tracing::debug",
+        "tracing::warn",
+        "tracing::error",
+        "tracing::trace",
+        "tracing::instrument",
+        "tracing::info_span",
+        "tracing::debug_span",
+        "tracing::warn_span",
+        "tracing::error_span",
+        "tokio::select",
+        "tokio::join",
+        "tokio::try_join",
+        "futures::select",
+        "futures::join",
+        "serde_json::json",
+    ];
+    
     let mut result = line.to_string();
     
+    // CRITICAL: First handle path-qualified macros (must be done before simple macros)
+    // These are unambiguous since they contain ::
+    for macro_name in PATH_MACROS {
+        let search_pattern = format!("{}(", macro_name);
+        let correct_pattern = format!("{}!(", macro_name);
+        
+        if result.contains(&search_pattern) && !result.contains(&correct_pattern) {
+            result = result.replace(&search_pattern, &format!("{}!(", macro_name));
+        }
+    }
+    
+    // Then handle simple macros
     for macro_name in MACROS {
         let search_pattern = format!("{}(", macro_name);
         let correct_pattern = format!("{}!(", macro_name);
@@ -374,5 +416,39 @@ mod tests {
         assert!(is_valid_identifier("foo"));
         assert!(is_valid_identifier("_bar"));
         assert!(!is_valid_identifier("123foo"));
+    }
+    
+    #[test]
+    fn test_transform_path_macros() {
+        // CRITICAL: Path-qualified macros like anyhow::bail must be transformed
+        assert_eq!(
+            transform_macro_calls("anyhow::bail(\"error message\")"),
+            "anyhow::bail!(\"error message\")"
+        );
+        assert_eq!(
+            transform_macro_calls("anyhow::anyhow(\"error: {}\", x)"),
+            "anyhow::anyhow!(\"error: {}\", x)"
+        );
+        assert_eq!(
+            transform_macro_calls("log::info(\"message\")"),
+            "log::info!(\"message\")"
+        );
+        // Already has ! should not be double-transformed
+        assert_eq!(
+            transform_macro_calls("anyhow::bail!(\"already correct\")"),
+            "anyhow::bail!(\"already correct\")"
+        );
+    }
+    
+    #[test]
+    fn test_transform_simple_macros() {
+        assert_eq!(
+            transform_macro_calls("println(\"hello\")"),
+            "println!(\"hello\")"
+        );
+        assert_eq!(
+            transform_macro_calls("vec(1, 2, 3)"),
+            "vec!(1, 2, 3)"
+        );
     }
 }

@@ -115,20 +115,21 @@ impl ParserState {
     }
     
     /// Update brace depth tracking and return (prev_depth, opens, closes)
+    /// CRITICAL: Ignores braces inside string literals to prevent false positives
+    /// from format strings like "header {} mismatch"
     pub fn update_brace_depth(&mut self, trimmed: &str) -> (usize, usize, usize) {
         let prev_depth = self.brace_depth;
-        let opens = trimmed.matches('{').count();
-        let closes = trimmed.matches('}').count();
+        let (opens, closes) = count_braces_outside_strings(trimmed);
         self.brace_depth += opens;
         self.brace_depth = self.brace_depth.saturating_sub(closes);
         (prev_depth, opens, closes)
     }
     
     /// Update bracket depth tracking and return (prev_bracket_depth, bracket_opens, bracket_closes)
+    /// CRITICAL: Ignores brackets inside string literals
     pub fn update_bracket_depth(&mut self, trimmed: &str) -> (usize, usize, usize) {
         let prev_bracket_depth = self.bracket_depth;
-        let bracket_opens = trimmed.matches('[').count();
-        let bracket_closes = trimmed.matches(']').count();
+        let (bracket_opens, bracket_closes) = count_brackets_outside_strings(trimmed);
         self.bracket_depth += bracket_opens;
         self.bracket_depth = self.bracket_depth.saturating_sub(bracket_closes);
         (prev_bracket_depth, bracket_opens, bracket_closes)
@@ -153,5 +154,104 @@ impl ParserState {
 impl Default for ParserState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Count opening and closing braces OUTSIDE of string literals
+/// This is CRITICAL to avoid counting format placeholders like {} in "hello {} world"
+fn count_braces_outside_strings(s: &str) -> (usize, usize) {
+    let mut opens = 0;
+    let mut closes = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    
+    for c in s.chars() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        
+        if c == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+        
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        
+        if !in_string {
+            match c {
+                '{' => opens += 1,
+                '}' => closes += 1,
+                _ => {}
+            }
+        }
+    }
+    
+    (opens, closes)
+}
+
+/// Count opening and closing brackets OUTSIDE of string literals
+fn count_brackets_outside_strings(s: &str) -> (usize, usize) {
+    let mut opens = 0;
+    let mut closes = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    
+    for c in s.chars() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        
+        if c == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+        
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        
+        if !in_string {
+            match c {
+                '[' => opens += 1,
+                ']' => closes += 1,
+                _ => {}
+            }
+        }
+    }
+    
+    (opens, closes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_count_braces_outside_strings() {
+        // Normal braces
+        assert_eq!(count_braces_outside_strings("{ hello }"), (1, 1));
+        assert_eq!(count_braces_outside_strings("{{ nested }}"), (2, 2));
+        
+        // Braces inside strings should be IGNORED
+        assert_eq!(count_braces_outside_strings("\"hello {} world\""), (0, 0));
+        assert_eq!(count_braces_outside_strings("anyhow::bail(\"header {} mismatch\")"), (0, 0));
+        
+        // Mixed - real brace + format placeholder inside string
+        assert_eq!(count_braces_outside_strings("if x { \"fmt {}\" }"), (1, 1));
+        
+        // Escaped quotes in string
+        assert_eq!(count_braces_outside_strings("\"escaped \\\" quote {}\""), (0, 0));
+    }
+    
+    #[test]
+    fn test_count_brackets_outside_strings() {
+        assert_eq!(count_brackets_outside_strings("[1, 2, 3]"), (1, 1));
+        assert_eq!(count_brackets_outside_strings("\"array [0]\""), (0, 0));
     }
 }
