@@ -394,6 +394,132 @@ pub fn detect_bare_enum_literal(line: &str) -> Option<String> {
     None
 }
 
+/// Detect struct literal INSIDE function call: `Some(StructName {`, `Ok(StructName {`
+/// Returns the struct name if this pattern starts a struct literal
+/// 
+/// Pattern: `FuncCall(StructName {` where:
+/// - There's a `(` before `{`
+/// - Between `(` and `{` is a valid struct name (PascalCase or known struct)
+/// - Brace count shows unclosed `{` (opens > closes)
+/// 
+/// This handles cases like:
+/// - `Some(PrivateTxInfo {`
+/// - `Ok(Result { field = value })`
+/// - `return Some(Data {`
+pub fn detect_struct_literal_in_call(line: &str, registry: &StructRegistry) -> Option<String> {
+    let trimmed = line.trim();
+    
+    // EXCLUDE function definitions
+    if is_rust_block_start(trimmed) {
+        return None;
+    }
+    
+    // EXCLUDE control flow
+    if is_control_flow_start(trimmed) {
+        return None;
+    }
+    
+    // Must have both `(` and `{`
+    let paren_pos = match trimmed.rfind('(') {
+        Some(pos) => pos,
+        None => return None,
+    };
+    
+    let brace_pos = match find_brace_outside_string(trimmed) {
+        Some(pos) if pos > paren_pos => pos,
+        _ => return None,
+    };
+    
+    // Extract text between `(` and `{`
+    let between = trimmed[paren_pos + 1..brace_pos].trim();
+    
+    // Must be a valid struct name (PascalCase identifier or registered struct)
+    if between.is_empty() {
+        return None;
+    }
+    
+    // Check for valid struct name
+    let struct_name: String = between
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    
+    if struct_name.is_empty() {
+        return None;
+    }
+    
+    // Validate: must start with uppercase (PascalCase) or be a registered struct
+    let first_char = struct_name.chars().next().unwrap();
+    if !first_char.is_uppercase() && !registry.is_struct(&struct_name) {
+        return None;
+    }
+    
+    // Check that brace is unclosed (multi-line struct literal)
+    let opens = trimmed.matches('{').count();
+    let closes = trimmed.matches('}').count();
+    
+    if opens > closes {
+        return Some(struct_name);
+    }
+    
+    None
+}
+
+/// Detect enum variant literal INSIDE function call: `Some(Enum::Variant {`
+/// Returns the enum path if this pattern starts an enum literal
+pub fn detect_enum_literal_in_call(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    
+    // EXCLUDE function definitions
+    if is_rust_block_start(trimmed) {
+        return None;
+    }
+    
+    // EXCLUDE control flow
+    if is_control_flow_start(trimmed) {
+        return None;
+    }
+    
+    // Must have `(`, `::`, and `{`
+    let paren_pos = match trimmed.rfind('(') {
+        Some(pos) => pos,
+        None => return None,
+    };
+    
+    let brace_pos = match find_brace_outside_string(trimmed) {
+        Some(pos) if pos > paren_pos => pos,
+        _ => return None,
+    };
+    
+    let between = &trimmed[paren_pos + 1..brace_pos];
+    
+    // Must have ::
+    if !between.contains("::") {
+        return None;
+    }
+    
+    let enum_path = between.trim();
+    
+    // Validate enum path: must have uppercase variant after ::
+    if let Some(last_colon_pos) = enum_path.rfind("::") {
+        let variant = &enum_path[last_colon_pos + 2..].trim();
+        if !variant.is_empty() {
+            let first_char = variant.chars().next().unwrap();
+            if first_char.is_uppercase() {
+                // Check that brace is unclosed
+                let opens = trimmed.matches('{').count();
+                let closes = trimmed.matches('}').count();
+                
+                if opens > closes {
+                    return Some(enum_path.to_string());
+                }
+            }
+        }
+    }
+    
+    None
+}
+
 /// Detect if line starts an enum struct variant literal: `varname = Enum::Variant {`
 pub fn detect_enum_literal_start(line: &str) -> Option<(String, String)> {
     let trimmed = line.trim();

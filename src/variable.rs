@@ -666,6 +666,14 @@ pub fn is_valid_identifier(s: &str) -> bool {
 pub fn expand_value(value: &str, explicit_type: Option<&str>) -> String {
     let trimmed = value.trim();
     
+    // Handle closure with RustS+ parameter syntax: `|param TYPE|` -> `|param: TYPE|`
+    if trimmed.starts_with('|') {
+        let transformed = transform_closure_params(trimmed);
+        if transformed != trimmed {
+            return transformed;
+        }
+    }
+    
     // Handle string literal (simple case, no concatenation)
     // CRITICAL FIX: In Rust, bare string literals are &'static str by default
     // Only convert to String::from() if EXPLICITLY typed as String
@@ -690,6 +698,135 @@ pub fn expand_value(value: &str, explicit_type: Option<&str>) -> String {
     }
     
     trimmed.to_string()
+}
+
+/// Transform RustS+ closure parameters to Rust syntax
+/// `|param TYPE|` -> `|param: TYPE|`
+/// `|param TYPE| -> RetType { body }` -> `|param: TYPE| -> RetType { body }`
+/// `|a &Address, b u32|` -> `|a: &Address, b: u32|`
+fn transform_closure_params(closure: &str) -> String {
+    let trimmed = closure.trim();
+    
+    // Must start with `|`
+    if !trimmed.starts_with('|') {
+        return trimmed.to_string();
+    }
+    
+    // Find the closing `|` of the parameter list
+    let mut depth = 0;
+    let mut close_pipe_pos = None;
+    let chars: Vec<char> = trimmed.chars().collect();
+    
+    for (i, &c) in chars.iter().enumerate().skip(1) {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            '|' if depth == 0 => {
+                close_pipe_pos = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    
+    let close_pos = match close_pipe_pos {
+        Some(pos) => pos,
+        None => return trimmed.to_string(), // No closing `|` found
+    };
+    
+    // Extract parameters between the pipes
+    let params_str = &trimmed[1..close_pos];
+    let after_params = &trimmed[close_pos..]; // Includes the closing `|`
+    
+    // Split parameters by comma
+    let params: Vec<&str> = split_closure_params(params_str);
+    
+    // Transform each parameter
+    let transformed_params: Vec<String> = params.iter()
+        .map(|p| transform_single_closure_param(p.trim()))
+        .collect();
+    
+    format!("|{}|{}", transformed_params.join(", "), &after_params[1..])
+}
+
+/// Split closure parameters by comma, respecting nested angle brackets and parens
+fn split_closure_params(params: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut depth = 0;
+    
+    for (i, c) in params.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                result.push(&params[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    
+    if start < params.len() {
+        result.push(&params[start..]);
+    }
+    
+    result
+}
+
+/// Transform a single closure parameter: `param TYPE` -> `param: TYPE`
+fn transform_single_closure_param(param: &str) -> String {
+    let trimmed = param.trim();
+    
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    
+    // Already has colon - pass through
+    if trimmed.contains(':') {
+        return trimmed.to_string();
+    }
+    
+    // Check for RustS+ style: `param TYPE`
+    // The type must start with uppercase, `&`, `(`, `[`, or be a known primitive
+    if let Some(space_pos) = trimmed.find(' ') {
+        let param_name = &trimmed[..space_pos].trim();
+        let param_type = &trimmed[space_pos + 1..].trim();
+        
+        // Validate param_name is a valid identifier
+        let name_valid = !param_name.is_empty() && 
+            param_name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) &&
+            param_name.chars().all(|c| c.is_alphanumeric() || c == '_');
+        
+        // Validate param_type looks like a type
+        let type_valid = !param_type.is_empty() && (
+            param_type.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+            || param_type.starts_with('&')
+            || param_type.starts_with('(')
+            || param_type.starts_with('[')
+            || param_type.starts_with("Vec")
+            || param_type.starts_with("Option")
+            || param_type.starts_with("Result")
+            || param_type.starts_with("Box")
+            || param_type.starts_with("impl ")
+            || param_type.starts_with("dyn ")
+            || is_primitive_type(param_type)
+        );
+        
+        if name_valid && type_valid {
+            return format!("{}: {}", param_name, param_type);
+        }
+    }
+    
+    // No transformation needed
+    trimmed.to_string()
+}
+
+/// Check if a type string is a primitive type
+fn is_primitive_type(t: &str) -> bool {
+    matches!(t, "i8" | "i16" | "i32" | "i64" | "i128" | "isize" |
+               "u8" | "u16" | "u32" | "u64" | "u128" | "usize" |
+               "f32" | "f64" | "bool" | "char" | "str")
 }
 
 /// Expands string concatenation to make it Rust-legal

@@ -179,6 +179,11 @@ pub fn needs_semicolon(trimmed: &str) -> bool {
         return false;
     }
     
+    // CRITICAL FIX: `where` clause should not get semicolon
+    if trimmed == "where" || trimmed.starts_with("where ") {
+        return false;
+    }
+    
     if trimmed.starts_with("if ") || trimmed.starts_with("else") 
        || trimmed.starts_with("for ") || trimmed.starts_with("while ")
        || trimmed.starts_with("loop") || trimmed.starts_with("match ") {

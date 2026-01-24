@@ -258,31 +258,135 @@ pub fn is_multi_pattern_final(line: &str) -> bool {
         return false;
     }
     
-    // Count braces - needs at least 2 `{` for pattern + body
-    // Pattern: `| EnumVariant { field } { body }`
-    //           ^-- 1st brace (destruct) ^-- 2nd brace (body)
-    // Or: `| SimpleVariant { body }` 
-    //                       ^-- only 1 brace (body), no destruct
-    
-    // Find brace pairs to determine if there's a body
+    // Count braces
     let brace_count = trimmed.matches('{').count();
     let close_count = trimmed.matches('}').count();
     
-    // If balanced braces and at least one pair, check if it's body
-    if brace_count >= 1 && brace_count == close_count {
-        // Find last `{` and last `}`
-        if let (Some(last_open), Some(last_close)) = (trimmed.rfind('{'), trimmed.rfind('}')) {
-            if last_close > last_open {
-                // There's content between last { and last }
-                let body = &trimmed[last_open + 1..last_close];
-                if !body.trim().is_empty() {
-                    return true;
+    // Must have balanced braces
+    if brace_count != close_count || brace_count == 0 {
+        return false;
+    }
+    
+    // CRITICAL FIX: Detect if last `{ }` is a body or struct destructure
+    // 
+    // TWO or more brace pairs: Last pair is body
+    //   `| EnumVariant { field } { body }` → TRUE (has body)
+    //
+    // ONE brace pair: Need to check if it's destructure or body
+    //   `| EnumVariant { field, .. }` → FALSE (just destructure)
+    //   `| SimpleVariant { body_expr }` → TRUE (body)
+    //
+    // Heuristic: Struct destructure content is:
+    //   - Identifiers (field names) separated by commas
+    //   - Optional `..` rest pattern
+    //   - Optional `ref` or `mut` before identifiers
+    //   - Optional `: alias` after identifiers
+    // Body content has expressions with operators, parens, function calls, etc.
+    
+    if brace_count >= 2 {
+        // Two+ brace pairs means pattern + body
+        return true;
+    }
+    
+    // One brace pair - check if it's struct destructure or body
+    if let (Some(last_open), Some(last_close)) = (trimmed.rfind('{'), trimmed.rfind('}')) {
+        if last_close > last_open {
+            let content = trimmed[last_open + 1..last_close].trim();
+            if !content.is_empty() {
+                // Check if content looks like struct destructure (identifiers + commas)
+                // or like a body expression
+                if is_struct_destructure_content(content) {
+                    return false; // It's just destructuring, not a body
+                } else {
+                    return true; // It's a body expression
                 }
             }
         }
     }
     
     false
+}
+
+/// Check if brace content looks like struct destructure (field names)
+/// vs body expression (operators, function calls, etc.)
+/// 
+/// Destructure: `field1, field2, ..`, `ref x, mut y`, `x: alias`
+/// Body: `expr`, `a + b`, `func()`, `*ptr`, `(tuple)`
+fn is_struct_destructure_content(content: &str) -> bool {
+    // Split by comma to check each part
+    let parts: Vec<&str> = content.split(',').map(|s| s.trim()).collect();
+    
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        
+        // `..` rest pattern is destructure
+        if part == ".." {
+            continue;
+        }
+        
+        // Strip ref/mut prefix
+        let binding = part
+            .strip_prefix("ref ")
+            .or_else(|| part.strip_prefix("mut "))
+            .unwrap_or(part)
+            .trim();
+        
+        // Check for rename pattern: `field: alias`
+        let identifier = if let Some(colon_pos) = binding.find(':') {
+            // Make sure it's not ::
+            if colon_pos > 0 && binding.as_bytes().get(colon_pos.saturating_sub(1)) == Some(&b':') {
+                binding // Has :: so treat whole thing as identifier
+            } else {
+                binding[..colon_pos].trim()
+            }
+        } else {
+            binding
+        };
+        
+        if identifier.is_empty() {
+            return false;
+        }
+        
+        // Body expressions have operators and special characters
+        // that wouldn't appear in field bindings
+        let has_expression_chars = identifier.contains('(')
+            || identifier.contains(')')
+            || identifier.contains('+')
+            || identifier.contains('-')
+            || identifier.contains('*')
+            || identifier.contains('/')
+            || identifier.contains('!')
+            || identifier.contains('&')
+            || identifier.contains('|')
+            || identifier.contains('=')
+            || identifier.contains('<')
+            || identifier.contains('>')
+            || identifier.contains('[')
+            || identifier.contains(']')
+            || identifier.contains('"')
+            || identifier.contains('\'')
+            || identifier.contains('?');
+        
+        if has_expression_chars {
+            return false; // This looks like a body expression
+        }
+        
+        // Check it's a valid identifier (starts with letter or _)
+        let first_char = identifier.chars().next().unwrap();
+        if !first_char.is_alphabetic() && first_char != '_' {
+            return false; // Not a valid identifier, must be expression
+        }
+        
+        // Check all chars are alphanumeric or underscore
+        if !identifier.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return false; // Not a valid identifier
+        }
+    }
+    
+    // All parts look like field bindings
+    true
 }
 
 /// Check if a first pattern line will be followed by multi-pattern continuation

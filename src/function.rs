@@ -21,6 +21,8 @@ pub struct Parameter {
     pub param_type: String,
     pub is_borrow: bool,
     pub is_mut_borrow: bool,
+    /// Parameter has explicit `mut` modifier (e.g., `mut get_balance F1`)
+    pub is_mut_param: bool,
 }
 
 /// A parsed function signature
@@ -1220,6 +1222,7 @@ fn parse_single_param(param: &str) -> Result<Parameter, String> {
             param_type: "&".to_string(),
             is_borrow: true,
             is_mut_borrow: false,
+            is_mut_param: false,
         });
     }
     if param == "&mut self" {
@@ -1228,6 +1231,7 @@ fn parse_single_param(param: &str) -> Result<Parameter, String> {
             param_type: "&mut".to_string(),
             is_borrow: true,
             is_mut_borrow: true,
+            is_mut_param: false,
         });
     }
     if param == "self" {
@@ -1236,6 +1240,17 @@ fn parse_single_param(param: &str) -> Result<Parameter, String> {
             param_type: "".to_string(),
             is_borrow: false,
             is_mut_borrow: false,
+            is_mut_param: false,
+        });
+    }
+    // CRITICAL FIX: Handle `mut self` (owned mutable self)
+    if param == "mut self" {
+        return Ok(Parameter {
+            name: "self".to_string(),
+            param_type: "".to_string(),
+            is_borrow: false,
+            is_mut_borrow: false,
+            is_mut_param: true,  // Mark as mutable parameter
         });
     }
     // Also handle: self: Type (explicit self type)
@@ -1246,16 +1261,25 @@ fn parse_single_param(param: &str) -> Result<Parameter, String> {
             param_type: type_str,
             is_borrow: false,
             is_mut_borrow: false,
+            is_mut_param: false,
         });
     }
     
-    let first_space = param.find(' ').ok_or_else(|| format!(
+    // CRITICAL FIX: Handle explicit `mut` modifier on parameters
+    // RustS+ syntax: `mut get_balance F1` means parameter `get_balance` of type `F1` is mutable
+    let (is_mut_param, param_to_parse) = if param.starts_with("mut ") {
+        (true, param[4..].trim())
+    } else {
+        (false, param)
+    };
+    
+    let first_space = param_to_parse.find(' ').ok_or_else(|| format!(
         "Parameter '{}' has no type annotation. All parameters must have explicit types in RustS+.",
-        param
+        param_to_parse
     ))?;
     
-    let name = param[..first_space].trim().to_string();
-    let type_str = param[first_space..].trim().to_string();
+    let name = param_to_parse[..first_space].trim().to_string();
+    let type_str = param_to_parse[first_space..].trim().to_string();
     
     if name.is_empty() {
         return Err("Parameter name cannot be empty".to_string());
@@ -1276,10 +1300,24 @@ fn parse_single_param(param: &str) -> Result<Parameter, String> {
         (false, false)
     };
     
-    Ok(Parameter { name, param_type: type_str, is_borrow, is_mut_borrow })
+    Ok(Parameter { name, param_type: type_str, is_borrow, is_mut_borrow, is_mut_param })
 }
 
+/// Convert a RustS+ function signature to Rust syntax
+/// 
+/// `has_where_clause`: If true, DON'T add `{` at the end because `where` clause follows
 pub fn signature_to_rust(sig: &FunctionSignature) -> String {
+    signature_to_rust_impl(sig, false)
+}
+
+/// Convert a RustS+ function signature to Rust syntax, controlling brace output
+/// 
+/// `has_where_clause`: If true, DON'T add `{` at the end because `where` clause follows
+pub fn signature_to_rust_with_where(sig: &FunctionSignature, has_where_clause: bool) -> String {
+    signature_to_rust_impl(sig, has_where_clause)
+}
+
+fn signature_to_rust_impl(sig: &FunctionSignature, has_where_clause: bool) -> String {
     let mut result = String::new();
     
     if sig.is_pub { result.push_str("pub "); }
@@ -1328,8 +1366,8 @@ pub fn signature_to_rust(sig: &FunctionSignature) -> String {
             // Bare [T] is unsized and cannot be a function parameter in Rust
             let transformed_type = transform_param_type(&p.param_type);
             
-            // CRITICAL: Add `mut` if this param has write effect
-            if needs_mut {
+            // CRITICAL: Add `mut` if this param has write effect OR explicit mut modifier
+            if needs_mut || p.is_mut_param {
                 format!("mut {}: {}", p.name, transformed_type)
             } else {
                 format!("{}: {}", p.name, transformed_type)
@@ -1355,6 +1393,8 @@ pub fn signature_to_rust(sig: &FunctionSignature) -> String {
         }
     }
     
+    // CRITICAL FIX: Don't add `{` if there's a `where` clause following
+    // The `{` will come after the `where` clause
     if sig.is_single_line {
         if let Some(ref expr) = sig.single_line_expr {
             let mut ctx = CurrentFunctionContext::new();
@@ -1364,7 +1404,8 @@ pub fn signature_to_rust(sig: &FunctionSignature) -> String {
             result.push_str(&transformed_expr);
             result.push_str(" }");
         }
-    } else {
+    } else if !has_where_clause {
+        // Only add `{` if there's NO where clause following
         result.push_str(" {");
     }
     

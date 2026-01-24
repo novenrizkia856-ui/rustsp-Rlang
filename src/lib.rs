@@ -59,7 +59,7 @@ pub use type_env::{
 use variable::{VariableTracker, parse_rusts_assignment_ext, expand_value};
 use scope::ScopeAnalyzer;
 use function::{
-    parse_function_line, signature_to_rust, FunctionParseResult,
+    parse_function_line, signature_to_rust, signature_to_rust_with_where, FunctionParseResult,
     CurrentFunctionContext,
     transform_string_concat, transform_call_args, should_be_tail_return
 };
@@ -96,6 +96,7 @@ use modes::{
 use detection::{
     detect_struct_literal_start, detect_bare_struct_literal,
     detect_bare_enum_literal, detect_enum_literal_start, detect_array_literal_start,
+    detect_struct_literal_in_call, detect_enum_literal_in_call,
 };
 use transform_literal::{
     transform_literal_field_with_ctx,
@@ -524,12 +525,16 @@ pub fn parse_rusts(source: &str) -> String {
             
             let needs_as_str = match_string_ctx.needs_as_str();
             
-            if let Some((var_name, match_expr)) = parse_control_flow_assignment(trimmed) {
-                let is_param = current_fn_ctx.params.contains_key(&var_name);
+            if let Some((var_name_raw, match_expr)) = parse_control_flow_assignment(trimmed) {
+                // CRITICAL FIX: Parse type annotation from var_name
+                // var_name_raw could be "sender &Address" which needs to become "sender: &Address"
+                let (actual_var_name, type_annotation) = parse_var_type_annotation(&var_name_raw);
+                
+                let is_param = current_fn_ctx.params.contains_key(actual_var_name);
                 let is_decl = scope_analyzer.is_decl(line_num);
                 let is_mutation = scope_analyzer.is_mut(line_num);
-                let is_shadowing = tracker.is_shadowing(&var_name, line_num);
-                let needs_mut = scope_analyzer.needs_mut(&var_name, line_num);
+                let is_shadowing = tracker.is_shadowing(actual_var_name, line_num);
+                let needs_mut = scope_analyzer.needs_mut(actual_var_name, line_num);
                 let needs_let = is_decl || (!is_mutation && !is_param) || is_shadowing;
                 
                 let transformed_match_expr = if needs_as_str {
@@ -540,9 +545,9 @@ pub fn parse_rusts(source: &str) -> String {
                 
                 if needs_let {
                     let keyword = if needs_mut { "let mut" } else { "let" };
-                    output_lines.push(format!("{}{} {} = {}", leading_ws, keyword, var_name, transformed_match_expr));
+                    output_lines.push(format!("{}{} {}{} = {}", leading_ws, keyword, actual_var_name, type_annotation, transformed_match_expr));
                 } else {
-                    output_lines.push(format!("{}{} = {}", leading_ws, var_name, transformed_match_expr));
+                    output_lines.push(format!("{}{}{} = {}", leading_ws, actual_var_name, type_annotation, transformed_match_expr));
                 }
             } else {
                 let transformed = if needs_as_str {
@@ -558,19 +563,22 @@ pub fn parse_rusts(source: &str) -> String {
         
         // IF EXPRESSION AS ASSIGNMENT
         if is_if_assignment(trimmed) {
-            if let Some((var_name, if_expr)) = parse_control_flow_assignment(trimmed) {
-                let is_param = current_fn_ctx.params.contains_key(&var_name);
+            if let Some((var_name_raw, if_expr)) = parse_control_flow_assignment(trimmed) {
+                // CRITICAL FIX: Parse type annotation from var_name
+                let (actual_var_name, type_annotation) = parse_var_type_annotation(&var_name_raw);
+                
+                let is_param = current_fn_ctx.params.contains_key(actual_var_name);
                 let is_decl = scope_analyzer.is_decl(line_num);
                 let is_mutation = scope_analyzer.is_mut(line_num);
-                let is_shadowing = tracker.is_shadowing(&var_name, line_num);
-                let needs_mut = scope_analyzer.needs_mut(&var_name, line_num);
+                let is_shadowing = tracker.is_shadowing(actual_var_name, line_num);
+                let needs_mut = scope_analyzer.needs_mut(actual_var_name, line_num);
                 let needs_let = is_decl || (!is_mutation && !is_param) || is_shadowing;
                 
                 if needs_let {
                     let keyword = if needs_mut { "let mut" } else { "let" };
-                    output_lines.push(format!("{}{} {} = ({}", leading_ws, keyword, var_name, if_expr));
+                    output_lines.push(format!("{}{} {}{} = ({}", leading_ws, keyword, actual_var_name, type_annotation, if_expr));
                 } else {
-                    output_lines.push(format!("{}{} = ({}", leading_ws, var_name, if_expr));
+                    output_lines.push(format!("{}{}{} = ({}", leading_ws, actual_var_name, type_annotation, if_expr));
                 }
                 if_expr_assignment_depth = Some(prev_depth);
                 continue;
@@ -598,6 +606,23 @@ pub fn parse_rusts(source: &str) -> String {
             ) {
                 output_lines.push(result);
                 continue;
+            }
+            
+            // Struct/enum literal inside function call (in match arm body)
+            if opens > closes && trimmed.contains('(') {
+                if let Some(_struct_name) = detect_struct_literal_in_call(trimmed, &struct_registry) {
+                    literal_mode.enter(LiteralKind::Struct, prev_depth + opens, false);
+                    let transformed = transform_call_with_struct_literal(trimmed);
+                    output_lines.push(format!("{}{}", leading_ws, transformed));
+                    continue;
+                }
+                
+                if let Some(_enum_path) = detect_enum_literal_in_call(trimmed) {
+                    literal_mode.enter(LiteralKind::EnumVariant, prev_depth + opens, false);
+                    let transformed = transform_call_with_struct_literal(trimmed);
+                    output_lines.push(format!("{}{}", leading_ws, transformed));
+                    continue;
+                }
             }
             
             // Bare struct/enum literal handling
@@ -847,6 +872,31 @@ pub fn parse_rusts(source: &str) -> String {
             continue;
         }
         
+        // STRUCT/ENUM LITERAL INSIDE FUNCTION CALL
+        // Pattern: `Some(StructName {`, `Ok(Enum::Variant {`
+        // These need to enter literal_mode so fields are processed correctly
+        if opens > closes && trimmed.contains('(') {
+            // Check for struct literal inside function call
+            if let Some(struct_name) = detect_struct_literal_in_call(trimmed, &struct_registry) {
+                // Enter literal mode for the struct fields
+                literal_mode.enter(LiteralKind::Struct, prev_depth + opens, false);
+                // Transform the line - keep as-is but transform any `=` to `:` in fields if single-line
+                let transformed = transform_call_with_struct_literal(trimmed);
+                output_lines.push(format!("{}{}", leading_ws, transformed));
+                continue;
+            }
+            
+            // Check for enum literal inside function call
+            if let Some(_enum_path) = detect_enum_literal_in_call(trimmed) {
+                // Enter literal mode for the enum fields
+                literal_mode.enter(LiteralKind::EnumVariant, prev_depth + opens, false);
+                // Transform the line
+                let transformed = transform_call_with_struct_literal(trimmed);
+                output_lines.push(format!("{}{}", leading_ws, transformed));
+                continue;
+            }
+        }
+        
         // BARE STRUCT LITERAL
         if let Some(struct_name) = detect_bare_struct_literal(trimmed, &struct_registry) {
             // CRITICAL FIX: Check for COMPLETE single-line literals
@@ -905,9 +955,26 @@ pub fn parse_rusts(source: &str) -> String {
         
         // FUNCTION DEFINITION
         if trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ") {
+            // CRITICAL FIX: Look ahead to detect if next line is a `where` clause
+            // If so, DON'T add `{` at the end of the function signature
+            let next_line_is_where = {
+                let mut found_where = false;
+                for future in lines.iter().skip(line_num + 1) {
+                    let ft = strip_inline_comment(future);
+                    let ft_trim = ft.trim();
+                    if ft_trim.is_empty() {
+                        continue;
+                    }
+                    found_where = ft_trim.starts_with("where") && 
+                        (ft_trim == "where" || ft_trim.chars().nth(5).map(|c| c.is_whitespace() || c == '\n').unwrap_or(true));
+                    break;
+                }
+                found_where
+            };
+            
             match parse_function_line(trimmed) {
                 FunctionParseResult::RustSPlusSignature(sig) => {
-                    let rust_sig = signature_to_rust(&sig);
+                    let rust_sig = signature_to_rust_with_where(&sig, next_line_is_where);
                     output_lines.push(format!("{}{}", leading_ws, rust_sig));
                     continue;
                 }
@@ -1071,7 +1138,12 @@ pub fn parse_rusts(source: &str) -> String {
     }
     
     // Apply post-processing and return
-    let result = apply_postprocessing(output_lines);
+    let mut result = apply_postprocessing(output_lines);
+    
+    // CRITICAL FIX: Transform common function-style calls to macro calls
+    // RustS+ may use `anyhow()`, `unreachable()`, etc. as functions
+    // but Rust requires `anyhow!()`, `unreachable!()`, etc.
+    result = transform_macros_to_correct_syntax(&result);
     
     // Rust sanity check (non-test only)
     #[cfg(not(test))]
@@ -1080,6 +1152,75 @@ pub fn parse_rusts(source: &str) -> String {
         if !sanity.is_valid {
             eprintln!("{}", rust_sanity::format_internal_error(&sanity));
         }
+    }
+    
+    result
+}
+
+/// Transform function-style macro calls to correct Rust macro syntax
+/// `anyhow("msg")` -> `anyhow!("msg")`
+/// `unreachable()` -> `unreachable!()`
+fn transform_macros_to_correct_syntax(code: &str) -> String {
+    let mut result = code.to_string();
+    
+    // List of common macros that users might accidentally call as functions
+    let macros = [
+        "anyhow",
+        "unreachable", 
+        "unimplemented",
+        "panic",
+        "todo",
+        "format",
+        "vec",
+        "println",
+        "eprintln",
+        "dbg",
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "debug_assert",
+        "debug_assert_eq",
+        "debug_assert_ne",
+    ];
+    
+    for macro_name in macros.iter() {
+        // Pattern: `macro_name(` where NOT preceded by `!` or followed by `!`
+        // We need to be careful not to match `macro_name!(` which is already correct
+        // Also need to avoid matching `some_macro_name(` (longer identifier)
+        
+        let pattern = format!("{}(", macro_name);
+        let correct = format!("{}!(", macro_name);
+        
+        // Simple approach: look for pattern and check it's not already `!(`
+        let mut new_result = String::new();
+        let mut chars: Vec<char> = result.chars().collect();
+        let mut i = 0;
+        
+        while i < chars.len() {
+            // Check if we're at the start of the pattern
+            let remaining: String = chars[i..].iter().collect();
+            if remaining.starts_with(&pattern) {
+                // Check character before is not alphanumeric (word boundary)
+                let prev_char = if i > 0 { chars[i - 1] } else { ' ' };
+                let is_word_boundary = !prev_char.is_alphanumeric() && prev_char != '_';
+                
+                // Check it's not already `!(`
+                let already_macro = i > 0 && chars[i - 1] == '!';
+                
+                if is_word_boundary && !already_macro {
+                    // Insert `!` before `(`
+                    new_result.push_str(macro_name);
+                    new_result.push('!');
+                    i += macro_name.len(); // Skip past macro name, next iteration will add `(`
+                    continue;
+                }
+            }
+            
+            new_result.push(chars[i]);
+            i += 1;
+        }
+        
+        result = new_result;
     }
     
     result
@@ -1338,6 +1479,30 @@ fn is_rust_native_line(trimmed: &str) -> bool {
     // RustS+: `const NAME TYPE = VALUE` (no colon)
     // Rust:   `const NAME: TYPE = VALUE;` (has colon)
     // These are handled separately by transform_const_or_static()
+    
+    // CRITICAL FIX: `where` clause and trait bounds should pass through unchanged
+    // These appear after function signatures with generic constraints
+    if trimmed == "where" || trimmed.starts_with("where ") {
+        return true;
+    }
+    
+    // Trait bounds in where clauses: `T: Trait,` or `F1: FnMut(...) -> Type,`
+    // These have `:` but no `=`, so they're not variable declarations
+    // Pattern: identifier `:` type (no `=`)
+    if !trimmed.contains('=') && trimmed.contains(':') && !trimmed.contains("::") {
+        // Check if it looks like a trait bound: starts with uppercase identifier followed by `:`
+        let first_colon = trimmed.find(':').unwrap();
+        let before_colon = trimmed[..first_colon].trim();
+        if !before_colon.is_empty() {
+            let first_char = before_colon.chars().next().unwrap();
+            // Trait bound identifiers typically start with uppercase
+            // Or could be 'impl' keyword for impl Trait bounds
+            if first_char.is_uppercase() || before_colon.starts_with("impl ") {
+                return true;
+            }
+        }
+    }
+    
     trimmed.starts_with("let ")
         || trimmed.starts_with("use ")
         || trimmed.starts_with("mod ")
@@ -1697,4 +1862,103 @@ fn parse_var_type_annotation(var_part: &str) -> (&str, String) {
     }
     
     (var_part, String::new())
+}
+
+/// Transform a line containing struct literal inside function call
+/// Example: `Some(PrivateTxInfo {` -> `Some(PrivateTxInfo {`
+/// Example: `Some(Data { x = 1 })` -> `Some(Data { x: 1 })`
+/// 
+/// This handles the opening line - fields on subsequent lines are handled by literal_mode
+fn transform_call_with_struct_literal(line: &str) -> String {
+    let trimmed = line.trim();
+    
+    // Find the `{` position
+    let brace_pos = match trimmed.find('{') {
+        Some(pos) => pos,
+        None => return trimmed.to_string(),
+    };
+    
+    // Check if there are fields after `{` (single-line case with fields)
+    let after_brace = &trimmed[brace_pos + 1..];
+    
+    // If line just ends with `{`, no transformation needed for the fields part
+    if after_brace.trim().is_empty() || after_brace.trim() == "{" {
+        return trimmed.to_string();
+    }
+    
+    // If there's content after `{`, we need to transform field assignments
+    let before_brace = &trimmed[..brace_pos + 1]; // Include `{`
+    
+    // Check for closing `}`
+    if let Some(close_pos) = after_brace.rfind('}') {
+        let fields_part = &after_brace[..close_pos];
+        let after_close = &after_brace[close_pos..];
+        
+        // Transform fields: `field = value` -> `field: value`
+        let transformed_fields = transform_fields_inline(fields_part);
+        
+        return format!("{} {} {}", before_brace, transformed_fields, after_close);
+    }
+    
+    // Multi-line start with some fields on first line (rare but possible)
+    // Just pass through for now - literal_mode will handle continuation
+    trimmed.to_string()
+}
+
+/// Transform inline fields: `x = 1, y = 2` -> `x: 1, y: 2`
+fn transform_fields_inline(fields: &str) -> String {
+    use crate::transform_literal::find_field_eq;
+    
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut brace_depth: usize = 0;
+    
+    for c in fields.chars() {
+        if c == '"' && !current.ends_with('\\') {
+            in_string = !in_string;
+        }
+        if !in_string {
+            if c == '{' { brace_depth += 1; }
+            if c == '}' { brace_depth = brace_depth.saturating_sub(1); }
+        }
+        
+        if c == ',' && !in_string && brace_depth == 0 {
+            result.push(transform_single_inline_field(&current));
+            current.clear();
+        } else {
+            current.push(c);
+        }
+    }
+    
+    if !current.trim().is_empty() {
+        result.push(transform_single_inline_field(&current));
+    }
+    
+    result.join(", ")
+}
+
+/// Transform a single field: `field = value` -> `field: value`
+fn transform_single_inline_field(field: &str) -> String {
+    use crate::transform_literal::find_field_eq;
+    
+    let trimmed = field.trim();
+    if trimmed.is_empty() { return String::new(); }
+    
+    // Spread syntax
+    if trimmed.starts_with("..") { return trimmed.to_string(); }
+    
+    // Already has colon (not ::)
+    if trimmed.contains(':') && !trimmed.contains("::") {
+        return trimmed.to_string();
+    }
+    
+    // Field assignment: `field = value`
+    if let Some(eq_pos) = find_field_eq(trimmed) {
+        let name = trimmed[..eq_pos].trim();
+        let value = trimmed[eq_pos + 1..].trim();
+        return format!("{}: {}", name, value);
+    }
+    
+    trimmed.to_string()
 }
