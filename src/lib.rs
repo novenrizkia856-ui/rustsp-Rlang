@@ -617,7 +617,10 @@ pub fn parse_rusts(source: &str) -> String {
                 transformed = transform_call_args(&transformed, &fn_registry);
             }
             
-            let is_tail = is_before_closing_brace;
+            // CRITICAL FIX: Use should_be_tail_return instead of simple is_before_closing_brace
+            // is_before_closing_brace only tells position, not whether it's actually a return expr
+            // should_be_tail_return checks: function has return value + line is NOT mutating statement
+            let is_tail = should_be_tail_return(&transformed, &current_fn_ctx, is_before_closing_brace);
             
             if is_tail {
                 if let Some(ref ret_type) = current_fn_ctx.return_type {
@@ -627,10 +630,9 @@ pub fn parse_rusts(source: &str) -> String {
                 }
             }
             
-            // CRITICAL FIX: Semicolon logic for match arm body
-            // Suppress semicolon if:
+            // Semicolon logic: suppress if:
             // 1. is_tail (return expression), OR
-            // 2. inside multiline expr AND next line closes it (we're last arg in function/macro call)
+            // 2. inside multiline expr AND next line closes it (we're last arg in macro/function call)
             let suppress_semi = is_tail || (inside_multiline_expr && next_line_closes_expr);
             if needs_semicolon(&transformed) && !suppress_semi {
                 output_lines.push(format!("{}{};", leading_ws, transformed));
@@ -661,6 +663,9 @@ pub fn parse_rusts(source: &str) -> String {
             }
             let transformed = transform_struct_field(&clean_line);
             let transformed = transform_struct_field_slice_to_vec(&transformed);
+            // CRITICAL FIX: Transform generic brackets in struct field types
+            // e.g., Option[Arc[T]] -> Option<Arc<T>>
+            let transformed = helpers::transform_generic_brackets(&transformed);
             output_lines.push(transformed);
             continue;
         }
