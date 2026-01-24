@@ -191,6 +191,16 @@ pub fn parse_rusts(source: &str) -> String {
             .map(|next| strip_inline_comment(next).trim().starts_with('.'))
             .unwrap_or(false);
         
+        // CRITICAL: Look-ahead for closing paren/bracket
+        // If next line starts with ) or ] or }) etc., we're the last item in an expression
+        let next_line_closes_expr = lines.get(line_num + 1)
+            .map(|next| {
+                let binding = strip_inline_comment(next);
+                let t = binding.trim();
+                t.starts_with(')') || t.starts_with(']') || t.starts_with("})") || t.starts_with(");") || t.starts_with("];")
+            })
+            .unwrap_or(false);
+        
         // Handle multi-line function signature accumulation
         if let Some(ref mut acc) = multiline_fn_acc {
             acc.push(' ');
@@ -617,9 +627,12 @@ pub fn parse_rusts(source: &str) -> String {
                 }
             }
             
-            // CRITICAL FIX: Do NOT add semicolon when inside multiline expression (e.g., function call arguments)
-            // Bug: `e` in multiline println was getting `;` added, breaking the code
-            if needs_semicolon(&transformed) && !is_tail && !inside_multiline_expr {
+            // CRITICAL FIX: Semicolon logic for match arm body
+            // Suppress semicolon if:
+            // 1. is_tail (return expression), OR
+            // 2. inside multiline expr AND next line closes it (we're last arg in function/macro call)
+            let suppress_semi = is_tail || (inside_multiline_expr && next_line_closes_expr);
+            if needs_semicolon(&transformed) && !suppress_semi {
                 output_lines.push(format!("{}{};", leading_ws, transformed));
             } else {
                 output_lines.push(format!("{}{}", leading_ws, transformed));
@@ -726,7 +739,10 @@ pub fn parse_rusts(source: &str) -> String {
                 continue;
             }
             
-            literal_mode.enter(LiteralKind::Struct, prev_depth + opens, needs_let);
+            // CRITICAL FIX: Always mark as assignment (true) for semicolon handling,
+            // regardless of needs_let. Field assignments (self.x = ...) need semicolons
+            // even without `let` keyword.
+            literal_mode.enter(LiteralKind::Struct, prev_depth + opens, true);
             output_lines.push(format!("{}{}{} = {} {{", leading_ws, let_keyword, var_name, struct_name));
             continue;
         }
@@ -774,7 +790,10 @@ pub fn parse_rusts(source: &str) -> String {
                 continue;
             }
             
-            literal_mode.enter(LiteralKind::EnumVariant, prev_depth + opens, needs_let);
+            // CRITICAL FIX: Always mark as assignment (true) for semicolon handling,
+            // regardless of needs_let. Field assignments (self.status = ...) need semicolons
+            // even without `let` keyword.
+            literal_mode.enter(LiteralKind::EnumVariant, prev_depth + opens, true);
             output_lines.push(format!("{}{}{} = {} {{", leading_ws, let_keyword, var_name, enum_path));
             continue;
         }
@@ -988,14 +1007,14 @@ pub fn parse_rusts(source: &str) -> String {
             let result = process_assignment(
                 &var_name, var_type.as_deref(), &value, is_outer, is_explicit_mut,
                 line_num, &leading_ws, &scope_analyzer, &tracker, &current_fn_ctx, &fn_registry,
-                inside_multiline_expr, next_line_is_method_chain, &mut prev_line_was_continuation,
+                inside_multiline_expr, next_line_is_method_chain, next_line_closes_expr, &mut prev_line_was_continuation,
             );
             output_lines.push(result);
         } else {
             // Not an assignment
             let result = process_non_assignment(
                 trimmed, &leading_ws, line_num, &current_fn_ctx, &fn_registry,
-                is_before_closing_brace, inside_multiline_expr, next_line_is_method_chain,
+                is_before_closing_brace, inside_multiline_expr, next_line_is_method_chain, next_line_closes_expr,
                 &mut prev_line_was_continuation,
             );
             output_lines.push(result);
@@ -1487,6 +1506,7 @@ fn process_assignment(
     fn_registry: &function::FunctionRegistry,
     inside_multiline_expr: bool,
     next_line_is_method_chain: bool,
+    next_line_closes_expr: bool,
     prev_line_was_continuation: &mut bool,
 ) -> String {
     let is_decl = scope_analyzer.is_decl(line_num);
@@ -1509,7 +1529,15 @@ fn process_assignment(
     let is_shadowing = tracker.is_shadowing(var_name, line_num);
     let should_have_let = is_decl || (!is_mutation && !is_param) || is_shadowing;
     
-    let semi = if ends_with_continuation_operator(&expanded_value) || next_line_is_method_chain || inside_multiline_expr { "" } else { ";" };
+    // CRITICAL FIX: Semicolon logic
+    // 1. If value ends with continuation → no semicolon (expression continues)
+    // 2. If next line is method chain → no semicolon (chained call)
+    // 3. If inside multiline expr AND next line closes it → no semicolon (we're last arg)
+    // 4. Otherwise → add semicolon
+    let suppress_semi = ends_with_continuation_operator(&expanded_value)
+        || next_line_is_method_chain
+        || (inside_multiline_expr && next_line_closes_expr);
+    let semi = if suppress_semi { "" } else { ";" };
     *prev_line_was_continuation = ends_with_continuation_operator(&expanded_value);
     
     let type_annotation = var_type.map(|t| format!(": {}", t)).unwrap_or_default();
@@ -1538,6 +1566,7 @@ fn process_non_assignment(
     is_before_closing_brace: bool,
     inside_multiline_expr: bool,
     next_line_is_method_chain: bool,
+    next_line_closes_expr: bool,
     prev_line_was_continuation: &mut bool,
 ) -> String {
     let mut transformed = trimmed.to_string();
@@ -1582,11 +1611,18 @@ fn process_non_assignment(
     let this_line_ends_with_continuation = ends_with_continuation_operator(&transformed);
     *prev_line_was_continuation = this_line_ends_with_continuation;
     
-    let should_add_semi = !this_line_ends_with_continuation
-        && !is_return_expr 
-        && !inside_multiline_expr
-        && !next_line_is_method_chain
-        && needs_semicolon(&transformed);
+    // CRITICAL FIX: Semicolon logic for non-assignment expressions
+    // 1. If ends with continuation → no semicolon
+    // 2. If return expression → no semicolon
+    // 3. If next line is method chain → no semicolon
+    // 4. If inside multiline expr AND next line closes it → no semicolon (last arg)
+    // 5. Otherwise → add semicolon if needed
+    let suppress_semi = this_line_ends_with_continuation
+        || is_return_expr
+        || next_line_is_method_chain
+        || (inside_multiline_expr && next_line_closes_expr);
+    
+    let should_add_semi = !suppress_semi && needs_semicolon(&transformed);
     
     if should_add_semi {
         format!("{}{};", leading_ws, transformed)
