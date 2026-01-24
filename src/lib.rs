@@ -78,6 +78,7 @@ use control_flow::{
     is_single_line_arm, transform_single_line_arm,
     transform_enum_struct_init,
     MatchStringContext, transform_match_for_string_patterns, pattern_is_string_literal,
+    is_multi_pattern_continuation, transform_multi_pattern_line,
 };
 use hex_normalizer::normalize_hex_literals;
 
@@ -432,7 +433,51 @@ pub fn parse_rusts(source: &str) -> String {
             }
         }
         
-        // Match arm pattern handling
+        // ================================================================
+        // CRITICAL FIX: Handle multi-pattern match arms
+        // 
+        // Multi-pattern syntax in RustS+:
+        //   TxPayload::Transfer { gas_limit, .. }      <- first pattern (no |)
+        //   | TxPayload::Stake { gas_limit, .. }       <- continuation
+        //   | TxPayload::Custom { gas_limit, .. } { body }  <- final (has body)
+        //
+        // Key insight: We need LOOK-AHEAD to detect if NEXT line starts with |
+        // If so, current line is first pattern and should pass-through.
+        // ================================================================
+        
+        // Look-ahead: check if next non-empty line starts with |
+        let next_line_starts_with_pipe = {
+            let mut found_pipe = false;
+            for future in lines.iter().skip(line_num + 1) {
+                let ft = strip_inline_comment(future);
+                let ft_trim = ft.trim();
+                if ft_trim.is_empty() {
+                    continue;
+                }
+                found_pipe = ft_trim.starts_with('|');
+                break;
+            }
+            found_pipe
+        };
+        
+        // Handle multi-pattern continuation lines (starting with |)
+        if match_mode.expecting_arm_pattern() && is_multi_pattern_continuation(trimmed) {
+            let ret_type = current_fn_ctx.return_type.as_deref();
+            let transformed = transform_multi_pattern_line(&clean_line, ret_type);
+            output_lines.push(transformed);
+            continue;
+        }
+        
+        // Handle FIRST pattern in multi-pattern sequence
+        // Detection: current line ends with `}` (struct destruct), next line starts with `|`
+        if match_mode.expecting_arm_pattern() && next_line_starts_with_pipe {
+            // This is the first pattern in a multi-pattern arm
+            // DO NOT transform, pass through as-is (no => {)
+            output_lines.push(line.to_string());
+            continue;
+        }
+        
+        // Match arm pattern handling (regular single-pattern arms)
         if match_mode.expecting_arm_pattern() && is_match_arm_pattern(trimmed) {
             if is_single_line_arm(trimmed) {
                 let ret_type = current_fn_ctx.return_type.as_deref();
@@ -454,7 +499,6 @@ pub fn parse_rusts(source: &str) -> String {
             match_mode.enter_arm_body(brace_depth, arm_has_if_expr);
             continue;
         }
-        
         // Match expression start
         if is_match_start(trimmed) {
             let is_assignment = parse_control_flow_assignment(trimmed).is_some();
@@ -1258,30 +1302,16 @@ fn check_next_is_else(lines: &[&str], line_num: usize) -> bool {
     false
 }
 
-fn detect_arm_has_if_expr(lines: &[&str], line_num: usize, start_depth: usize) -> bool {
-    let mut temp_depth = start_depth;
-    let mut found_first = false;
-    
-    for future_line in lines.iter().skip(line_num + 1) {
-        let ft = strip_inline_comment(future_line);
-        let ft_trim = ft.trim();
-        
-        let (ft_opens, ft_closes) = count_braces_outside_strings(ft_trim);
-        
-        temp_depth += ft_opens;
-        temp_depth = temp_depth.saturating_sub(ft_closes);
-        
-        if ft_trim == "}" && temp_depth < start_depth {
-            break;
-        }
-        
-        if !found_first && !ft_trim.is_empty() {
-            found_first = true;
-            if ft_trim.starts_with("if ") && !ft_trim.contains("let ") {
-                return true;
-            }
-        }
-    }
+fn detect_arm_has_if_expr(_lines: &[&str], _line_num: usize, _start_depth: usize) -> bool {
+    // CRITICAL FIX: Disable L-02 if-expression special handling.
+    // 
+    // The previous logic was BROKEN:
+    // - It detected any `if` at start of arm body as "if expression"
+    // - This triggered special handling that removed the `{` from pattern
+    // - But it DIDN'T add matching `(` for the `)` in closing
+    // - Result: unbalanced delimiters like `}),` without `(`
+    //
+    // The normal transformation `Pattern => { ... },` handles ALL cases correctly.
     false
 }
 
