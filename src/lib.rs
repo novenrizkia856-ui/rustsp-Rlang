@@ -506,6 +506,8 @@ pub fn parse_rusts(source: &str) -> String {
             let mut match_string_ctx = MatchStringContext::from_match_line(trimmed);
             
             // Look ahead for string patterns
+            // A string PATTERN is: `"some_string" {` where { is AFTER the closing quote
+            // NOT a format string: `"format {} string"` where { is INSIDE the string
             for future_line in lines.iter().skip(line_num + 1) {
                 let ft = strip_inline_comment(future_line);
                 let ft_trim = ft.trim();
@@ -517,9 +519,36 @@ pub fn parse_rusts(source: &str) -> String {
                     break;
                 }
                 
-                if ft_trim.starts_with('"') && ft_trim.contains('{') {
-                    match_string_ctx.has_string_patterns = true;
-                    break;
+                // CRITICAL FIX: Only match string PATTERNS, not format strings
+                // String pattern: `"pattern" {` - brace AFTER closing quote
+                // Format string: `"text {} text"` - brace INSIDE string (NOT a pattern!)
+                if ft_trim.starts_with('"') {
+                    // Find the closing quote (handling escape sequences)
+                    let mut in_escape = false;
+                    let mut quote_end = None;
+                    for (i, c) in ft_trim[1..].char_indices() {
+                        if in_escape {
+                            in_escape = false;
+                            continue;
+                        }
+                        if c == '\\' {
+                            in_escape = true;
+                            continue;
+                        }
+                        if c == '"' {
+                            quote_end = Some(i + 1); // +1 because we started at index 1
+                            break;
+                        }
+                    }
+                    
+                    // Check if `{` comes AFTER the closing quote (true pattern)
+                    if let Some(end) = quote_end {
+                        let after_string = ft_trim[end + 1..].trim();
+                        if after_string.starts_with('{') {
+                            match_string_ctx.has_string_patterns = true;
+                            break;
+                        }
+                    }
                 }
             }
             
@@ -1164,6 +1193,8 @@ fn transform_macros_to_correct_syntax(code: &str) -> String {
     let mut result = code.to_string();
     
     // List of common macros that users might accidentally call as functions
+    // CRITICAL: Only include macros that are NEVER used as methods or attributes
+    // DO NOT include: write, writeln (RwLock methods), cfg (attribute)
     let macros = [
         "anyhow",
         "unreachable", 
@@ -1181,6 +1212,14 @@ fn transform_macros_to_correct_syntax(code: &str) -> String {
         "debug_assert",
         "debug_assert_eq",
         "debug_assert_ne",
+        "matches",      // CRITICAL: matches! macro for pattern matching
+        "bail",         // anyhow::bail!
+        "ensure",       // anyhow::ensure!
+        "include_str",
+        "include_bytes",
+        "concat",
+        "stringify",
+        // NOTE: Removed 'write', 'writeln', 'cfg' - these conflict with methods/attributes
     ];
     
     for macro_name in macros.iter() {
@@ -1189,11 +1228,10 @@ fn transform_macros_to_correct_syntax(code: &str) -> String {
         // Also need to avoid matching `some_macro_name(` (longer identifier)
         
         let pattern = format!("{}(", macro_name);
-        let correct = format!("{}!(", macro_name);
         
         // Simple approach: look for pattern and check it's not already `!(`
         let mut new_result = String::new();
-        let mut chars: Vec<char> = result.chars().collect();
+        let chars: Vec<char> = result.chars().collect();
         let mut i = 0;
         
         while i < chars.len() {
@@ -1207,7 +1245,14 @@ fn transform_macros_to_correct_syntax(code: &str) -> String {
                 // Check it's not already `!(`
                 let already_macro = i > 0 && chars[i - 1] == '!';
                 
-                if is_word_boundary && !already_macro {
+                // CRITICAL: Check it's NOT a method call (preceded by `.`)
+                let is_method_call = prev_char == '.';
+                
+                // CRITICAL: Check it's NOT in an attribute context (preceded by `[` or `#[`)
+                let is_attribute = prev_char == '[' || 
+                    (i >= 2 && chars[i - 2] == '#' && chars[i - 1] == '[');
+                
+                if is_word_boundary && !already_macro && !is_method_call && !is_attribute {
                     // Insert `!` before `(`
                     new_result.push_str(macro_name);
                     new_result.push('!');

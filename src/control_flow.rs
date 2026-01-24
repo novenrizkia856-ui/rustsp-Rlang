@@ -429,6 +429,7 @@ pub fn transform_multi_pattern_line(line: &str, return_type: Option<&str>) -> St
     let trimmed = line.trim();
     let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
     
+    // CASE 1: Single-line body (has both { and } for body)
     if is_multi_pattern_final(trimmed) {
         // This is the final pattern with body - transform it
         // Use find_body_braces for robust body detection
@@ -448,6 +449,23 @@ pub fn transform_multi_pattern_line(line: &str, return_type: Option<&str>) -> St
             };
             
             return format!("{}{} => {{ {} }},", leading_ws, pattern, transformed_body);
+        }
+    }
+    
+    // CASE 2: Multi-line body opening (ends with `{` but no closing `}`)
+    // Pattern: `| EnumVariant { field, .. } {`
+    // This is final pattern but body continues on next line
+    if trimmed.starts_with('|') && trimmed.ends_with('{') {
+        let open_count = trimmed.matches('{').count();
+        let close_count = trimmed.matches('}').count();
+        
+        // If more opens than closes, the last `{` is body start
+        if open_count > close_count {
+            // Find the last `{` which is the body opening brace
+            if let Some(last_brace) = trimmed.rfind('{') {
+                let pattern = trimmed[..last_brace].trim();
+                return format!("{}{} => {{", leading_ws, pattern);
+            }
         }
     }
     
