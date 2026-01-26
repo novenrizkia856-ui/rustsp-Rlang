@@ -90,31 +90,93 @@ fn check_balanced_delimiters(code: &str) -> Option<SanityError> {
     let mut in_char = false;
     let mut escape_next = false;
     
-    for (line_num, line) in code.lines().enumerate() {
-        for (col, ch) in line.chars().enumerate() {
+    let lines: Vec<&str> = code.lines().collect();
+    
+    for (line_num, line) in lines.iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let mut col = 0;
+        
+        while col < chars.len() {
+            let ch = chars[col];
+            
             // Handle escapes
             if escape_next {
                 escape_next = false;
+                col += 1;
                 continue;
             }
             
             if ch == '\\' && (in_string || in_char) {
                 escape_next = true;
+                col += 1;
                 continue;
             }
             
-            // Track string/char state
+            // Track string state
             if ch == '"' && !in_char {
                 in_string = !in_string;
+                col += 1;
                 continue;
             }
             
-            if ch == '\'' && !in_string {
+            // CRITICAL FIX: Handle `'` - distinguish char literals from lifetimes
+            // Char literal: 'c' or '\n' (quote, char, optional backslash escape, quote)
+            // Lifetime: 'ident (quote followed by identifier, NO closing quote)
+            if ch == '\'' && !in_string && !in_char {
+                // Peek ahead to determine if this is a char literal or lifetime
+                if col + 1 < chars.len() {
+                    let next = chars[col + 1];
+                    
+                    // Check for lifetime: 'ident (identifier starts with letter or _)
+                    if next.is_alphabetic() || next == '_' {
+                        // This is likely a lifetime like 'static, 'a, '_
+                        // Skip the tick and identifier
+                        col += 1; // skip the '
+                        while col < chars.len() && (chars[col].is_alphanumeric() || chars[col] == '_') {
+                            col += 1;
+                        }
+                        continue;
+                    }
+                    
+                    // Check for char literal: 'c' or '\x'
+                    // If next is backslash, it's an escape like '\n'
+                    if next == '\\' {
+                        // Escaped char literal: '\n', '\t', '\x00', etc.
+                        // Skip: ' \ x ... '
+                        col += 1; // skip '
+                        col += 1; // skip \
+                        // Skip escape sequence (could be \n, \x00, \u{...})
+                        while col < chars.len() && chars[col] != '\'' {
+                            col += 1;
+                        }
+                        if col < chars.len() {
+                            col += 1; // skip closing '
+                        }
+                        continue;
+                    }
+                    
+                    // Regular char literal: 'c' where c is a single char
+                    if col + 2 < chars.len() && chars[col + 2] == '\'' {
+                        col += 3; // skip 'c'
+                        continue;
+                    }
+                }
+                
+                // Fallback: toggle in_char mode (legacy behavior)
                 in_char = !in_char;
+                col += 1;
+                continue;
+            }
+            
+            // Handle closing quote for char literals (when in_char mode from fallback)
+            if ch == '\'' && in_char {
+                in_char = false;
+                col += 1;
                 continue;
             }
             
             if in_string || in_char {
+                col += 1;
                 continue;
             }
             
@@ -182,6 +244,7 @@ fn check_balanced_delimiters(code: &str) -> Option<SanityError> {
                 }
                 _ => {}
             }
+            col += 1;
         }
     }
     
@@ -636,5 +699,58 @@ fn apply_tx(w: Wallet, tx: Tx) -> effects(write w) Wallet {
             e.kind == SanityErrorKind::EffectAnnotationLeakage && 
             e.message.contains("L-05 VIOLATION")
         }), "Should have L-05 violation error");
+    }
+    
+    // =========================================================================
+    // CRITICAL: Lifetime annotation tests
+    // =========================================================================
+    
+    #[test]
+    fn test_lifetime_static_in_type() {
+        // 'static lifetime should NOT be treated as a char literal
+        let code = r#"
+struct EnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    original_values: Vec<(&'static str, Option<String>)>,
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(result.is_valid, "Lifetimes should not confuse delimiter tracking: {:?}", result.errors);
+    }
+    
+    #[test]
+    fn test_lifetime_anonymous_in_fn() {
+        // '_ anonymous lifetime should NOT be treated as a char literal
+        let code = r#"
+fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    Ok(())
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(result.is_valid, "Anonymous lifetimes should not confuse delimiter tracking: {:?}", result.errors);
+    }
+    
+    #[test]
+    fn test_lifetime_in_async_trait() {
+        // Complex lifetime in async trait return type
+        let code = r#"
+fn post_blob(&self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<BlobRef, DAError>> + Send + '_>>;
+"#;
+        let result = check_rust_output(code);
+        assert!(result.is_valid, "Lifetimes in async traits should work: {:?}", result.errors);
+    }
+    
+    #[test]
+    fn test_char_literal_still_works() {
+        // Regular char literals should still be handled correctly
+        let code = r#"
+fn main() {
+    let c = 'a';
+    let newline = '\n';
+    let tab = '\t';
+}
+"#;
+        let result = check_rust_output(code);
+        assert!(result.is_valid, "Char literals should still work: {:?}", result.errors);
     }
 }

@@ -78,6 +78,10 @@ fn transform_generic_brackets(type_str: &str) -> String {
         "Deref", "DerefMut", "Borrow", "BorrowMut",
         // Range types
         "Range", "RangeInclusive", "RangeFrom", "RangeTo", "RangeFull",
+        // CRITICAL: Async/Future types for async trait methods
+        "Future", "Stream", "Poll",
+        // std::fmt types (CRITICAL for Display/Debug implementations)
+        "Formatter", "Arguments",
         // Other common generics
         "Sender", "Receiver", "SyncSender",
         "MaybeUninit", "ManuallyDrop",
@@ -1145,7 +1149,10 @@ fn parse_rustsplus_function(after_fn: &str, is_pub: bool) -> Result<FunctionSign
             type_rest = type_rest[2..].trim();
         }
         
-        let type_end = type_rest.find(|c: char| c == '{' || c == '=').unwrap_or(type_rest.len());
+        // CRITICAL FIX: Find end of return type, but ignore `=` inside brackets
+        // Associated type syntax like `Future[Output = Result[T, E]]` has `=` inside `[]`
+        // Only consider `=` at TOP LEVEL (bracket depth 0) as single-line expression marker
+        let type_end = find_type_end(type_rest);
         let raw_ret_type = type_rest[..type_end].trim().to_string();
         
         // L-05 CRITICAL FIX: Strip effects clause from return type
@@ -1177,6 +1184,60 @@ fn parse_rustsplus_function(after_fn: &str, is_pub: bool) -> Result<FunctionSign
         name, generics, parameters, return_type, is_pub, is_single_line, single_line_expr,
         write_params,
     })
+}
+
+/// Find the end of a return type string, ignoring `=` inside brackets
+/// 
+/// This is CRITICAL for handling associated type syntax like:
+/// `Pin[Box[dyn Future[Output = Result[T, E]] + Send]]`
+/// 
+/// The `=` in `Output = Result[...]` is NOT a single-line function marker!
+/// Only `=` at bracket depth 0 indicates a single-line function body.
+/// 
+/// Returns the position where the type ends (at `{` or top-level `=`)
+fn find_type_end(s: &str) -> usize {
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut prev_char = ' ';
+    
+    for (i, c) in s.chars().enumerate() {
+        // Handle string literals
+        if c == '"' && prev_char != '\\' {
+            in_string = !in_string;
+            prev_char = c;
+            continue;
+        }
+        
+        if in_string {
+            prev_char = c;
+            continue;
+        }
+        
+        match c {
+            '[' | '(' | '<' => depth += 1,
+            ']' | ')' | '>' => depth = depth.saturating_sub(1),
+            '{' => {
+                // `{` always ends the type (start of function body)
+                return i;
+            }
+            '=' => {
+                // CRITICAL: Only consider `=` at top level (depth 0)
+                // `=` inside brackets is associated type syntax, NOT single-line fn marker
+                if depth == 0 {
+                    // Also check it's not `==`, `!=`, `<=`, `>=`, `=>`
+                    let next_char = s.chars().nth(i + 1).unwrap_or(' ');
+                    if prev_char != '!' && prev_char != '<' && prev_char != '>' 
+                       && prev_char != '=' && next_char != '=' && next_char != '>' {
+                        return i;
+                    }
+                }
+            }
+            _ => {}
+        }
+        prev_char = c;
+    }
+    
+    s.len()
 }
 
 fn parse_parameters(params_str: &str) -> Result<Vec<Parameter>, String> {
@@ -1814,5 +1875,56 @@ mod tests {
             }
             _ => panic!("Expected RustSPlusSignature"),
         }
+    }
+    
+    // =========================================================================
+    // ASSOCIATED TYPE TESTS - Output = Result[T, E] must be preserved
+    // =========================================================================
+    
+    #[test]
+    fn test_find_type_end_simple() {
+        // Simple type without brackets
+        assert_eq!(find_type_end("String {"), 7);
+        assert_eq!(find_type_end("i32 ="), 4);
+    }
+    
+    #[test]
+    fn test_find_type_end_with_associated_type() {
+        // CRITICAL: `=` inside brackets must NOT be treated as end of type
+        let input = "Pin[Box[dyn Future[Output = Result[T, E]] + Send]]";
+        assert_eq!(find_type_end(input), input.len()); // No `{` or top-level `=`
+        
+        let input2 = "Pin[Box[dyn Future[Output = Result[T, E]]]] {";
+        assert_eq!(find_type_end(input2), input2.len() - 2); // At `{`
+    }
+    
+    #[test]
+    fn test_async_trait_method_signature() {
+        // Async trait method with associated type Output = Result[...]
+        let line = "fn post_blob(&self, data &[u8]) Pin[Box[dyn Future[Output = Result[BlobRef, DAError]] + Send + '_]]";
+        match parse_function_line(line) {
+            FunctionParseResult::RustSPlusSignature(sig) => {
+                let rust = signature_to_rust(&sig);
+                // CRITICAL: Must NOT have `{` in the output (no body)
+                // CRITICAL: Must preserve `Output = Result`, NOT `Output { Result`
+                assert!(rust.contains("Output = Result"),
+                    "Associated type = must be preserved, got: {}", rust);
+                assert!(!rust.contains("Output {"),
+                    "Must NOT have Output {{ , got: {}", rust);
+                assert!(rust.contains("Future<"),
+                    "Future must be transformed to angle brackets, got: {}", rust);
+            }
+            _ => panic!("Expected RustSPlusSignature"),
+        }
+    }
+    
+    #[test]
+    fn test_future_generic_transformation() {
+        // Verify Future is in GENERIC_TYPES and gets transformed
+        let result = transform_generic_brackets("Future[Output = Result[T, E]]");
+        assert_eq!(result, "Future<Output = Result<T, E>>");
+        
+        let result2 = transform_generic_brackets("Pin[Box[dyn Future[Output = Result[T, E]]]]");
+        assert_eq!(result2, "Pin<Box<dyn Future<Output = Result<T, E>>>>");
     }
 }

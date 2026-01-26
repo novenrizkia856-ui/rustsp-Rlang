@@ -247,8 +247,15 @@ pub fn parse_rusts(source: &str) -> String {
                 
                 match parse_function_line(&complete_sig) {
                     FunctionParseResult::RustSPlusSignature(sig) => {
-                        let rust_sig = signature_to_rust(&sig);
-                        output_lines.push(format!("{}{}", multiline_fn_leading_ws, rust_sig));
+                        // CRITICAL FIX: For trait methods (no body), use signature_to_rust_with_where
+                        // with `true` to suppress the `{`, then add `;` for trait method declaration
+                        if is_trait_method {
+                            let rust_sig = signature_to_rust_with_where(&sig, true);
+                            output_lines.push(format!("{}{};", multiline_fn_leading_ws, rust_sig));
+                        } else {
+                            let rust_sig = signature_to_rust(&sig);
+                            output_lines.push(format!("{}{}", multiline_fn_leading_ws, rust_sig));
+                        }
                     }
                     FunctionParseResult::RustPassthrough => {
                         output_lines.push(format!("{}{}", multiline_fn_leading_ws, complete_sig));
@@ -1080,10 +1087,26 @@ pub fn parse_rusts(source: &str) -> String {
                 found_where
             };
             
+            // CRITICAL FIX: Detect trait method declarations (no body)
+            // If trimmed doesn't end with `{` and parens are balanced, it's a trait method
+            let is_trait_method_declaration = {
+                let paren_opens = trimmed.matches('(').count();
+                let paren_closes = trimmed.matches(')').count();
+                let parens_balanced = paren_opens == paren_closes && paren_opens > 0;
+                let no_body = !trimmed.ends_with('{');
+                parens_balanced && no_body
+            };
+            
             match parse_function_line(trimmed) {
                 FunctionParseResult::RustSPlusSignature(sig) => {
-                    let rust_sig = signature_to_rust_with_where(&sig, next_line_is_where);
-                    output_lines.push(format!("{}{}", leading_ws, rust_sig));
+                    // For trait methods (no body), suppress `{` and add `;`
+                    if is_trait_method_declaration {
+                        let rust_sig = signature_to_rust_with_where(&sig, true);
+                        output_lines.push(format!("{}{};", leading_ws, rust_sig));
+                    } else {
+                        let rust_sig = signature_to_rust_with_where(&sig, next_line_is_where);
+                        output_lines.push(format!("{}{}", leading_ws, rust_sig));
+                    }
                     continue;
                 }
                 FunctionParseResult::RustPassthrough => {

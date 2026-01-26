@@ -65,6 +65,8 @@ pub fn transform_generic_brackets(type_str: &str) -> String {
         "Range", "RangeInclusive", "RangeFrom", "RangeTo", "RangeFull",
         // Async/Future types (CRITICAL for da.rss)
         "Future", "Stream", "Poll",
+        // std::fmt types (CRITICAL for Display/Debug implementations)
+        "Formatter", "Arguments",
         // Other common generics
         "Sender", "Receiver", "SyncSender",
         "MaybeUninit", "ManuallyDrop",
@@ -187,7 +189,9 @@ pub fn find_matching_bracket(s: &str) -> Option<usize> {
 pub fn ends_with_continuation_operator(line: &str) -> bool {
     let trimmed = line.trim();
     
-    if trimmed.ends_with('(') || trimmed.ends_with('[') {
+    // CRITICAL FIX: `{` indicates start of a block/closure body - continuation, not statement end
+    // Example: `.map_err(|e| {` - the closure body continues on next line
+    if trimmed.ends_with('(') || trimmed.ends_with('[') || trimmed.ends_with('{') {
         return true;
     }
     
@@ -662,5 +666,18 @@ mod tests {
             transform_generic_brackets("Pin[Box[dyn Stream[Item = Result[Blob, DAError]] + Send]]"),
             "Pin<Box<dyn Stream<Item = Result<Blob, DAError>> + Send>>"
         );
+    }
+    
+    /// CRITICAL: Closure bodies (ending with `{`) must suppress semicolon
+    /// Bug: `.map_err(|e| {` was getting `{;` instead of just `{`
+    #[test]
+    fn test_closure_brace_is_continuation() {
+        assert!(ends_with_continuation_operator(".map_err(|e| {"));
+        assert!(ends_with_continuation_operator("Self::func().and_then(|x| {"));
+        assert!(ends_with_continuation_operator("if condition {"));
+        assert!(ends_with_continuation_operator("match x {"));
+        // But closing braces are NOT continuation
+        assert!(!ends_with_continuation_operator("}"));
+        assert!(!ends_with_continuation_operator("})"));
     }
 }

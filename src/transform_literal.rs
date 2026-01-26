@@ -29,18 +29,17 @@ pub fn transform_literal_field_with_ctx(line: &str, ctx: Option<&CurrentFunction
         return line.to_string();
     }
     
-    // Already has colon (except ::) - but might have nested struct with = in value
-    if trimmed.contains(':') && !trimmed.contains("::") {
+    // CRITICAL FIX: Check for `field: value` syntax PROPERLY
+    // The old code used `trimmed.contains(':')` which matched `:` inside URLs like "http://..."
+    // New logic: Check if there's a `:` BEFORE any `=` and OUTSIDE string literals
+    if let Some(colon_pos) = find_field_colon_position(trimmed) {
+        // This line has `field: value` syntax (colon is outside strings and before any =)
         // Check if there's a nested struct that needs transformation
         if trimmed.contains('{') && trimmed.contains('=') {
-            if let Some(colon_pos) = trimmed.find(':') {
-                if !trimmed[..colon_pos].contains("::") {
-                    let field = trimmed[..colon_pos].trim();
-                    let value = trimmed[colon_pos + 1..].trim().trim_end_matches(',');
-                    let transformed_value = transform_nested_struct_value(value);
-                    return format!("{}{}: {},", leading_ws, field, transformed_value);
-                }
-            }
+            let field = trimmed[..colon_pos].trim();
+            let value = trimmed[colon_pos + 1..].trim().trim_end_matches(',');
+            let transformed_value = transform_nested_struct_value(value);
+            return format!("{}{}: {},", leading_ws, field, transformed_value);
         }
         let clean = trimmed.trim_end_matches(',');
         return format!("{}{},", leading_ws, clean);
@@ -257,6 +256,89 @@ pub fn find_field_eq(s: &str) -> Option<usize> {
     None
 }
 
+/// CRITICAL FIX: Find the position of `:` in `field: value` syntax
+/// Returns Some(position) if there's a valid field colon, None otherwise
+/// 
+/// This function checks:
+/// 1. The `:` is OUTSIDE string literals
+/// 2. The `:` is NOT part of `::` (path separator)
+/// 3. The `:` appears BEFORE any `=` (so it's not `field = "url:port"`)
+///
+/// Examples:
+/// - `field: value` → Some(5)
+/// - `field = "http://localhost"` → None (: is inside string)
+/// - `std::fmt::Display` → None (: is part of ::)
+/// - `field: Struct { x = 1 }` → Some(5)
+pub fn find_field_colon_position(s: &str) -> Option<usize> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut in_string = false;
+    let mut first_eq_pos: Option<usize> = None;
+    
+    // First pass: find the first `=` (assignment) position outside strings
+    for i in 0..chars.len() {
+        if chars[i] == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string && chars[i] == '=' {
+            let prev = if i > 0 { chars[i-1] } else { ' ' };
+            let next = if i + 1 < chars.len() { chars[i+1] } else { ' ' };
+            // Check it's a simple = not ==, !=, <=, >=, =>
+            if prev != '!' && prev != '<' && prev != '>' && prev != '=' && next != '=' && next != '>' {
+                first_eq_pos = Some(i);
+                break;
+            }
+        }
+    }
+    
+    // Second pass: find `:` that is BEFORE the first `=` and OUTSIDE strings
+    in_string = false;
+    for i in 0..chars.len() {
+        // If we've reached the first `=`, stop searching
+        if let Some(eq_pos) = first_eq_pos {
+            if i >= eq_pos {
+                return None; // No valid field colon found before =
+            }
+        }
+        
+        if chars[i] == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        
+        if !in_string && chars[i] == ':' {
+            // Check it's not part of ::
+            let prev = if i > 0 { chars[i-1] } else { ' ' };
+            let next = if i + 1 < chars.len() { chars[i+1] } else { ' ' };
+            
+            if prev != ':' && next != ':' {
+                // Valid field colon found!
+                return Some(i);
+            }
+        }
+    }
+    
+    // If no `=` was found, check if there's a standalone `:` (already Rust syntax)
+    if first_eq_pos.is_none() {
+        in_string = false;
+        for i in 0..chars.len() {
+            if chars[i] == '"' {
+                in_string = !in_string;
+                continue;
+            }
+            if !in_string && chars[i] == ':' {
+                let prev = if i > 0 { chars[i-1] } else { ' ' };
+                let next = if i + 1 < chars.len() { chars[i+1] } else { ' ' };
+                if prev != ':' && next != ':' {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    
+    None
+}
+
 /// Check if a field name is valid (supports raw identifiers like r#type)
 pub fn is_valid_field_name(s: &str) -> bool {
     if s.is_empty() { return false; }
@@ -399,5 +481,65 @@ mod tests {
         let input = "Address { value = hash }";
         let output = transform_nested_struct_value(input);
         assert!(output.contains("value: hash"));
+    }
+    
+    // =========================================================================
+    // CRITICAL BUG FIX TESTS
+    // =========================================================================
+    
+    /// CRITICAL: URL colons inside strings must NOT confuse field detection
+    /// Bug: `rpc_url = "http://localhost:26658".to_string()` was NOT transformed
+    /// because the `:` in the URL triggered the "already has colon" check
+    #[test]
+    fn test_url_colon_in_value_string() {
+        // The `:` in "http://localhost:26658" should NOT be treated as field: syntax
+        let input = "    rpc_url = \"http://localhost:26658\".to_string()";
+        let output = transform_literal_field(input);
+        assert_eq!(output, "    rpc_url: \"http://localhost:26658\".to_string(),");
+    }
+    
+    #[test]
+    fn test_url_colon_various_formats() {
+        // IP:port format
+        assert_eq!(
+            transform_literal_field("    url = \"http://127.0.0.1:8080\""),
+            "    url: String::from(\"http://127.0.0.1:8080\"),"
+        );
+        
+        // Hostname:port format
+        assert_eq!(
+            transform_literal_field("    endpoint = \"ws://celestia:26658\""),
+            "    endpoint: String::from(\"ws://celestia:26658\"),"
+        );
+    }
+    
+    #[test]
+    fn test_find_field_colon_position() {
+        // Already has field: syntax - should find the colon
+        assert_eq!(find_field_colon_position("field: value"), Some(5));
+        assert_eq!(find_field_colon_position("name: \"test\""), Some(4));
+        
+        // Has `=` with colon in string - should return None (no field colon)
+        assert_eq!(find_field_colon_position("url = \"http://localhost\""), None);
+        assert_eq!(find_field_colon_position("rpc = \"ws://host:8080\""), None);
+        
+        // Path separator :: should NOT be detected
+        assert_eq!(find_field_colon_position("std::fmt::Display"), None);
+        assert_eq!(find_field_colon_position("value = Type::Variant"), None);
+    }
+    
+    #[test]
+    fn test_mixed_colon_scenarios() {
+        // Already Rust syntax with method call containing colon
+        assert_eq!(
+            transform_literal_field("    id: std::process::id()"),
+            "    id: std::process::id(),"
+        );
+        
+        // Field: followed by URL (already transformed)
+        assert_eq!(
+            transform_literal_field("    endpoint: \"http://localhost:8080\""),
+            "    endpoint: \"http://localhost:8080\","
+        );
     }
 }

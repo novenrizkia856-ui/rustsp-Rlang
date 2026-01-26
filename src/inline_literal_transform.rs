@@ -4,7 +4,7 @@
 //! literals, as well as inline field transformation.
 
 use std::collections::HashMap;
-use crate::transform_literal::{find_field_eq, is_valid_field_name, is_string_literal, should_clone_field_value, transform_nested_struct_value};
+use crate::transform_literal::{find_field_eq, find_field_colon_position, is_valid_field_name, is_string_literal, should_clone_field_value, transform_nested_struct_value};
 
 /// Transform single-line struct literal: `u = User { id = 1, name = "x" }`
 pub fn transform_single_line_struct_literal(line: &str, var_name: &str) -> String {
@@ -138,11 +138,11 @@ pub fn extract_field_value(field: &str) -> Option<String> {
     if let Some(eq_pos) = find_field_eq(trimmed) {
         let value = trimmed[eq_pos + 1..].trim();
         return Some(value.to_string());
-    } else if trimmed.contains(':') && !trimmed.contains("::") {
-        if let Some(colon_pos) = trimmed.find(':') {
-            let value = trimmed[colon_pos + 1..].trim();
-            return Some(value.to_string());
-        }
+    } else if let Some(colon_pos) = find_field_colon_position(trimmed) {
+        // CRITICAL FIX: Use find_field_colon_position to properly detect field: syntax
+        // This ignores colons inside string literals like "http://..."
+        let value = trimmed[colon_pos + 1..].trim();
+        return Some(value.to_string());
     }
     None
 }
@@ -191,17 +191,16 @@ pub fn transform_single_literal_field_with_clone(field: &str, add_clone: bool) -
     // Spread syntax
     if trimmed.starts_with("..") { return trimmed.to_string(); }
     
-    // Already transformed (has colon)
-    if trimmed.contains(':') && !trimmed.contains("::") {
+    // CRITICAL FIX: Check for field: syntax properly using find_field_colon_position
+    // This ignores colons inside string literals like "http://..."
+    if let Some(colon_pos) = find_field_colon_position(trimmed) {
         if add_clone {
             // Find the value part and add .clone()
-            if let Some(colon_pos) = trimmed.find(':') {
-                let name = trimmed[..colon_pos].trim();
-                let value = trimmed[colon_pos + 1..].trim();
-                // Only add .clone() if value is a clonable expression
-                if should_clone_field_value(value) && !value.ends_with(".clone()") {
-                    return format!("{}: {}.clone()", name, value);
-                }
+            let name = trimmed[..colon_pos].trim();
+            let value = trimmed[colon_pos + 1..].trim();
+            // Only add .clone() if value is a clonable expression
+            if should_clone_field_value(value) && !value.ends_with(".clone()") {
+                return format!("{}: {}.clone()", name, value);
             }
         }
         return trimmed.to_string();
