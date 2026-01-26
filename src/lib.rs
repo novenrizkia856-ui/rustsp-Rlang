@@ -831,9 +831,10 @@ pub fn parse_rusts(source: &str) -> String {
             in_struct_def = true;
             struct_def_depth = brace_depth;
             
-            if let Some(_struct_name) = parse_struct_header(trimmed) {
-                inject_derive_clone(&mut output_lines, &leading_ws);
-            }
+            // CRITICAL FIX: Do NOT auto-inject Clone!
+            // AtomicU64 and other types don't implement Clone.
+            // Let user explicitly add #[derive(Clone)] when needed.
+            // Old code: inject_derive_clone(&mut output_lines, &leading_ws);
             
             output_lines.push(format!("{}{}", leading_ws, trimmed));
             continue;
@@ -858,9 +859,10 @@ pub fn parse_rusts(source: &str) -> String {
         if is_enum_definition(trimmed) && !enum_ctx.in_enum_def {
             enum_ctx.enter_enum(brace_depth);
             
-            if let Some(_enum_name) = parse_enum_header(trimmed) {
-                inject_derive_clone(&mut output_lines, &leading_ws);
-            }
+            // CRITICAL FIX: Do NOT auto-inject Clone!
+            // Some enum variants may contain non-Clone types.
+            // Let user explicitly add #[derive(Clone)] when needed.
+            // Old code: inject_derive_clone(&mut output_lines, &leading_ws);
             
             output_lines.push(format!("{}{}", leading_ws, trimmed));
             continue;
@@ -1611,6 +1613,10 @@ fn detect_arm_has_if_expr(_lines: &[&str], _line_num: usize, _start_depth: usize
     false
 }
 
+/// DEPRECATED: This function was auto-injecting Clone to all structs/enums.
+/// This caused compilation errors for types containing non-Clone fields (e.g., AtomicU64).
+/// Clone should be explicitly added by users in their source code when needed.
+#[allow(dead_code)]
 fn inject_derive_clone(output_lines: &mut Vec<String>, leading_ws: &str) {
     let prev_line = output_lines.last().map(|s| s.trim().to_string());
     if let Some(ref prev) = prev_line {
