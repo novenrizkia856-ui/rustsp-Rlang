@@ -38,6 +38,11 @@ pub fn strip_inline_comment(line: &str) -> String {
 /// Transform RustS+ generic syntax to Rust generic syntax
 /// RustS+ uses square brackets for generics: `Vec[String]`, `HashMap[K, V]`
 /// Rust uses angle brackets: `Vec<String>`, `HashMap<K, V>`
+/// 
+/// Also handles:
+/// - Turbofish syntax: `parse::[u64]()` → `parse::<u64>()`
+/// - dyn trait objects: `dyn Future[Output = T]` → `dyn Future<Output = T>`
+/// - Associated types: `Output = Result[T, E]` (preserves `=`, only transforms brackets)
 pub fn transform_generic_brackets(type_str: &str) -> String {
     let trimmed = type_str.trim();
     
@@ -58,6 +63,8 @@ pub fn transform_generic_brackets(type_str: &str) -> String {
         "Deref", "DerefMut", "Borrow", "BorrowMut",
         // Range types
         "Range", "RangeInclusive", "RangeFrom", "RangeTo", "RangeFull",
+        // Async/Future types (CRITICAL for da.rss)
+        "Future", "Stream", "Poll",
         // Other common generics
         "Sender", "Receiver", "SyncSender",
         "MaybeUninit", "ManuallyDrop",
@@ -78,9 +85,13 @@ pub fn transform_generic_brackets(type_str: &str) -> String {
     
     let mut result = trimmed.to_string();
     
-    // CRITICAL FIX: Loop until no more transformations are needed
+    // CRITICAL FIX 1: Transform turbofish syntax FIRST
+    // Pattern: `::[T]` → `::<T>`
+    // This handles things like `val.parse::[u64]()` → `val.parse::<u64>()`
+    result = transform_turbofish_brackets(&result);
+    
+    // CRITICAL FIX 2: Loop until no more transformations are needed
     // This ensures ALL occurrences of each generic type are transformed
-    // Bug fix: The old code only found the FIRST occurrence of each pattern
     let mut changed = true;
     while changed {
         changed = false;
@@ -92,6 +103,7 @@ pub fn transform_generic_brackets(type_str: &str) -> String {
             if let Some(pos) = result.find(&pattern) {
                 let is_word_boundary = pos == 0 || {
                     let prev_char = result.chars().nth(pos - 1).unwrap_or(' ');
+                    // Allow `dyn ` prefix for trait objects
                     !prev_char.is_alphanumeric() && prev_char != '_'
                 };
                 
@@ -111,6 +123,35 @@ pub fn transform_generic_brackets(type_str: &str) -> String {
                     }
                 }
             }
+        }
+    }
+    
+    result
+}
+
+/// Transform turbofish brackets: `::[T]` → `::<T>`
+/// 
+/// Examples:
+/// - `val.parse::[u64]()` → `val.parse::<u64>()`
+/// - `Iterator::collect::[Vec[i32]]()` → `Iterator::collect::<Vec<i32>>()`
+fn transform_turbofish_brackets(s: &str) -> String {
+    let mut result = s.to_string();
+    
+    // Pattern: `::[` followed by matching `]`
+    while let Some(pos) = result.find("::[") {
+        let bracket_start = pos + 2; // Position of `[`
+        if let Some(bracket_end) = find_matching_bracket(&result[bracket_start..]) {
+            let inner = &result[bracket_start + 1..bracket_start + bracket_end];
+            // Recursively transform inner content (may have nested generics)
+            let transformed_inner = transform_generic_brackets(inner);
+            
+            let before = &result[..pos];
+            let after = &result[bracket_start + bracket_end + 1..];
+            
+            result = format!("{}::<{}>{}", before, transformed_inner, after);
+        } else {
+            // No matching bracket found, stop to avoid infinite loop
+            break;
         }
     }
     
@@ -378,6 +419,15 @@ pub fn transform_macro_calls(line: &str) -> String {
 }
 
 /// Transform bare slice types [T] to Vec<T> in struct field definitions
+/// 
+/// CRITICAL: Only transforms BARE SLICE types `[T]`, NOT:
+/// - Fixed-size arrays `[T; N]` (contain semicolon)
+/// - Borrowed slices `&[T]` (start with &)
+/// 
+/// Examples:
+/// - `field: [u8]` → `field: Vec<u8>` (bare slice → Vec)
+/// - `field: [u8; 32]` → `field: [u8; 32]` (fixed-size array, UNCHANGED)
+/// - `field: &[u8]` → `field: &[u8]` (borrowed slice, UNCHANGED)
 pub fn transform_struct_field_slice_to_vec(line: &str) -> String {
     if !line.contains(':') {
         return line.to_string();
@@ -389,6 +439,7 @@ pub fn transform_struct_field_slice_to_vec(line: &str) -> String {
         let field_name = trimmed[..colon_pos].trim();
         let type_part = trimmed[colon_pos + 1..].trim();
         
+        // Only transform if it starts with `[` but NOT `&[` (borrowed slice)
         if type_part.starts_with('[') && !type_part.starts_with("&[") {
             let mut depth = 0;
             let mut slice_end = None;
@@ -408,6 +459,15 @@ pub fn transform_struct_field_slice_to_vec(line: &str) -> String {
             
             if let Some(end_pos) = slice_end {
                 let element_type = &type_part[1..end_pos];
+                
+                // CRITICAL FIX: Do NOT transform fixed-size arrays [T; N]
+                // Fixed-size arrays contain `;` inside brackets (e.g., `u8; 32`)
+                // Only transform bare slice types [T] (no semicolon)
+                if element_type.contains(';') {
+                    // This is a fixed-size array like [u8; 32] - leave unchanged
+                    return line.to_string();
+                }
+                
                 let rest = &type_part[end_pos + 1..];
                 return format!("{}{}: Vec<{}>{}", leading_ws, field_name, element_type, rest);
             }
@@ -552,6 +612,55 @@ mod tests {
         assert_eq!(
             transform_macro_calls("vec(1, 2, 3)"),
             "vec!(1, 2, 3)"
+        );
+    }
+    
+    // =========================================================================
+    // CRITICAL BUG FIXES TESTS
+    // =========================================================================
+    
+    /// CRITICAL: Fixed-size arrays [T; N] must NOT be transformed to Vec
+    #[test]
+    fn test_fixed_size_array_not_transformed() {
+        // Fixed-size arrays should stay as-is
+        assert_eq!(
+            transform_struct_field_slice_to_vec("    pub commitment: [u8; 32],"),
+            "    pub commitment: [u8; 32],"
+        );
+        assert_eq!(
+            transform_struct_field_slice_to_vec("    namespace: [u8; 29],"),
+            "    namespace: [u8; 29],"
+        );
+        // But bare slices SHOULD be transformed
+        assert_eq!(
+            transform_struct_field_slice_to_vec("    data: [u8],"),
+            "    data: Vec<u8>,"
+        );
+    }
+    
+    /// CRITICAL: Turbofish syntax ::[T] must become ::<T>
+    #[test]
+    fn test_turbofish_transformation() {
+        assert_eq!(
+            transform_generic_brackets("val.parse::[u64]()"),
+            "val.parse::<u64>()"
+        );
+        assert_eq!(
+            transform_generic_brackets("iter.collect::[Vec[i32]]()"),
+            "iter.collect::<Vec<i32>>()"
+        );
+    }
+    
+    /// CRITICAL: Nested generics in async types must be fully transformed
+    #[test]
+    fn test_nested_async_generics() {
+        assert_eq!(
+            transform_generic_brackets("Pin[Box[dyn Future[Output = Result[T, E]]]]"),
+            "Pin<Box<dyn Future<Output = Result<T, E>>>>"
+        );
+        assert_eq!(
+            transform_generic_brackets("Pin[Box[dyn Stream[Item = Result[Blob, DAError]] + Send]]"),
+            "Pin<Box<dyn Stream<Item = Result<Blob, DAError>> + Send>>"
         );
     }
 }

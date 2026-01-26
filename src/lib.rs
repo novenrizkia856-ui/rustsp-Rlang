@@ -217,15 +217,32 @@ pub fn parse_rusts(source: &str) -> String {
             let paren_opens = acc.matches('(').count();
             let paren_closes = acc.matches(')').count();
             
-            if paren_opens == paren_closes && acc.ends_with('{') {
+            // Check if signature is complete
+            // Case 1: Regular function with body - ends with `{`
+            // Case 2: Trait method without body - parens balanced, no `{` at end
+            let parens_balanced = paren_opens == paren_closes;
+            let has_body = acc.ends_with('{');
+            
+            // CRITICAL FIX: Trait methods don't have `{` at the end
+            // They're complete when parens are balanced and we're NOT in the middle of a type
+            // Detect trait method: balanced parens + no `{` + not ending with continuation
+            let is_trait_method = parens_balanced && !has_body && 
+                !acc.trim().ends_with(',') && 
+                !acc.trim().ends_with('(') &&
+                !acc.trim().ends_with('[') &&
+                !acc.trim().ends_with('+');
+            
+            if parens_balanced && (has_body || is_trait_method) {
                 let complete_sig = acc.clone();
                 multiline_fn_acc = None;
                 
-                in_function_body = true;
-                function_start_brace = brace_depth + 1;
-                
-                if let FunctionParseResult::RustSPlusSignature(ref sig) = parse_function_line(&complete_sig) {
-                    current_fn_ctx.enter(sig, function_start_brace);
+                if has_body {
+                    in_function_body = true;
+                    function_start_brace = brace_depth + 1;
+                    
+                    if let FunctionParseResult::RustSPlusSignature(ref sig) = parse_function_line(&complete_sig) {
+                        current_fn_ctx.enter(sig, function_start_brace);
+                    }
                 }
                 
                 match parse_function_line(&complete_sig) {
@@ -245,7 +262,9 @@ pub fn parse_rusts(source: &str) -> String {
                     }
                 }
                 
-                brace_depth += 1;
+                if has_body {
+                    brace_depth += 1;
+                }
                 continue;
             } else {
                 continue;
@@ -1497,9 +1516,12 @@ fn transform_const_or_static(trimmed: &str) -> Option<String> {
     // Check if already in Rust syntax (has colon before =)
     // This includes patterns like `NAME: TYPE` or `NAME: &'static str`
     if before_eq.contains(':') {
-        // Already Rust syntax - just ensure semicolon at end
+        // Already Rust syntax - ensure semicolon at end UNLESS multi-line
         let trimmed_input = trimmed.trim_end_matches(';');
-        return Some(format!("{};", trimmed_input));
+        // CRITICAL FIX: Don't add semicolon if multi-line declaration
+        let is_multiline = trimmed_input.trim().ends_with('[') || trimmed_input.trim().ends_with('{');
+        let suffix = if is_multiline { "" } else { ";" };
+        return Some(format!("{}{}", trimmed_input, suffix));
     }
     
     // RustS+ syntax: NAME TYPE (space-separated, no colon)
@@ -1522,10 +1544,15 @@ fn transform_const_or_static(trimmed: &str) -> Option<String> {
     // Transform type (Vec[T] → Vec<T>)
     let transformed_type = helpers::transform_generic_brackets(&type_str);
     
-    // Value without trailing semicolon (we'll add our own)
+    // Value without trailing semicolon (we'll add our own if needed)
     let value = after_eq.trim_end_matches(';');
     
-    Some(format!("{}{} {}: {} = {};", prefix, keyword, name, transformed_type, value))
+    // CRITICAL FIX: Don't add semicolon if this is a multi-line declaration
+    // (value ends with `[` or `{` indicating array/struct literal continues on next line)
+    let is_multiline_start = value.trim().ends_with('[') || value.trim().ends_with('{');
+    let suffix = if is_multiline_start { "" } else { ";" };
+    
+    Some(format!("{}{} {}: {} = {}{}", prefix, keyword, name, transformed_type, value, suffix))
 }
 
 fn check_before_closing_brace(lines: &[&str], line_num: usize) -> bool {
