@@ -89,25 +89,35 @@ fn transform_generic_brackets(type_str: &str) -> String {
     
     let mut result = trimmed.to_string();
     
-    for generic_type in GENERIC_TYPES {
-        let pattern = format!("{}[", generic_type);
+    // CRITICAL FIX: Loop until no more transformations are needed
+    // This ensures ALL occurrences of each generic type are transformed
+    // Bug fix: The old code only found the FIRST occurrence of each pattern
+    let mut changed = true;
+    while changed {
+        changed = false;
         
-        if let Some(pos) = result.find(&pattern) {
-            let is_word_boundary = pos == 0 || {
-                let prev_char = result.chars().nth(pos - 1).unwrap_or(' ');
-                !prev_char.is_alphanumeric() && prev_char != '_'
-            };
+        for generic_type in GENERIC_TYPES {
+            let pattern = format!("{}[", generic_type);
             
-            if is_word_boundary {
-                let bracket_start = pos + generic_type.len();
-                if let Some(bracket_end) = find_matching_bracket(&result[bracket_start..]) {
-                    let inner = &result[bracket_start + 1..bracket_start + bracket_end];
-                    let transformed_inner = transform_generic_brackets(inner);
-                    
-                    let before = &result[..pos];
-                    let after = &result[bracket_start + bracket_end + 1..];
-                    
-                    result = format!("{}{}<{}>{}", before, generic_type, transformed_inner, after);
+            if let Some(pos) = result.find(&pattern) {
+                let is_word_boundary = pos == 0 || {
+                    let prev_char = result.chars().nth(pos - 1).unwrap_or(' ');
+                    !prev_char.is_alphanumeric() && prev_char != '_'
+                };
+                
+                if is_word_boundary {
+                    let bracket_start = pos + generic_type.len();
+                    if let Some(bracket_end) = find_matching_bracket(&result[bracket_start..]) {
+                        let inner = &result[bracket_start + 1..bracket_start + bracket_end];
+                        let transformed_inner = transform_generic_brackets(inner);
+                        
+                        let before = &result[..pos];
+                        let after = &result[bracket_start + bracket_end + 1..];
+                        
+                        result = format!("{}{}<{}>{}", before, generic_type, transformed_inner, after);
+                        changed = true;
+                        break; // Restart loop
+                    }
                 }
             }
         }

@@ -444,8 +444,12 @@ pub fn parse_rusts_assignment_ext(line: &str) -> Option<(String, Option<String>,
         
         // Type typically starts with uppercase, or is a known generic like Vec[, Option[, etc.
         // Also handle reference types like &Type, &mut Type
+        // CRITICAL FIX: Also handle path-qualified types like std::collections::HashSet[T]
+        // These start with lowercase but are valid types!
         let vtype_valid = !vtype.is_empty() && (
             vtype.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+            // Path-qualified types (std::, crate::, super::, self::, or any module::)
+            || vtype.contains("::")
             || vtype.starts_with("Vec[") || vtype.starts_with("Vec<")
             || vtype.starts_with("Option[") || vtype.starts_with("Option<")
             || vtype.starts_with("Result[") || vtype.starts_with("Result<")

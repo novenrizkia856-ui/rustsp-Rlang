@@ -171,6 +171,12 @@ pub fn parse_rusts(source: &str) -> String {
     let mut multiline_fn_acc: Option<String> = None;
     let mut multiline_fn_leading_ws: String = String::new();
     
+    // CRITICAL FIX: Multi-line assignment accumulation
+    // When an assignment ends with `=`, we need to join it with the next line
+    // Example: `mut x Type =\n    value` should become `mut x Type = value`
+    let mut multiline_assign_acc: Option<String> = None;
+    let mut multiline_assign_leading_ws: String = String::new();
+    
     // Expression continuation tracking
     let mut prev_line_was_continuation = false;
     let mut multiline_expr_depth: i32 = 0;
@@ -254,6 +260,60 @@ pub fn parse_rusts(source: &str) -> String {
             if paren_opens > paren_closes {
                 multiline_fn_acc = Some(trimmed.to_string());
                 multiline_fn_leading_ws = leading_ws.clone();
+                continue;
+            }
+        }
+        
+        // CRITICAL FIX: Handle multi-line assignment accumulation
+        // If we're accumulating a multiline assignment, join the current line
+        if let Some(ref mut acc) = multiline_assign_acc {
+            // Join with current line (add space for readability)
+            acc.push(' ');
+            acc.push_str(trimmed);
+            
+            // Check if assignment is now complete (doesn't end with `=` anymore)
+            let ends_with_eq = acc.trim().ends_with('=') && !acc.trim().ends_with("==") 
+                && !acc.trim().ends_with("!=") && !acc.trim().ends_with("<=") 
+                && !acc.trim().ends_with(">=") && !acc.trim().ends_with("=>");
+            
+            if !ends_with_eq {
+                // Assignment is complete, process it
+                let complete_assign = acc.clone();
+                let assign_ws = multiline_assign_leading_ws.clone();
+                multiline_assign_acc = None;
+                
+                // Process the complete assignment
+                if let Some((var_name, var_type, value, is_outer, is_explicit_mut)) = parse_rusts_assignment_ext(&complete_assign) {
+                    // Transform generic brackets in type
+                    let transformed_type = var_type.map(|t| helpers::transform_generic_brackets(&t));
+                    
+                    let result = process_assignment(
+                        &var_name, transformed_type.as_deref(), &value, is_outer, is_explicit_mut,
+                        line_num, &assign_ws, &scope_analyzer, &tracker, &current_fn_ctx, &fn_registry,
+                        inside_multiline_expr, next_line_is_method_chain, next_line_closes_expr, &mut prev_line_was_continuation,
+                    );
+                    output_lines.push(result);
+                } else {
+                    // Fallback: output as-is
+                    output_lines.push(format!("{}{}", assign_ws, complete_assign));
+                }
+                continue;
+            } else {
+                // Still incomplete, continue accumulating
+                continue;
+            }
+        }
+        
+        // Check if current line is start of multiline assignment (ends with `=`)
+        if trimmed.contains('=') && !trimmed.contains("==") {
+            let ends_with_eq = trimmed.ends_with('=') && !trimmed.ends_with("==") 
+                && !trimmed.ends_with("!=") && !trimmed.ends_with("<=") 
+                && !trimmed.ends_with(">=") && !trimmed.ends_with("=>");
+            
+            if ends_with_eq {
+                // Start accumulating multiline assignment
+                multiline_assign_acc = Some(trimmed.to_string());
+                multiline_assign_leading_ws = leading_ws.clone();
                 continue;
             }
         }
