@@ -4,3 +4,6 @@
 /testing
 main_rusts_temp.rs
 main_1.rss
+installer/windows/files/cargo-rustsp.exe
+installer/windows/files/rustsp.exe
+installer/windows/rustsp-setup.exe
