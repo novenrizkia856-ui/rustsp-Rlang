@@ -340,6 +340,17 @@ pub fn extract_assignment_target(line: &str) -> String {
         return String::new();
     }
     
+    // ═══════════════════════════════════════════════════════════════════════
+    // BUGFIX: Skip `const` and `static` declarations
+    // ═══════════════════════════════════════════════════════════════════════
+    // `const MAX_SIZE usize = 100` is NOT a variable assignment!
+    // It's a compile-time constant declaration. The word "const" was being
+    // extracted as the variable name, causing false RSPL071 errors.
+    // ═══════════════════════════════════════════════════════════════════════
+    if trimmed.starts_with("const ") || trimmed.starts_with("static ") {
+        return String::new();
+    }
+    
     // CRITICAL FIX: Skip macro calls like println!(), vec![], format!(), etc.
     // Macro calls are NEVER assignment targets - the `=` inside them is part of the macro args
     if is_macro_call(trimmed) {
@@ -1051,8 +1062,30 @@ impl EffectAnalyzer {
             
             // === FILE I/O ===
             "std::io", "File::", "OpenOptions::",
-            ".read(", ".read_exact(", ".read_to_string(", ".read_to_end(",
-            ".write(", ".write_all(", ".flush(",
+            // ═══════════════════════════════════════════════════════════════════════
+            // BUGFIX: Removed generic ".read(" and ".write(" patterns
+            // ═══════════════════════════════════════════════════════════════════════
+            // These patterns were causing FALSE POSITIVES with synchronization primitives!
+            // 
+            // RwLock.read(), RwLock.write(), Mutex.lock(), RefCell.borrow() are NOT I/O!
+            // They are memory synchronization primitives that operate in-process.
+            //
+            // TRUE I/O operations:
+            //   - File::open().read() - reads from filesystem
+            //   - TcpStream::connect().write() - writes to network
+            //   - stdin().read() - reads from console
+            //
+            // NOT I/O (synchronization):
+            //   - RwLock::new().read() - acquires read lock in memory
+            //   - Mutex::new().lock() - acquires mutex in memory
+            //   - RefCell::new().borrow() - borrows reference in memory
+            //
+            // We now use more specific patterns to avoid false positives.
+            // ═══════════════════════════════════════════════════════════════════════
+            ".read_exact(", ".read_to_string(", ".read_to_end(",
+            ".write_all(", ".flush(",
+            "Read::read", "Write::write",
+            "BufRead::", "io::Read", "io::Write",
             "fs::read", "fs::write", "fs::create", "fs::open",
             "fs::remove", "fs::rename", "fs::copy",
             "fs::create_dir", "fs::remove_dir", "fs::read_dir",
@@ -2323,6 +2356,16 @@ impl AntiFailLogicChecker {
         }
         
         // ═══════════════════════════════════════════════════════════════════════
+        // BUGFIX: Skip `const` and `static` declarations
+        // ═══════════════════════════════════════════════════════════════════════
+        // These are compile-time constants, NOT variable assignments.
+        // `const MAX_SIZE usize = 100` should not trigger RSPL071.
+        // ═══════════════════════════════════════════════════════════════════════
+        if trimmed.starts_with("const ") || trimmed.starts_with("static ") {
+            return;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════════════
         // CRITICAL FIX: Skip struct field initialization
         // ═══════════════════════════════════════════════════════════════════════
         // 
@@ -2489,7 +2532,26 @@ impl AntiFailLogicChecker {
     }
     
     fn emit_logic06_error(&mut self, var_name: &str, line_num: usize, source: &str) {
-        let original_line = self.function_vars.get(var_name).copied().unwrap_or(0);
+        // ═══════════════════════════════════════════════════════════════════════
+        // BUGFIX: Get original line from multiple sources
+        // ═══════════════════════════════════════════════════════════════════════
+        // Previously: `function_vars.get().unwrap_or(0)` caused "line 0" errors
+        // when variable was tracked in scope but not in function_vars.
+        //
+        // Fix: Try function_vars first, then search through scopes, then use
+        // a sensible fallback (line before current) instead of 0.
+        // ═══════════════════════════════════════════════════════════════════════
+        let original_line = self.function_vars.get(var_name).copied()
+            .or_else(|| {
+                // Try to find declaration line in any scope (reverse order = innermost first)
+                self.scopes.iter().rev()
+                    .find_map(|s| s.variables.get(var_name).copied())
+            })
+            .unwrap_or_else(|| {
+                // Fallback: if we can't find it anywhere, use line before current
+                // This is better than "line 0" which is clearly a bug indicator
+                line_num.saturating_sub(1).max(1)
+            });
         
         let error = RsplError::new(
             ErrorCode::RSPL071,
