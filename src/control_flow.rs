@@ -594,10 +594,15 @@ pub fn is_single_line_arm(line: &str) -> bool {
         return false;
     }
     
-    // Content between `{` and `}` must exist (the body)
+    // CRITICAL BUGFIX: Empty bodies like `_ {}` are valid single-line arms!
+    // Previously this returned false for empty bodies, causing them to be
+    // treated as multi-line arms which consumed the following `}` meant
+    // to close the match block, resulting in unbalanced delimiters.
     let close_pos = trimmed.rfind('}').unwrap();
-    if close_pos <= open_pos + 1 {
-        return false; // No content between braces
+    
+    // Just verify braces are in correct order (always true for valid syntax)
+    if close_pos < open_pos {
+        return false;
     }
     
     true

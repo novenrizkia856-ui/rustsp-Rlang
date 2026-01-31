@@ -69,9 +69,14 @@ pub fn process_literal_mode_line(
         if let Some(result) = process_literal_close(leading_ws, brace_depth, literal_mode, array_mode) {
             return LiteralModeResult::Handled(result);
         }
+        // CRITICAL BUGFIX: If should_exit returned false but line is just "}" or "},",
+        // do NOT process it as a literal field - let it fall through to normal processing.
+        // This prevents incorrectly consuming closing braces that belong to outer scopes
+        // (function body, impl block, etc.), which would cause "unclosed delimiter" errors.
+        return LiteralModeResult::NotHandled;
     }
     
-    // Process line inside literal mode
+    // Process line inside literal mode (only for non-closing-brace lines)
     if literal_mode.is_active() {
         let transformed = transform_literal_field_with_ctx(clean_line, current_fn_ctx);
         
