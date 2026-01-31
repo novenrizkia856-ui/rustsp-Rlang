@@ -55,6 +55,8 @@ pub enum FunctionParseResult {
 /// Transform RustS+ generic syntax to Rust generic syntax
 /// RustS+ uses square brackets for generics: `Vec[String]`, `HashMap[K, V]`
 /// Rust uses angle brackets: `Vec<String>`, `HashMap<K, V>`
+/// 
+/// Also handles lifetime parameters: `Formatter[_]` → `Formatter<'_>`
 fn transform_generic_brackets(type_str: &str) -> String {
     let trimmed = type_str.trim();
     
@@ -91,6 +93,13 @@ fn transform_generic_brackets(type_str: &str) -> String {
         "Lazy", "OnceCell", "OnceLock",
     ];
     
+    // CRITICAL: Types that take LIFETIME parameters instead of type parameters
+    // When inner content is `_`, it must become `'_` (lifetime elision placeholder)
+    const LIFETIME_PARAM_TYPES: &[&str] = &[
+        "Formatter",   // std::fmt::Formatter<'a>
+        "Arguments",   // std::fmt::Arguments<'a>
+    ];
+    
     let mut result = trimmed.to_string();
     
     // CRITICAL FIX: Loop until no more transformations are needed
@@ -113,7 +122,16 @@ fn transform_generic_brackets(type_str: &str) -> String {
                     let bracket_start = pos + generic_type.len();
                     if let Some(bracket_end) = find_matching_bracket(&result[bracket_start..]) {
                         let inner = &result[bracket_start + 1..bracket_start + bracket_end];
-                        let transformed_inner = transform_generic_brackets(inner);
+                        let mut transformed_inner = transform_generic_brackets(inner);
+                        
+                        // CRITICAL FIX: Handle lifetime parameter types
+                        // For types like Formatter that take lifetimes, `_` must become `'_`
+                        if LIFETIME_PARAM_TYPES.contains(generic_type) {
+                            // If inner is just `_`, convert to lifetime placeholder `'_`
+                            if transformed_inner.trim() == "_" {
+                                transformed_inner = "'_".to_string();
+                            }
+                        }
                         
                         let before = &result[..pos];
                         let after = &result[bracket_start + bracket_end + 1..];

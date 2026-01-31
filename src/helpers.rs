@@ -43,6 +43,7 @@ pub fn strip_inline_comment(line: &str) -> String {
 /// - Turbofish syntax: `parse::[u64]()` → `parse::<u64>()`
 /// - dyn trait objects: `dyn Future[Output = T]` → `dyn Future<Output = T>`
 /// - Associated types: `Output = Result[T, E]` (preserves `=`, only transforms brackets)
+/// - Lifetime parameters: `Formatter[_]` → `Formatter<'_>` (NOT `Formatter<_>`)
 pub fn transform_generic_brackets(type_str: &str) -> String {
     let trimmed = type_str.trim();
     
@@ -85,6 +86,13 @@ pub fn transform_generic_brackets(type_str: &str) -> String {
         "RwLockReadGuard", "RwLockWriteGuard", "MutexGuard",
     ];
     
+    // CRITICAL: Types that take LIFETIME parameters instead of type parameters
+    // When inner content is `_`, it must become `'_` (lifetime elision placeholder)
+    const LIFETIME_PARAM_TYPES: &[&str] = &[
+        "Formatter",   // std::fmt::Formatter<'a>
+        "Arguments",   // std::fmt::Arguments<'a>
+    ];
+    
     let mut result = trimmed.to_string();
     
     // CRITICAL FIX 1: Transform turbofish syntax FIRST
@@ -114,7 +122,16 @@ pub fn transform_generic_brackets(type_str: &str) -> String {
                     if let Some(bracket_end) = find_matching_bracket(&result[bracket_start..]) {
                         let inner = &result[bracket_start + 1..bracket_start + bracket_end];
                         // Recursively transform inner content
-                        let transformed_inner = transform_generic_brackets(inner);
+                        let mut transformed_inner = transform_generic_brackets(inner);
+                        
+                        // CRITICAL FIX 3: Handle lifetime parameter types
+                        // For types like Formatter that take lifetimes, `_` must become `'_`
+                        if LIFETIME_PARAM_TYPES.contains(generic_type) {
+                            // If inner is just `_`, convert to lifetime placeholder `'_`
+                            if transformed_inner.trim() == "_" {
+                                transformed_inner = "'_".to_string();
+                            }
+                        }
                         
                         let before = &result[..pos];
                         let after = &result[bracket_start + bracket_end + 1..];
@@ -679,5 +696,34 @@ mod tests {
         // But closing braces are NOT continuation
         assert!(!ends_with_continuation_operator("}"));
         assert!(!ends_with_continuation_operator("})"));
+    }
+    
+    /// CRITICAL: Types that take lifetime parameters must use '_ not _
+    /// Bug: `Formatter[_]` was becoming `Formatter<_>` instead of `Formatter<'_>`
+    #[test]
+    fn test_lifetime_parameter_types() {
+        // Formatter takes a lifetime, not a type parameter
+        assert_eq!(
+            transform_generic_brackets("Formatter[_]"),
+            "Formatter<'_>"
+        );
+        assert_eq!(
+            transform_generic_brackets("std::fmt::Formatter[_]"),
+            "std::fmt::Formatter<'_>"
+        );
+        // Arguments also takes a lifetime
+        assert_eq!(
+            transform_generic_brackets("Arguments[_]"),
+            "Arguments<'_>"
+        );
+        // But regular generics with _ should stay as _
+        assert_eq!(
+            transform_generic_brackets("Option[_]"),
+            "Option<_>"
+        );
+        assert_eq!(
+            transform_generic_brackets("Vec[_]"),
+            "Vec<_>"
+        );
     }
 }
