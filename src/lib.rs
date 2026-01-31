@@ -220,19 +220,41 @@ pub fn parse_rusts(source: &str) -> String {
             // Check if signature is complete
             // Case 1: Regular function with body - ends with `{`
             // Case 2: Trait method without body - parens balanced, no `{` at end
+            // Case 3: Function with where clause - parens balanced, no `{`, where clause follows
             let parens_balanced = paren_opens == paren_closes;
             let has_body = acc.ends_with('{');
+            
+            // CRITICAL FIX: Look ahead to check if next line is a `where` clause
+            let next_line_is_where_multiline = {
+                let mut found_where = false;
+                for future in lines.iter().skip(line_num + 1) {
+                    let ft = strip_inline_comment(future);
+                    let ft_trim = ft.trim();
+                    if ft_trim.is_empty() {
+                        continue;
+                    }
+                    found_where = ft_trim.starts_with("where") && 
+                        (ft_trim == "where" || ft_trim.chars().nth(5).map(|c| c.is_whitespace() || c == '\n').unwrap_or(true));
+                    break;
+                }
+                found_where
+            };
             
             // CRITICAL FIX: Trait methods don't have `{` at the end
             // They're complete when parens are balanced and we're NOT in the middle of a type
             // Detect trait method: balanced parens + no `{` + not ending with continuation
+            // BUT: If next line is `where`, this is NOT a trait method - it has a body after the where!
             let is_trait_method = parens_balanced && !has_body && 
                 !acc.trim().ends_with(',') && 
                 !acc.trim().ends_with('(') &&
                 !acc.trim().ends_with('[') &&
-                !acc.trim().ends_with('+');
+                !acc.trim().ends_with('+') &&
+                !next_line_is_where_multiline;  // CRITICAL: Don't treat as trait method if where clause follows
             
-            if parens_balanced && (has_body || is_trait_method) {
+            // Signature is complete when: has body, OR is trait method, OR has where clause following
+            let signature_complete = parens_balanced && (has_body || is_trait_method || next_line_is_where_multiline);
+            
+            if signature_complete {
                 let complete_sig = acc.clone();
                 multiline_fn_acc = None;
                 
@@ -253,7 +275,8 @@ pub fn parse_rusts(source: &str) -> String {
                             let rust_sig = signature_to_rust_with_where(&sig, true);
                             output_lines.push(format!("{}{};", multiline_fn_leading_ws, rust_sig));
                         } else {
-                            let rust_sig = signature_to_rust(&sig);
+                            // For functions with where clause, don't add `{` - where clause comes next
+                            let rust_sig = signature_to_rust_with_where(&sig, next_line_is_where_multiline);
                             output_lines.push(format!("{}{}", multiline_fn_leading_ws, rust_sig));
                         }
                     }
@@ -1090,13 +1113,16 @@ pub fn parse_rusts(source: &str) -> String {
             };
             
             // CRITICAL FIX: Detect trait method declarations (no body)
-            // If trimmed doesn't end with `{` and parens are balanced, it's a trait method
+            // If trimmed doesn't end with `{` and parens are balanced, it MIGHT be a trait method.
+            // BUT: If next line is a `where` clause, it's NOT a trait method - it has a body!
             let is_trait_method_declaration = {
                 let paren_opens = trimmed.matches('(').count();
                 let paren_closes = trimmed.matches(')').count();
                 let parens_balanced = paren_opens == paren_closes && paren_opens > 0;
                 let no_body = !trimmed.ends_with('{');
-                parens_balanced && no_body
+                // CRITICAL FIX: If next line is `where`, this is NOT a trait method!
+                // Functions with `where` clauses have their `{` after the `where` clause.
+                parens_balanced && no_body && !next_line_is_where
             };
             
             match parse_function_line(trimmed) {
