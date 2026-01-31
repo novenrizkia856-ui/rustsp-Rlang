@@ -385,20 +385,6 @@ fn print_usage() {
 
 fn print_version() {
     println!("RustS+ Compiler v1.0.0 (Stable version)");
-    println!("Effect System: Enabled (Full Effect Ownership)");
-    println!("Logic Checks: L-01 through L-06");
-    println!("Effect Checks: Effect-01 through Effect-06");
-    println!("");
-    println!("NEW: IR-Based Effect System:");
-    println!("  - AST: Abstract Syntax Tree");
-    println!("  - HIR: High-level IR with scope resolution");
-    println!("  - EIR: Effect IR with structural inference");
-    println!("");
-    println!("Effect Inference:");
-    println!("  - Structural, not regex-based");
-    println!("  - Effect Ownership Model");
-    println!("  - Cross-Function Effect Propagation");
-    println!("  - Zero Heuristics - Explicit Declaration Required");
 }
 
 fn print_analysis(source: &str, file_name: &str) {
