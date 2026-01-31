@@ -48,32 +48,38 @@ pub mod postprocess_output;
 pub mod tests;
 
 // ============================================================================
-// NEW MODULAR COMPONENTS - Lowering (analysis/preparation)
+// NEW MODULAR COMPONENTS
 // ============================================================================
-pub mod transpiler_state;
-pub mod depth_tracking_lowering;
-pub mod lookahead_lowering;
-pub mod multiline_fn_lowering;
-pub mod multiline_assign_lowering;
-pub mod use_import_lowering;
-pub mod array_mode_lowering;
-pub mod literal_mode_lowering;
-pub mod match_mode_lowering;
 
-// ============================================================================
-// NEW MODULAR COMPONENTS - Translation (RustS+ → Rust)
-// ============================================================================
-pub mod struct_def_translate;
-pub mod enum_def_translate;
-pub mod literal_start_translate;
-pub mod literal_inline_translate;
-pub mod function_def_translate;
-pub mod const_static_translate;
-pub mod native_passthrough_translate;
-pub mod array_literal_translate;
-pub mod assignment_translate;
-pub mod expression_translate;
-pub mod macro_translate;
+/// Lowering modules - analysis and preparation phases
+/// 
+/// Contains:
+/// - `transpiler_state` - Parser state management
+/// - `depth_tracking` - Brace/bracket depth tracking
+/// - `lookahead` - Look-ahead utilities
+/// - `multiline_fn` - Multi-line function signature handling
+/// - `multiline_assign` - Multi-line assignment handling
+/// - `use_import_mode` - Use import mode handling
+/// - `array_mode` - Array mode handling
+/// - `literal_mode` - Literal mode handling
+/// - `match_mode` - Match mode handling
+pub mod lowering;
+
+/// Translation modules - RustS+ → Rust syntax transformation
+/// 
+/// Contains:
+/// - `struct_def` - Struct definition translation
+/// - `enum_def` - Enum definition translation
+/// - `literal_start` - Struct/enum literal start translation
+/// - `literal_inline` - Inline literal field transformation
+/// - `function_def` - Function definition translation
+/// - `const_static` - Const/static declaration translation
+/// - `native_passthrough` - Rust native line detection
+/// - `array_literal` - Array literal translation
+/// - `assignment` - Assignment processing
+/// - `expression` - Non-assignment expression processing
+/// - `macro_transform` - Macro transformation
+pub mod translate;
 
 // ============================================================================
 // MAIN TRANSPILATION

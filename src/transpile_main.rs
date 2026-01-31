@@ -18,45 +18,45 @@ use crate::postprocess_output::apply_postprocessing;
 use crate::rust_sanity;
 
 // Import lowering modules
-use crate::depth_tracking_lowering::{
+use crate::lowering::depth_tracking_lowering::{
     count_braces_outside_strings, count_brackets_outside_strings, update_multiline_depth,
 };
-use crate::lookahead_lowering::{
+use crate::lowering::lookahead_lowering::{
     check_before_closing_brace, check_next_line_is_where,
     check_next_line_starts_with_pipe, check_next_line_is_method_chain,
     check_next_line_closes_expr,
 };
-use crate::multiline_fn_lowering::{is_multiline_fn_start, process_multiline_fn_signature, MultilineFnResult};
-use crate::multiline_assign_lowering::{
+use crate::lowering::multiline_fn_lowering::{is_multiline_fn_start, process_multiline_fn_signature, MultilineFnResult};
+use crate::lowering::multiline_assign_lowering::{
     is_multiline_assign_start, is_multiline_assign_complete, process_complete_multiline_assign,
 };
-use crate::use_import_lowering::{process_use_import_line, UseImportResult};
-use crate::array_mode_lowering::{process_array_mode_line, ArrayModeResult};
-use crate::literal_mode_lowering::{process_literal_mode_line, LiteralModeResult};
-use crate::match_mode_lowering::{process_match_mode_line, MatchModeResult};
+use crate::lowering::use_import_lowering::{process_use_import_line, UseImportResult};
+use crate::lowering::array_mode_lowering::{process_array_mode_line, ArrayModeResult};
+use crate::lowering::literal_mode_lowering::{process_literal_mode_line, LiteralModeResult};
+use crate::lowering::match_mode_lowering::{process_match_mode_line, MatchModeResult};
 
 // Import translation modules
-use crate::struct_def_translate::{process_struct_def_line, StructDefResult};
-use crate::enum_def_translate::{process_enum_def_line, EnumDefResult};
-use crate::literal_start_translate::{
+use crate::translate::struct_def_translate::{process_struct_def_line, StructDefResult};
+use crate::translate::enum_def_translate::{process_enum_def_line, EnumDefResult};
+use crate::translate::literal_start_translate::{
     process_struct_literal_start, process_enum_literal_start,
     process_literal_in_call, process_bare_struct_literal, process_bare_enum_literal,
     LiteralStartResult,
 };
-use crate::function_def_translate::{process_function_def, FunctionDefResult};
-use crate::const_static_translate::transform_const_or_static;
-use crate::native_passthrough_translate::{is_rust_native_line, process_native_line};
-use crate::array_literal_translate::{process_array_literal_start, ArrayLiteralResult};
-use crate::expression_translate::{process_non_assignment, process_tuple_destructuring};
-use crate::assignment_translate::process_assignment;
-use crate::macro_translate::transform_macros_to_correct_syntax;
+use crate::translate::function_def_translate::{process_function_def, FunctionDefResult};
+use crate::translate::const_static_translate::transform_const_or_static;
+use crate::translate::native_passthrough_translate::{is_rust_native_line, process_native_line};
+use crate::translate::array_literal_translate::{process_array_literal_start, ArrayLiteralResult};
+use crate::translate::expression_translate::{process_non_assignment, process_tuple_destructuring};
+use crate::translate::assignment_translate::process_assignment;
+use crate::translate::macro_translate::transform_macros_to_correct_syntax;
 
 // Import for match/if handling
 use crate::control_flow::{
     is_match_start, is_if_assignment, parse_control_flow_assignment,
     MatchStringContext, transform_match_for_string_patterns, pattern_is_string_literal,
 };
-use crate::assignment_translate::parse_var_type_annotation;
+use crate::translate::assignment_translate::parse_var_type_annotation;
 
 /// Main entry point for RustS+ to Rust transpilation
 pub fn parse_rusts(source: &str) -> String {
@@ -289,7 +289,7 @@ pub fn parse_rusts(source: &str) -> String {
         // If expression assignment end
         if if_expr_assignment_depth.is_some() && trimmed == "}" {
             let start_depth = if_expr_assignment_depth.unwrap();
-            let next_is_else = crate::lookahead_lowering::check_next_is_else(&lines, line_num);
+            let next_is_else = crate::lowering::lookahead_lowering::check_next_is_else(&lines, line_num);
             if brace_depth <= start_depth && !next_is_else {
                 if_expr_assignment_depth = None;
                 output_lines.push(format!("{}}}); ", leading_ws));

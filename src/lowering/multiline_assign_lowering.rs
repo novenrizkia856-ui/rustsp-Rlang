@@ -11,7 +11,7 @@
 
 use crate::variable::parse_rusts_assignment_ext;
 use crate::helpers;
-use crate::assignment_translate::process_assignment;
+use crate::translate::assignment_translate::process_assignment;
 use crate::scope::ScopeAnalyzer;
 use crate::variable::VariableTracker;
 use crate::function::{CurrentFunctionContext, FunctionRegistry};

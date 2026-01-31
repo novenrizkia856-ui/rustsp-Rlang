@@ -268,7 +268,7 @@ fn transform_call_with_struct_literal(line: &str) -> String {
         let fields_part = &after_brace[..close_pos];
         let after_close = &after_brace[close_pos..];
         
-        let transformed_fields = crate::literal_inline_translate::transform_fields_inline(fields_part);
+        let transformed_fields = crate::translate::literal_inline_translate::transform_fields_inline(fields_part);
         
         return format!("{} {} {}", before_brace, transformed_fields, after_close);
     }

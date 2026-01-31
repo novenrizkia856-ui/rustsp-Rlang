@@ -21,7 +21,7 @@ use crate::function::{
     parse_function_line, signature_to_rust_with_where, FunctionParseResult,
     CurrentFunctionContext,
 };
-use crate::lookahead_lowering::check_next_line_is_where;
+use crate::lowering::lookahead_lowering::check_next_line_is_where;
 
 /// Result of processing a multi-line function signature accumulation
 pub enum MultilineFnResult {

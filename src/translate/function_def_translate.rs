@@ -17,7 +17,7 @@ use crate::function::{
     CurrentFunctionContext,
 };
 use crate::helpers::needs_semicolon;
-use crate::lookahead_lowering::check_next_line_is_where;
+use crate::lowering::lookahead_lowering::check_next_line_is_where;
 
 /// Result of processing a function definition
 pub enum FunctionDefResult {

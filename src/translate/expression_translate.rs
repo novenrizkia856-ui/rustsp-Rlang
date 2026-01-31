@@ -17,7 +17,7 @@ use crate::control_flow::transform_enum_struct_init;
 use crate::clone_helpers::transform_array_access_clone;
 use crate::helpers::{ends_with_continuation_operator, needs_semicolon};
 use crate::transform_literal::is_string_literal;
-use crate::assignment_translate::parse_var_type_annotation;
+use crate::translate::assignment_translate::parse_var_type_annotation;
 
 /// Process a non-assignment expression
 pub fn process_non_assignment(

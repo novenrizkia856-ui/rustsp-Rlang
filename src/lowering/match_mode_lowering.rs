@@ -15,7 +15,7 @@ use crate::control_flow::{
     transform_single_line_arm, transform_multi_pattern_line,
 };
 use crate::clone_helpers::extract_arm_pattern;
-use crate::lookahead_lowering::detect_arm_has_if_expr;
+use crate::lowering::lookahead_lowering::detect_arm_has_if_expr;
 use crate::function::CurrentFunctionContext;
 
 /// Result of processing a line in match mode
