@@ -1,0 +1,7 @@
+// hello.rss - RustS+ Hello World Example
+// Effect Honesty: main() declares 'io' effect because it uses println
+
+fn main() effects(io) {
+    println("Hello, RustS+!")
+    println("Where Logic Safety Meets Memory Safety")
+}
