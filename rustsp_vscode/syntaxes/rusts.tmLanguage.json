@@ -3,6 +3,8 @@
   "patterns": [
     { "include": "#comments" },
     { "include": "#strings" },
+    { "include": "#effectsClause" },
+    { "include": "#matchArm" },
     { "include": "#keywords" },
     { "include": "#types" },
     { "include": "#numbers" }
@@ -16,6 +18,7 @@
         }
       ]
     },
+
     "strings": {
       "patterns": [
         {
@@ -31,6 +34,52 @@
         }
       ]
     },
+
+    "effectsClause": {
+      "patterns": [
+        {
+          "name": "meta.effects.rustsplus",
+          "begin": "\\beffects\\s*\\(",
+          "beginCaptures": {
+            "0": { "name": "keyword.modifier.rustsplus" }
+          },
+          "end": "\\)",
+          "patterns": [
+            {
+              "name": "support.type.effect.rustsplus",
+              "match": "\\b(io|alloc|panic|read|write)\\b"
+            },
+            {
+              "name": "variable.parameter.effect.rustsplus",
+              "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b"
+            },
+            {
+              "name": "punctuation.separator.rustsplus",
+              "match": ","
+            }
+          ]
+        }
+      ]
+    },
+
+    "matchArm": {
+      "patterns": [
+        {
+          "name": "meta.match.arm.rustsplus",
+          "begin": "\\b[A-Z][A-Za-z0-9_:]*\\s*\\{",
+          "beginCaptures": {
+            "0": { "name": "entity.name.match.arm.rustsplus" }
+          },
+          "end": "\\}",
+          "patterns": [
+            { "include": "#strings" },
+            { "include": "#keywords" },
+            { "include": "#numbers" }
+          ]
+        }
+      ]
+    },
+
     "keywords": {
       "patterns": [
         {
@@ -44,13 +93,10 @@
         {
           "name": "constant.language.rustsplus",
           "match": "\\b(true|false)\\b"
-        },
-        {
-          "name": "support.type.effect.rustsplus",
-          "match": "\\b(io|alloc|panic|read|write)\\b"
         }
       ]
     },
+
     "types": {
       "patterns": [
         {
@@ -59,6 +105,7 @@
         }
       ]
     },
+
     "numbers": {
       "patterns": [
         {
