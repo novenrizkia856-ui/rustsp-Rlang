@@ -1134,7 +1134,7 @@ pub struct SourceLocation {
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        cargo-rustsp v0.9.0                          │
+│                        cargo-rustsp v1.0.0                          │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
 │  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐             │
@@ -1147,7 +1147,7 @@ pub struct SourceLocation {
 │  │  Features:                                                   │   │
 │  │  • Multi-module resolution (nested modules, mod.rss)         │   │
 │  │  • Workspace support (multiple crates)                       │   │
-│  │  • Incremental compilation (hash-based caching)              │   │
+│  │  • Incremental compilation (SHA-256 + Merkle tree caching)   │   │
 │  │  • Mixed .rs/.rss projects                                   │   │
 │  │  • Feature flags support                                     │   │
 │  │  • Source-mapped error reporting                             │   │
@@ -1162,7 +1162,8 @@ pub struct SourceLocation {
 |-------|-----------|
 | **Multi-Module** | Full support for nested modules (`mod foo;` resolves to `foo.rss` or `foo/mod.rss`) |
 | **Workspace** | Build multiple crates in a single workspace |
-| **Incremental** | Hash-based caching - only recompile changed files |
+| **Incremental** | SHA-256 content hashing + Merkle tree structure tracking — only recompiles what changed |
+| **Smart Detection** | Detects renames, moves, additions, deletions without unnecessary recompilation |
 | **Mixed Projects** | Combine `.rs` (pure Rust) and `.rss` (RustS+) in a single project |
 | **Features** | Full `--features` support like regular cargo |
 | **Error Mapping** | Error messages point to the location in the original `.rss` file |
@@ -1194,9 +1195,19 @@ cargo rustsp --version
 | `cargo rustsp run` | Build and run |
 | `cargo rustsp test` | Run tests |
 | `cargo rustsp check` | Check tanpa compile binary |
-| `cargo rustsp clean` | Clean build artifacts |
 | `cargo rustsp bench` | Run benchmarks |
 | `cargo rustsp doc` | Generate documentation |
+
+### RustS+ Toolchain Options
+
+| Option | Description |
+|--------|-------------|
+| `--rustsp-force` | Force recompile semua file .rss (ignore cache) |
+| `--rustsp-quiet` | Suppress rustsp preprocessing output |
+| `--rustsp-keep` | Jangan hapus deployed .rs files setelah cargo selesai |
+| `--rustsp-clean` | Hapus leftover .rs files dari source tree |
+| `--rustsp-reset` | Reset cache total — hapus `target/rustsp/` dan mulai dari awal |
+| `--rustsp-status` | Lihat status cache: jumlah file, merkle root, ukuran cache |
 
 ### Options
 
@@ -1282,14 +1293,14 @@ my_workspace/
 cargo-rustsp follows Rust's module resolution rules:
 
 ```
-mod foo;  →  Mencari dalam urutan:
+mod foo;  →  find in order:
              1. foo.rss      (RustS+ file)
              2. foo/mod.rss  (RustS+ directory module)
              3. foo.rs       (Rust file)
              4. foo/mod.rs   (Rust directory module)
 ```
 
-Custom path dengan attribute:
+Custom path with attribute:
 ```rust
 #[path = "custom/location.rss"]
 mod my_module;
@@ -1302,75 +1313,89 @@ cargo rustsp build
         │
         ▼
 ┌───────────────────────────────────────┐
-│ 1. Analyze module graph               │
-│    - Parse mod declarations           │
-│    - Resolve all dependencies         │
+│ 1. Scan .rss files                    │
+│    - SHA-256 hash setiap file         │
+│    - Build Merkle tree dari paths     │
 └───────────────┬───────────────────────┘
                 │
                 ▼
 ┌───────────────────────────────────────┐
-│ 2. Check cache                        │
-│    - Hash-based change detection      │
-│    - Skip unchanged files             │
+│ 2. Load compile.json manifest         │
+│    - Compare merkle root (struktur)   │
+│    - Compare content hash (per file)  │
+│    - Detect: new/mod/rename/move/del  │
 └───────────────┬───────────────────────┘
                 │
                 ▼
 ┌───────────────────────────────────────┐
-│ 3. Compile .rss files                 │
+│ 3. Compile HANYA file yang berubah    │
 │    rustsp file.rss --emit-rs          │
-│    (Stage 0 → Stage 1 → Stage 2)      │
+│    Simpan hasil di target/rustsp/     │
 │                                       │
 │    ⚠️ ERROR? STOPS HERE               │
 └───────────────┬───────────────────────┘
                 │
                 ▼
 ┌───────────────────────────────────────┐
-│ 4. Copy to shadow directory           │
-│    /tmp/rustsp_shadow_<project>/      │
-│    - .rs files (compiled dari .rss)   │
-│    - .rs files (copy dari .rs asli)   │
+│ 4. Deploy cached .rs ke source dirs   │
+│    (copy dari target/rustsp/ → src/)  │
 └───────────────┬───────────────────────┘
                 │
                 ▼
 ┌───────────────────────────────────────┐
-│ 5. Generate Cargo.toml                │
+│ 5. cargo build/run/test               │
+│    (standard Rust compiler)           │
 └───────────────┬───────────────────────┘
                 │
                 ▼
 ┌───────────────────────────────────────┐
-│ 6. cargo build                        │
-│    Output: target/rustsp_build/       │
+│ 6. Auto-cleanup .rs dari source tree  │
+│    Update compile.json manifest       │
 └───────────────────────────────────────┘
 ```
 
-### Incremental Compilation
+### Incremental Compilation (SHA-256 + Merkle Tree)
 
-cargo-rustsp caches to speed up rebuilds:
+cargo-rustsp v1.0.0 uses a smart caching system that stores compilation results in `target/rustsp/` so that it doesn't need to be recompiled every time a command is run.
+
 ```
-target/
-└── rustsp_build/
-    ├── .rustsp_cache      # Hash-based cache file
-    ├── debug/             # Debug build artifacts
-    └── release/           # Release build artifacts
+target/rustsp/
+├── compile.json          # Manifest: SHA-256 hashes, Merkle root, file mappings
+└── [mirrored source]     # Cached compiled .rs files
+    └── src/
+        ├── main.rs
+        ├── lib.rs
+        └── models/
+            └── user.rs
 ```
 
-How it works:
-- Each `.rss` file is hashed based on its content
-- If the hash matches the cache → skip compilation
-- Force rebuild with `--force`
+**How ​​change detection works:**
 
-### Shadow Directory Isolation
+| Change Type | Detection | Action |
+|--------------------|---------|------|
+| New file | Path not in manifest | Compile |
+| Contents changed | SHA-256 hash mismatch | Recompile |
+| File renamed | Same hash, different name, same dir | Update cache (skip compile) |
+| File moved | Same hash, same name, different dir | Update cache (skip compile) |
+| File deleted | Existing in manifest but missing from disk | Remove from cache |
+| Unchanged | Path & hash match | Skip, use cache directly |
 
-cargo-rustsp uses a TEMP directory to avoid conflicts with the parent Cargo.toml:
+**Merkle trees** are used to quickly detect changes in project structure — if the root hashes are the same, there's no need for a per-file check. If they differ, the toolchain performs a diff to determine which files were changed, renamed, moved, or deleted.
+
+**Example output:**
+
 ```
-Original Project              Shadow Project (TEMP)
-────────────────              ─────────────────────
-my_project/                   /tmp/rustsp_shadow_my_project/
-├── Cargo.toml                ├── Cargo.toml (generated)
-└── src/                      └── src/
-    ├── main.rss                  ├── main.rs (compiled)
-    ├── utils.rss                 ├── utils.rs (compiled)
-    └── helper.rs                 └── helper.rs (copied)
+Preprocessing RustS+ files (incremental)...
+      [NEW] src/models/order.rss
+      [MOD] src/main.rss
+   [RENAMED] src/customer.rss ← src/user.rss
+      [DEL] src/old_module.rss
+   Compiling src/models/order.rss
+   Compiling src/main.rss
+  Preprocessed 2 compiled, 5 cached, 1 renamed/moved, 1 removed
+  Structure project layout changed (merkle root updated)
+    Deployed 8/8 .rs file(s) to source tree
+     Running cargo build
 ```
 
 ### Workspace Build
@@ -1415,8 +1440,14 @@ Make sure the `rustsp` compiler is in the PATH or in the same directory as `carg
 #### Cache Issues
 If the build feels stale:
 ```bash
-cargo rustsp clean
-cargo rustsp build --force
+# Lihat status cache
+cargo rustsp --rustsp-status
+
+# Force recompile all
+cargo rustsp build --rustsp-force
+
+# total reset from beginning
+cargo rustsp --rustsp-reset
 ```
 
 #### Module Not Found
