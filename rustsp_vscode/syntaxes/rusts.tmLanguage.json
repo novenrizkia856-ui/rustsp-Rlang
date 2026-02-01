@@ -1,0 +1,71 @@
+{
+  "scopeName": "source.rustsplus",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#numbers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.rustsplus",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.rustsplus",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.rustsplus",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.rustsplus",
+          "match": "\\b(fn|struct|enum|match|if|else|while|for|return)\\b"
+        },
+        {
+          "name": "keyword.modifier.rustsplus",
+          "match": "\\b(mut|outer|effects)\\b"
+        },
+        {
+          "name": "constant.language.rustsplus",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "support.type.effect.rustsplus",
+          "match": "\\b(io|alloc|panic|read|write)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.rustsplus",
+          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|bool|String)\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.rustsplus",
+          "match": "\\b\\d+\\b"
+        }
+      ]
+    }
+  }
+}

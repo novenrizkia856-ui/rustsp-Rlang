@@ -7,3 +7,6 @@ main_1.rss
 installer/windows/files/cargo-rustsp.exe
 installer/windows/files/rustsp.exe
 installer/windows/rustsp-setup.exe
+rustsp_vscode/node_modules
+rustsp_vscode/package-lock.json
+rustsp_vscode/out

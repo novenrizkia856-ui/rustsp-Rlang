@@ -1,0 +1,40 @@
+{
+  "name": "rusts-plus",
+  "displayName": "RustS+",
+  "description": "RustS+ language support",
+  "version": "0.1.0",
+  "publisher": "rustsplus",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Programming Languages"],
+  "activationEvents": [
+    "onLanguage:rustsplus"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "rustsplus",
+        "aliases": ["RustS+", "rusts+"],
+        "extensions": [".rss"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "rustsplus",
+        "scopeName": "source.rustsplus",
+        "path": "./syntaxes/rusts.tmLanguage.json"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "@types/vscode": "^1.85.0"
+  }
+}
