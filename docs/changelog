@@ -18,6 +18,36 @@ With this foundation, RustS+ is ready to enter production in the same way Rust o
 In essence, RustS+ evolves not by adding features, but by deepening the meaning that the compiler can verify. With formal IRs, a capability-based type system, and linear effect ownership, RustS+ becomes a language that is not only memory-safe, but reality-safe. Once this foundation is solid, only then can it expand like Rust did: from DSDN to the entire world of systems that must not fail.
 
 
+
+Hashing
+
+Ganti DefaultHasher (u64) → SHA-256 pure Rust (FIPS 180-4)
+Tambah Merkle tree hashing untuk deteksi perubahan struktur project
+
+Incremental Compilation
+
+Cache hasil compile di target/rustsp/*.rs (mirror struktur source)
+File compile.json sebagai manifest utama (hash, path, merkle root)
+Deteksi 6 jenis perubahan: new, modified, renamed, moved, deleted, unchanged
+Rename/move file → skip compile (content hash match)
+Tidak ada perubahan → skip compiler RustS+, langsung ke cargo
+
+New toolchain architecture:
+
+Struct IncrementalCompiler replaces preprocess_project()
+DeployTracker replaces GeneratedFilesTracker (cached copy, not in-place)
+Inline JSON parser/serializer (zero dependencies)
+
+new commands:
+
+--rustsp-reset / --reset clean — reset cache total
+--rustsp-status — see info cache & manifest
+
+delete:
+
+old filecache (format .rustsp_cache tab-separated)
+compile in-place system (now, compile to cache first, then deploy)
+
 Effect detection based on TYPE SIGNATURE:
 - Function has EffectSignature in TypeEnv
 - Function calls to → effect lookup from signature
