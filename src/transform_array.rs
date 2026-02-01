@@ -88,16 +88,25 @@ fn transform_complete_literal_element(line: &str) -> String {
     
     // Extract fields between { and }
     let fields_part = &rest[1..close_brace]; // Skip opening {
-    let after_close = &rest[close_brace + 1..]; // Everything after }
     
     // Transform fields: `field = value` -> `field: value`
     let transformed_fields = transform_fields(fields_part);
     
-    // Reconstruct with comma
-    let needs_comma = !after_close.trim().ends_with(',');
-    let suffix = if needs_comma { "," } else { "" };
-    
-    format!("{} {{ {} }}{}{}", type_part, transformed_fields, after_close.trim_end_matches(','), suffix)
+    // CRITICAL BUGFIX: Always ensure trailing comma for array elements.
+    //
+    // Previous logic was:
+    //   let needs_comma = !after_close.trim().ends_with(',');
+    //   let suffix = if needs_comma { "," } else { "" };
+    //   format!("... {}{}", after_close.trim_end_matches(','), suffix)
+    //
+    // Bug: When source had trailing comma (after_close = ","):
+    //   1. needs_comma = false (comma exists) → suffix = ""
+    //   2. after_close.trim_end_matches(',') = "" (comma STRIPPED!)
+    //   3. Result: no comma at all!
+    //
+    // This caused `vec![]` elements to lose commas, making rustc fail with
+    // "no rules expected this token in macro call" on the NEXT element.
+    format!("{} {{ {} }},", type_part, transformed_fields)
 }
 
 /// Transform fields inside a struct/enum literal

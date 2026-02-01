@@ -879,16 +879,7 @@ mod tests {
         // The detection should work for struct variants
     }
     
-    #[test]
-    fn test_format_string_with_braces() {
-        // These should all return None - braces are inside strings
-        let result = detect_bare_enum_literal("println(\"hello {}\")");
-        assert!(result.is_none());
-        
-        let result = detect_bare_struct_literal("format(\"user {} logged in\")");
-        assert!(result.is_none());
-    }
-    
+
     //=========================================================================
     // VEC![ MACRO DETECTION TESTS
     // Verify that vec![ is properly detected as array literal

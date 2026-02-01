@@ -751,6 +751,17 @@ pub fn transform_arm_pattern(line: &str) -> String {
 
 /// Add `ref` to pattern bindings that are likely String types
 /// This uses heuristics based on common field names for strings
+///
+/// CRITICAL BUGFIX: Previous version had two problems:
+/// 1. Entry "s" in string_field_names matched ALL plural field names
+///    (heights, items, blocks, headers, results, etc.) via ends_with("s"),
+///    causing `ref heights` → `&Vec<u64>` → type mismatch in assert_eq!
+/// 2. Bare ends_with() matched partial words: "data" matched "metadata",
+///    "value" matched "hash_value", "name" matched "hostname" — all non-String types
+///
+/// Fix: Removed "s" entirely, and changed ends_with to require underscore
+/// prefix for compound names, so only `error_message` matches "message",
+/// not `voltmessage` or other coincidental suffixes.
 fn add_ref_to_string_fields(pattern: &str) -> String {
     // Check if pattern has struct destructuring
     if !pattern.contains('{') || !pattern.contains('}') {
@@ -758,10 +769,11 @@ fn add_ref_to_string_fields(pattern: &str) -> String {
     }
     
     // Common String field names that should get `ref`
+    // CRITICAL: "s" REMOVED — it matched every plural noun (heights, items, blocks...)
     let string_field_names = [
         "reason", "message", "error", "name", "description", "text",
-        "content", "body", "title", "label", "value", "data", "info",
-        "msg", "err", "str", "string", "s"
+        "content", "body", "title", "label",
+        "msg", "err", "string"
     ];
     
     // Find the struct part: everything between first `{` and last `}` in pattern
@@ -782,10 +794,23 @@ fn add_ref_to_string_fields(pattern: &str) -> String {
                         } else if f.starts_with("ref ") || f.starts_with("mut ") || f.contains(':') {
                             // Already has ref/mut or is a rename pattern (x: y)
                             f.to_string()
+                        } else if f.starts_with("..") {
+                            // Spread pattern (..) - pass through
+                            f.to_string()
                         } else {
-                            // Check if field name suggests it's a String
+                            // CRITICAL BUGFIX: Use exact match OR underscore-prefixed suffix
+                            // to avoid false positives on unrelated field names.
+                            //
+                            // Exact:    "message" == "message" ✓
+                            // Compound: "error_message".ends_with("_message") ✓  
+                            // Wrong:    "heights".ends_with("s") — NO LONGER MATCHES
+                            // Wrong:    "metadata".ends_with("data") — NO LONGER MATCHES
                             let field_lower = f.to_lowercase();
-                            if string_field_names.iter().any(|&s| field_lower == s || field_lower.ends_with(s)) {
+                            let is_string_field = string_field_names.iter().any(|&s| {
+                                field_lower == s 
+                                || field_lower.ends_with(&format!("_{}", s))
+                            });
+                            if is_string_field {
                                 format!("ref {}", f)
                             } else {
                                 f.to_string()

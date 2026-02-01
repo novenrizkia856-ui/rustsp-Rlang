@@ -93,13 +93,56 @@ fn extract_hex_identifier(s: &str) -> Option<String> {
     }
 }
 
+/// Rust integer type suffixes yang valid setelah hex literal
+/// Contoh: 0x11u8, 0xFFu64, 0x100usize, 0x10i32
+const RUST_TYPE_SUFFIXES: &[&str] = &[
+    "usize", "isize",   // pointer-sized (check longest first!)
+    "u128", "i128",      // 128-bit
+    "u64", "i64",        // 64-bit
+    "u32", "i32",        // 32-bit
+    "u16", "i16",        // 16-bit
+    "u8", "i8",          // 8-bit
+];
+
+/// Strip Rust integer type suffix dari hex literal.
+/// Returns (hex_without_suffix, suffix)
+///
+/// "0x11u8"    → ("0x11", "u8")
+/// "0xFFu64"   → ("0xFF", "u64")
+/// "0xDEADBEEF" → ("0xDEADBEEF", "")
+/// "0xMERKLE01" → ("0xMERKLE01", "")
+fn strip_rust_type_suffix(literal: &str) -> (&str, &str) {
+    for suffix in RUST_TYPE_SUFFIXES {
+        if literal.ends_with(suffix) {
+            let prefix = &literal[..literal.len() - suffix.len()];
+            // Sanity check: the part before suffix must have at least
+            // one hex digit after "0x", otherwise it's not really a suffix
+            // (e.g. "0xu8" is not valid — there's no hex value before u8)
+            if prefix.len() > 2 {
+                return (prefix, suffix);
+            }
+        }
+    }
+    (literal, "")
+}
+
 /// Normalize satu hex literal
+///
+/// CRITICAL BUGFIX: Must recognize Rust integer type suffixes (u8, u16, u32, etc.)
+/// Before: 0x11u8 → extract_hex_identifier sees 'u' as invalid → hashes "11u8" → WRONG!
+/// After:  0x11u8 → strip suffix → "0x11" is valid hex → preserve → re-attach "u8" → "0x11u8"
 fn normalize_single_hex_literal(literal: &str, cache: &mut HexNormalizerCache) -> String {
-    if let Some(identifier) = extract_hex_identifier(literal) {
+    // CRITICAL BUGFIX: Strip Rust type suffix BEFORE checking validity
+    // Without this, 0x11u8 is treated as custom hex because 'u' is not a hex digit
+    let (hex_core, type_suffix) = strip_rust_type_suffix(literal);
+    
+    if let Some(identifier) = extract_hex_identifier(hex_core) {
         let hash = cache.get_or_compute(&identifier);
-        format!("0x{:016x}", hash)
+        // Custom hex gets hashed; re-attach type suffix if any
+        // (unlikely for truly custom hex like 0xMERKLE01u8, but safe to preserve)
+        format!("0x{:016x}{}", hash, type_suffix)
     } else {
-        // Valid hex literal, return as-is
+        // Valid hex literal, return as-is (including original suffix)
         literal.to_string()
     }
 }
