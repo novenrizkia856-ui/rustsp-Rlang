@@ -602,6 +602,10 @@ struct FileEntry {
     cached_rs: String,
     /// Path where .rs should be deployed (e.g., "src/main.rs")
     deploy_path: String,
+    /// File modification time (unix timestamp as string, for fast change detection)
+    mtime: String,
+    /// File size in bytes (for fast change detection)
+    file_size: u64,
 }
 
 /// The compile.json manifest that tracks all compilation state
@@ -641,7 +645,7 @@ impl CompileManifest {
 
         let version = root.get_str("version")?.to_string();
         // Version check - reject incompatible formats
-        if !version.starts_with("2.") {
+        if !version.starts_with("1.") {
             return None;
         }
 
@@ -656,6 +660,10 @@ impl CompileManifest {
                     let file_name = val.get_str("file_name").unwrap_or("").to_string();
                     let cached_rs = val.get_str("cached_rs").unwrap_or("").to_string();
                     let deploy_path = val.get_str("deploy_path").unwrap_or("").to_string();
+                    let mtime = val.get_str("mtime").unwrap_or("0").to_string();
+                    let file_size: u64 = val.get_str("file_size")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
 
                     files.insert(
                         key.clone(),
@@ -665,6 +673,8 @@ impl CompileManifest {
                             file_name,
                             cached_rs,
                             deploy_path,
+                            mtime,
+                            file_size,
                         },
                     );
                 }
@@ -694,6 +704,8 @@ impl CompileManifest {
                 ("file_name".to_string(), json::str_val(&entry.file_name)),
                 ("cached_rs".to_string(), json::str_val(&entry.cached_rs)),
                 ("deploy_path".to_string(), json::str_val(&entry.deploy_path)),
+                ("mtime".to_string(), json::str_val(&entry.mtime)),
+                ("file_size".to_string(), json::str_val(&entry.file_size.to_string())),
             ]);
             file_entries.push((key.clone(), entry_obj));
         }
@@ -757,10 +769,14 @@ impl ChangeKind {
 struct ScannedFile {
     /// Relative path from project root
     relative_path: String,
-    /// SHA-256 of file content
+    /// SHA-256 of file content (may be reused from cache if mtime+size unchanged)
     content_hash: String,
     /// Just the file name
     file_name: String,
+    /// File modification time (unix timestamp as string)
+    mtime: String,
+    /// File size in bytes
+    file_size: u64,
 }
 
 /// Result of change detection between manifest and current project state
@@ -981,10 +997,14 @@ impl IncrementalCompiler {
         }
     }
 
-    /// Scan the project for all .rss files and compute their hashes
+    /// Scan the project for all .rss files and compute their hashes.
+    /// Uses mtime + file_size as a fast pre-filter to skip expensive SHA-256
+    /// computation when a file hasn't been modified since the last build.
     fn scan_project(&self) -> BTreeMap<String, ScannedFile> {
         let rss_files = find_rss_files(&self.project_root);
         let mut scanned = BTreeMap::new();
+        let mut hash_skipped = 0usize;
+        let mut hash_computed = 0usize;
 
         for rss_path in rss_files {
             // Compute relative path (using forward slashes for consistency)
@@ -993,16 +1013,47 @@ impl IncrementalCompiler {
                 Err(_) => continue,
             };
 
-            // Compute content hash
-            let content_hash = match sha256::hash_file(&rss_path) {
-                Ok(h) => h,
-                Err(_) => continue, // Skip unreadable files
-            };
-
             let file_name = rss_path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
+
+            // Get current mtime and file_size
+            let mtime = get_mtime(&rss_path);
+            let file_size = get_file_size(&rss_path);
+
+            // SMART HASH: if manifest has this file with matching mtime+size,
+            // reuse the cached content_hash (skip expensive SHA-256)
+            let content_hash = if !self.force {
+                if let Some(entry) = self.manifest.files.get(&relative) {
+                    if entry.mtime == mtime && entry.file_size == file_size && !entry.content_hash.is_empty() {
+                        // mtime + size both match → file hasn't changed, reuse hash
+                        hash_skipped += 1;
+                        entry.content_hash.clone()
+                    } else {
+                        // mtime or size changed → compute fresh SHA-256
+                        hash_computed += 1;
+                        match sha256::hash_file(&rss_path) {
+                            Ok(h) => h,
+                            Err(_) => continue,
+                        }
+                    }
+                } else {
+                    // New file not in manifest → must compute hash
+                    hash_computed += 1;
+                    match sha256::hash_file(&rss_path) {
+                        Ok(h) => h,
+                        Err(_) => continue,
+                    }
+                }
+            } else {
+                // Force mode → always compute hash
+                hash_computed += 1;
+                match sha256::hash_file(&rss_path) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                }
+            };
 
             scanned.insert(
                 relative.clone(),
@@ -1010,7 +1061,20 @@ impl IncrementalCompiler {
                     relative_path: relative,
                     content_hash,
                     file_name,
+                    mtime,
+                    file_size,
                 },
+            );
+        }
+
+        if !self.quiet && (hash_skipped > 0 || hash_computed > 0) {
+            eprintln!(
+                "{}       Scan{} {} file(s): {} hash-skipped (mtime match), {} hash-computed",
+                ansi::DIM,
+                ansi::RESET,
+                hash_skipped + hash_computed,
+                hash_skipped,
+                hash_computed
             );
         }
 
@@ -1209,6 +1273,8 @@ impl IncrementalCompiler {
                         .to_string_lossy(),
                 );
                 entry.deploy_path = Self::deploy_path(new_path);
+                entry.mtime = scanned.mtime.clone();
+                entry.file_size = scanned.file_size;
 
                 self.manifest.files.insert(new_path.clone(), entry);
             }
@@ -1252,6 +1318,8 @@ impl IncrementalCompiler {
                             file_name: scanned.file_name.clone(),
                             cached_rs: cached_relative,
                             deploy_path: Self::deploy_path(compile_path),
+                            mtime: scanned.mtime.clone(),
+                            file_size: scanned.file_size,
                         },
                     );
                 }
@@ -1302,6 +1370,8 @@ impl IncrementalCompiler {
                     if let Some(entry) = self.manifest.files.get_mut(missing_path) {
                         entry.content_hash = scanned.content_hash.clone();
                         entry.cached_rs = cached_relative;
+                        entry.mtime = scanned.mtime.clone();
+                        entry.file_size = scanned.file_size;
                     }
                 }
                 Err(e) => {
@@ -1457,6 +1527,21 @@ impl IncrementalCompiler {
 /// Normalize a path string to use forward slashes (cross-platform consistency)
 fn normalize_path(p: &str) -> String {
     p.replace('\\', "/")
+}
+
+/// Get file modification time as a unix timestamp string
+fn get_mtime(path: &Path) -> String {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|| "0".to_string())
+}
+
+/// Get file size in bytes
+fn get_file_size(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 /// Find project root by looking for Cargo.toml
@@ -2116,6 +2201,8 @@ mod tests {
                         file_name: "main.rss".to_string(),
                         cached_rs: "target/rustsp/src/main.rs".to_string(),
                         deploy_path: "src/main.rs".to_string(),
+                        mtime: "0".to_string(),
+                        file_size: 0,
                     },
                 );
                 m
@@ -2152,6 +2239,8 @@ mod tests {
                 file_name: "main.rss".to_string(),
                 cached_rs: "target/rustsp/src/main.rs".to_string(),
                 deploy_path: "src/main.rs".to_string(),
+                mtime: "0".to_string(),
+                file_size: 0,
             },
         );
         manifest.merkle_root = merkle::compute_root(&["src/main.rss".to_string()]);
@@ -2163,6 +2252,8 @@ mod tests {
                 relative_path: "src/main.rss".to_string(),
                 content_hash: "aaa".to_string(),
                 file_name: "main.rss".to_string(),
+                mtime: "0".to_string(),
+                file_size: 0,
             },
         );
 
@@ -2183,6 +2274,8 @@ mod tests {
                 file_name: "main.rss".to_string(),
                 cached_rs: "target/rustsp/src/main.rs".to_string(),
                 deploy_path: "src/main.rs".to_string(),
+                mtime: "0".to_string(),
+                file_size: 0,
             },
         );
         manifest.merkle_root = merkle::compute_root(&["src/main.rss".to_string()]);
@@ -2194,6 +2287,8 @@ mod tests {
                 relative_path: "src/main.rss".to_string(),
                 content_hash: "bbb".to_string(), // CHANGED
                 file_name: "main.rss".to_string(),
+                mtime: "0".to_string(),
+                file_size: 0,
             },
         );
 
@@ -2214,6 +2309,8 @@ mod tests {
                 file_name: "user.rss".to_string(),
                 cached_rs: "target/rustsp/src/user.rs".to_string(),
                 deploy_path: "src/user.rs".to_string(),
+                mtime: "0".to_string(),
+                file_size: 0,
             },
         );
         manifest.merkle_root = merkle::compute_root(&["src/user.rss".to_string()]);
@@ -2225,6 +2322,8 @@ mod tests {
                 relative_path: "src/customer.rss".to_string(),
                 content_hash: "aaa".to_string(), // Same content hash
                 file_name: "customer.rss".to_string(),
+                mtime: "0".to_string(),
+                file_size: 0,
             },
         );
 
@@ -2251,6 +2350,8 @@ mod tests {
                 file_name: "old.rss".to_string(),
                 cached_rs: "target/rustsp/src/old.rs".to_string(),
                 deploy_path: "src/old.rs".to_string(),
+                mtime: "0".to_string(),
+                file_size: 0,
             },
         );
         manifest.merkle_root = merkle::compute_root(&["src/old.rss".to_string()]);
@@ -2262,6 +2363,8 @@ mod tests {
                 relative_path: "src/new.rss".to_string(),
                 content_hash: "bbb".to_string(), // Different hash
                 file_name: "new.rss".to_string(),
+                mtime: "0".to_string(),
+                file_size: 0,
             },
         );
 
