@@ -1,13 +1,32 @@
 {
   "name": "rusts-plus",
-  "displayName": "RustS+",
-  "description": "RustS+ language support",
-  "version": "0.1.0",
+  "displayName": "RustS+ Language Support",
+  "description": "Full language support for RustS+ — the programming language with effect honesty. Syntax highlighting, IntelliSense, snippets, and more.",
+  "version": "0.2.0",
   "publisher": "rustsplus",
+  "license": "MIT",
+  "icon": "icons/rustsplus-icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/novenrizkia856-ui/rustsp-Rlang"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Programming Languages"],
+  "categories": [
+    "Programming Languages",
+    "Snippets",
+    "Formatters"
+  ],
+  "keywords": [
+    "rusts+",
+    "rustsplus",
+    "rust",
+    "effect-system",
+    "effect-honesty",
+    "blockchain",
+    "rss"
+  ],
   "activationEvents": [
     "onLanguage:rustsplus"
   ],
@@ -16,9 +35,20 @@
     "languages": [
       {
         "id": "rustsplus",
-        "aliases": ["RustS+", "rusts+"],
-        "extensions": [".rss"],
-        "configuration": "./language-configuration.json"
+        "aliases": [
+          "RustS+",
+          "rusts+",
+          "RustSPlus",
+          "rustsplus"
+        ],
+        "extensions": [
+          ".rss"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/rustsplus-icon.png",
+          "dark": "./icons/rustsplus-icon.png"
+        }
       }
     ],
     "grammars": [
@@ -27,14 +57,35 @@
         "scopeName": "source.rustsplus",
         "path": "./syntaxes/rusts.tmLanguage.json"
       }
-    ]
+    ],
+    "snippets": [
+      {
+        "language": "rustsplus",
+        "path": "./snippets/rustsplus.json"
+      }
+    ],
+    "configurationDefaults": {
+      "[rustsplus]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.formatOnSave": false,
+        "editor.semanticHighlighting.enabled": true,
+        "editor.bracketPairColorization.enabled": true,
+        "editor.guides.bracketPairs": "active",
+        "editor.suggest.snippetsPreventQuickSuggestions": false
+      }
+    }
   },
   "scripts": {
+    "vscode:prepublish": "npm run build",
     "build": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "package": "npx @vscode/vsce package"
   },
   "devDependencies": {
     "typescript": "^5.3.3",
-    "@types/vscode": "^1.85.0"
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0"
   }
 }

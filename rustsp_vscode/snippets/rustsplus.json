@@ -1,0 +1,308 @@
+{
+  "Main Function": {
+    "prefix": "main",
+    "body": [
+      "fn main() effects(io) {",
+      "    ${0:println(\"Hello, RustS+!\")}",
+      "}"
+    ],
+    "description": "Main function with io effects"
+  },
+  "Main Pure": {
+    "prefix": "mainpure",
+    "body": [
+      "fn main() {",
+      "    $0",
+      "}"
+    ],
+    "description": "Pure main function (no effects)"
+  },
+  "Function with Effects": {
+    "prefix": "fne",
+    "body": [
+      "fn ${1:name}(${2:params}) effects(${3:io}) ${4:ReturnType} {",
+      "    $0",
+      "}"
+    ],
+    "description": "Function with effects declaration"
+  },
+  "Pure Function": {
+    "prefix": "fnp",
+    "body": [
+      "fn ${1:name}(${2:params}) ${3:ReturnType} {",
+      "    $0",
+      "}"
+    ],
+    "description": "Pure function (no effects)"
+  },
+  "Function Void": {
+    "prefix": "fnv",
+    "body": [
+      "fn ${1:name}(${2:params}) {",
+      "    $0",
+      "}"
+    ],
+    "description": "Function with no return type"
+  },
+  "Single-line Function": {
+    "prefix": "fn1",
+    "body": [
+      "fn ${1:name}(${2:x} ${3:i32}) ${4:i32} = ${0:expr}"
+    ],
+    "description": "Single-line function expression"
+  },
+  "Generic Function": {
+    "prefix": "fng",
+    "body": [
+      "fn ${1:name}[${2:T}](${3:x} ${2:T}) ${2:T} {",
+      "    $0",
+      "}"
+    ],
+    "description": "Generic function with type parameter"
+  },
+  "Struct Definition": {
+    "prefix": "struct",
+    "body": [
+      "struct ${1:Name} {",
+      "    ${2:field} ${3:Type}",
+      "    $0",
+      "}"
+    ],
+    "description": "Struct definition"
+  },
+  "Enum Definition": {
+    "prefix": "enum",
+    "body": [
+      "enum ${1:Name} {",
+      "    ${2:Variant1}",
+      "    ${3:Variant2} { ${4:field} ${5:Type} }",
+      "    $0",
+      "}"
+    ],
+    "description": "Enum definition with variants"
+  },
+  "Match Expression": {
+    "prefix": "match",
+    "body": [
+      "match ${1:expr} {",
+      "    ${2:Pattern} {",
+      "        $0",
+      "    }",
+      "    _ {",
+      "        ${3:// default}",
+      "    }",
+      "}"
+    ],
+    "description": "Match expression (RustS+ style without =>)"
+  },
+  "Match Arm": {
+    "prefix": "arm",
+    "body": [
+      "${1:Pattern} {",
+      "    $0",
+      "}"
+    ],
+    "description": "Match arm (RustS+ style)"
+  },
+  "If-Else Expression": {
+    "prefix": "ife",
+    "body": [
+      "if ${1:condition} {",
+      "    $2",
+      "} else {",
+      "    $0",
+      "}"
+    ],
+    "description": "If-else expression"
+  },
+  "If-Else If-Else": {
+    "prefix": "ifei",
+    "body": [
+      "if ${1:condition1} {",
+      "    $2",
+      "} else if ${3:condition2} {",
+      "    $4",
+      "} else {",
+      "    $0",
+      "}"
+    ],
+    "description": "If-else if-else expression"
+  },
+  "If-Else Assignment": {
+    "prefix": "ifea",
+    "body": [
+      "${1:result} = if ${2:condition} {",
+      "    ${3:value1}",
+      "} else {",
+      "    ${0:value2}",
+      "}"
+    ],
+    "description": "If-else expression assigned to variable"
+  },
+  "While Loop": {
+    "prefix": "while",
+    "body": [
+      "mut ${1:i} = 0",
+      "while ${1:i} < ${2:10} {",
+      "    $0",
+      "    ${1:i} = ${1:i} + 1",
+      "}"
+    ],
+    "description": "While loop with counter"
+  },
+  "For Loop": {
+    "prefix": "for",
+    "body": [
+      "for ${1:item} in ${2:collection}.iter() {",
+      "    $0",
+      "}"
+    ],
+    "description": "For-in loop"
+  },
+  "Variable Immutable": {
+    "prefix": "let",
+    "body": [
+      "${1:name} = ${0:value}"
+    ],
+    "description": "Immutable variable (RustS+ - no 'let' keyword)"
+  },
+  "Variable Mutable": {
+    "prefix": "mut",
+    "body": [
+      "mut ${1:name} = ${0:value}"
+    ],
+    "description": "Mutable variable declaration"
+  },
+  "Variable with Type": {
+    "prefix": "lett",
+    "body": [
+      "${1:name} ${2:Type} = ${0:value}"
+    ],
+    "description": "Variable with explicit type annotation"
+  },
+  "Outer Mutation": {
+    "prefix": "outer",
+    "body": [
+      "outer ${1:var} = ${0:value}"
+    ],
+    "description": "Outer scope mutation"
+  },
+  "Effects Clause": {
+    "prefix": "effects",
+    "body": [
+      "effects(${1|io,alloc,panic,read,write|}${0})"
+    ],
+    "description": "Effects clause"
+  },
+  "Effects IO": {
+    "prefix": "eio",
+    "body": [
+      "effects(io)"
+    ],
+    "description": "IO effects clause"
+  },
+  "Effects Write": {
+    "prefix": "ew",
+    "body": [
+      "effects(write ${1:param})"
+    ],
+    "description": "Write effect clause"
+  },
+  "Effects Multiple": {
+    "prefix": "em",
+    "body": [
+      "effects(${1:io}, ${2:write ${3:param}})"
+    ],
+    "description": "Multiple effects clause"
+  },
+  "Effect Statement": {
+    "prefix": "effect",
+    "body": [
+      "effect ${1|read,write|}(${2:target})"
+    ],
+    "description": "Effect statement"
+  },
+  "Println": {
+    "prefix": "pl",
+    "body": [
+      "println(\"${1}\"${2:, ${3:args}})"
+    ],
+    "description": "println (RustS+ style, no !)"
+  },
+  "Println Format": {
+    "prefix": "plf",
+    "body": [
+      "println(\"${1}: {}\", ${2:value})"
+    ],
+    "description": "println with format placeholder"
+  },
+  "Struct Instantiation": {
+    "prefix": "sinst",
+    "body": [
+      "${1:name} = ${2:Type} {",
+      "    ${3:field} = ${4:value}",
+      "    $0",
+      "}"
+    ],
+    "description": "Struct instantiation (RustS+ uses = not :)"
+  },
+  "Impl Block": {
+    "prefix": "impl",
+    "body": [
+      "impl ${1:Type} {",
+      "    fn ${2:method}(self${3:, ${4:params}}) ${5:ReturnType} {",
+      "        $0",
+      "    }",
+      "}"
+    ],
+    "description": "Implementation block"
+  },
+  "Trait Definition": {
+    "prefix": "trait",
+    "body": [
+      "trait ${1:Name} {",
+      "    fn ${2:method}(self${3:, ${4:params}}) ${5:ReturnType}",
+      "    $0",
+      "}"
+    ],
+    "description": "Trait definition"
+  },
+  "Module Declaration": {
+    "prefix": "mod",
+    "body": [
+      "mod ${1:name}"
+    ],
+    "description": "Module declaration"
+  },
+  "Test Function": {
+    "prefix": "test",
+    "body": [
+      "#[test]",
+      "fn ${1:test_name}() {",
+      "    $0",
+      "}"
+    ],
+    "description": "Test function"
+  },
+  "Wallet Example": {
+    "prefix": "wallet",
+    "body": [
+      "struct Wallet {",
+      "    id u32",
+      "    balance i64",
+      "}",
+      "",
+      "fn apply_tx(w Wallet, amount i64) Wallet {",
+      "    Wallet {",
+      "        id = w.id",
+      "        balance = w.balance + amount",
+      "    }",
+      "}",
+      "",
+      "fn print_balance(w &Wallet) effects(io) {",
+      "    println(\"Balance: {}\", w.balance)",
+      "}"
+    ],
+    "description": "RustS+ wallet example from documentation"
+  }
+}

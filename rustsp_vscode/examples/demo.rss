@@ -1,0 +1,290 @@
+// ─── RustS+ Sample File ─────────────────────────────────────────────────────
+// This file demonstrates RustS+ syntax highlighting
+// File extension: .rss
+
+/// Documentation comment for the module
+// Regular comment
+
+// ─── Struct Definitions ─────────────────────────────────────────────────────
+
+struct Point {
+    x i32
+    y i32
+}
+
+struct Wallet {
+    id u32
+    balance i64
+    owner String
+}
+
+pub struct Config {
+    max_retries u8
+    timeout_ms u64
+    debug bool
+}
+
+// ─── Enum Definitions ───────────────────────────────────────────────────────
+
+enum Transaction {
+    Deposit { amount i64 }
+    Withdraw { amount i64 }
+    Transfer { from u32, to u32, amount i64 }
+}
+
+enum Message {
+    Quit
+    Move { x i32, y i32 }
+    Write(String)
+    Color(i32, i32, i32)
+}
+
+// ─── Pure Functions (No Effects) ────────────────────────────────────────────
+
+fn add(a i32, b i32) i32 {
+    a + b
+}
+
+fn double(x i32) i32 = x * 2
+
+fn create_point(x i32, y i32) Point {
+    Point { x = x, y = y }
+}
+
+fn apply_tx(w Wallet, tx Transaction) Wallet {
+    match tx {
+        Transaction::Deposit { amount } {
+            Wallet {
+                id = w.id
+                balance = w.balance + amount
+                owner = w.owner
+            }
+        }
+        Transaction::Withdraw { amount } {
+            Wallet {
+                id = w.id
+                balance = w.balance - amount
+                owner = w.owner
+            }
+        }
+        Transaction::Transfer { from, to, amount } {
+            Wallet {
+                id = w.id
+                balance = w.balance - amount
+                owner = w.owner
+            }
+        }
+    }
+}
+
+// ─── Generic Function ───────────────────────────────────────────────────────
+
+fn identity[T](x T) T {
+    x
+}
+
+fn first[T](items [T]) T {
+    items[0]
+}
+
+// ─── Functions with Effects ─────────────────────────────────────────────────
+
+fn greet(name String) effects(io) {
+    println("Hello, {}!", name)
+}
+
+fn print_balance(w &Wallet) effects(io) {
+    println("Wallet #{}: Balance = {}", w.id, w.balance)
+}
+
+fn process_data(data Data) effects(io, write data) Data {
+    println("Processing...")
+    effect write(data)
+    data.processed = true
+    data
+}
+
+fn create_users() effects(alloc) Vec[String] {
+    mut users = Vec::new()
+    users
+}
+
+fn risky_operation(x i32) effects(panic) i32 {
+    result = Some(x * 2)
+    result.unwrap()
+}
+
+fn transfer(from Account, to Account, amount i64) effects(write from, write to) (Account, Account) {
+    from.balance = from.balance - amount
+    to.balance = to.balance + amount
+    (from, to)
+}
+
+// ─── Trait & Impl ───────────────────────────────────────────────────────────
+
+trait Printable {
+    fn to_string(self) String
+}
+
+impl Printable for Point {
+    fn to_string(self) String {
+        format!("({}, {})", self.x, self.y)
+    }
+}
+
+impl Point {
+    fn new(x i32, y i32) Point {
+        Point { x = x, y = y }
+    }
+
+    fn distance(self, other Point) f64 {
+        dx = (self.x - other.x) as f64
+        dy = (self.y - other.y) as f64
+        (dx * dx + dy * dy)
+    }
+}
+
+// ─── Control Flow ───────────────────────────────────────────────────────────
+
+fn classify(score i32) effects(io) String {
+    // If-else expression (all branches required as value)
+    grade = if score >= 90 {
+        "A"
+    } else if score >= 80 {
+        "B"
+    } else if score >= 70 {
+        "C"
+    } else {
+        "F"
+    }
+
+    // Match expression with ranges
+    tier = match score {
+        90..=100 { "Excellent" }
+        80..=89 { "Good" }
+        70..=79 { "Average" }
+        _ { "Below Average" }
+    }
+
+    println("Grade: {}, Tier: {}", grade, tier)
+    grade
+}
+
+fn demonstrate_loops() effects(io) {
+    // While loop
+    mut i = 0
+    while i < 5 {
+        println("i = {}", i)
+        i = i + 1
+    }
+
+    // For loop
+    for item in vec![1, 2, 3, 4, 5].iter() {
+        println("item = {}", item)
+    }
+}
+
+// ─── Variable System ────────────────────────────────────────────────────────
+
+fn variable_examples() effects(io) {
+    // Immutable (no `let` keyword)
+    x = 10
+    name = "Alice"
+    pi = 3.14159
+
+    // Type annotation
+    count i32 = 42
+    flag bool = true
+
+    // Mutable
+    mut counter = 0
+    counter = counter + 1
+
+    // Outer scope mutation
+    mut total = 0
+    {
+        outer total = total + 100
+    }
+
+    // Numbers
+    hex = 0xFF
+    bin = 0b1010_1100
+    oct = 0o77
+    big = 1_000_000
+    float = 1.5e10
+
+    // String with format placeholders
+    println("Total: {}, Counter: {}", total, counter)
+}
+
+// ─── Match Patterns ─────────────────────────────────────────────────────────
+
+fn handle_message(msg Message) effects(io) {
+    match msg {
+        Message::Quit {
+            println("Quitting")
+        }
+        Message::Move { x, y } {
+            println("Moving to ({}, {})", x, y)
+        }
+        Message::Write(text) {
+            println("Writing: {}", text)
+        }
+        Message::Color(r, g, b) {
+            println("Color: ({}, {}, {})", r, g, b)
+        }
+    }
+}
+
+// ─── Attributes ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+struct Token {
+    kind String
+    value String
+    line u32
+}
+
+#[test]
+fn test_add() {
+    result = add(2, 3)
+    assert_eq!(result, 5)
+}
+
+#[cfg(test)]
+mod tests {
+    fn test_wallet() {
+        w = Wallet { id = 1, balance = 100, owner = "Alice" }
+        tx = Transaction::Deposit { amount = 50 }
+        w2 = apply_tx(w, tx)
+        assert_eq!(w2.balance, 150)
+    }
+}
+
+// ─── Main Entry Point ──────────────────────────────────────────────────────
+
+fn main() effects(io) {
+    // Create instances
+    wallet = Wallet { id = 1, balance = 100, owner = "Alice" }
+    tx = Transaction::Deposit { amount = 50 }
+
+    // Pure computation
+    new_wallet = apply_tx(wallet, tx)
+
+    // Effectful output
+    print_balance(&new_wallet)
+    greet("World")
+
+    // Generic function
+    value = identity(42)
+    println("Identity: {}", value)
+
+    // Control flow
+    classify(85)
+
+    // Pattern matching
+    msg = Message::Move { x = 10, y = 20 }
+    handle_message(msg)
+
+    println("Done!")
+}

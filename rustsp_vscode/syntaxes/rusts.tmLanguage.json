@@ -1,20 +1,106 @@
 {
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "RustS+",
   "scopeName": "source.rustsplus",
+  "fileTypes": ["rss"],
   "patterns": [
     { "include": "#comments" },
+    { "include": "#attributes" },
     { "include": "#strings" },
+    { "include": "#characters" },
+    { "include": "#effectStatement" },
     { "include": "#effectsClause" },
-    { "include": "#matchArm" },
+    { "include": "#functionDef" },
+    { "include": "#structDef" },
+    { "include": "#enumDef" },
+    { "include": "#implBlock" },
+    { "include": "#traitDef" },
+    { "include": "#modDecl" },
+    { "include": "#useDecl" },
+    { "include": "#macros" },
     { "include": "#keywords" },
+    { "include": "#constants" },
     { "include": "#types" },
-    { "include": "#numbers" }
+    { "include": "#lifetimes" },
+    { "include": "#numbers" },
+    { "include": "#operators" },
+    { "include": "#punctuation" },
+    { "include": "#functionCalls" },
+    { "include": "#typeIdentifiers" }
   ],
   "repository": {
+
     "comments": {
       "patterns": [
         {
+          "comment": "Documentation comment (///)",
+          "name": "comment.line.documentation.rustsplus",
+          "match": "///.*$"
+        },
+        {
+          "comment": "Line comment (//)",
           "name": "comment.line.double-slash.rustsplus",
           "match": "//.*$"
+        }
+      ]
+    },
+
+    "attributes": {
+      "patterns": [
+        {
+          "comment": "Inner attribute (#![...])",
+          "name": "meta.attribute.inner.rustsplus",
+          "begin": "#!\\[",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.attribute.begin.rustsplus" }
+          },
+          "end": "\\]",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.attribute.end.rustsplus" }
+          },
+          "patterns": [
+            { "include": "#attributeContent" }
+          ]
+        },
+        {
+          "comment": "Outer attribute (#[...])",
+          "name": "meta.attribute.outer.rustsplus",
+          "begin": "#\\[",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.attribute.begin.rustsplus" }
+          },
+          "end": "\\]",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.attribute.end.rustsplus" }
+          },
+          "patterns": [
+            { "include": "#attributeContent" }
+          ]
+        }
+      ]
+    },
+
+    "attributeContent": {
+      "patterns": [
+        { "include": "#strings" },
+        { "include": "#numbers" },
+        {
+          "name": "punctuation.definition.attribute.rustsplus",
+          "match": "[(),=]"
+        },
+        {
+          "comment": "Known derive macros",
+          "name": "entity.other.attribute-name.derive.rustsplus",
+          "match": "\\b(derive|allow|warn|deny|forbid|cfg|cfg_attr|test|bench|inline|cold|hot|repr|path|doc|feature|no_mangle|link|export_name|must_use|deprecated)\\b"
+        },
+        {
+          "comment": "Common derivable traits",
+          "name": "entity.name.type.trait.rustsplus",
+          "match": "\\b(Clone|Copy|Debug|Default|PartialEq|Eq|PartialOrd|Ord|Hash|Display|Serialize|Deserialize|Send|Sync)\\b"
+        },
+        {
+          "name": "entity.other.attribute-name.rustsplus",
+          "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b"
         }
       ]
     },
@@ -22,39 +108,140 @@
     "strings": {
       "patterns": [
         {
-          "name": "string.quoted.double.rustsplus",
-          "begin": "\"",
-          "end": "\"",
+          "comment": "Raw string literal r#\"...\"#",
+          "name": "string.quoted.raw.rustsplus",
+          "begin": "r(#*)\"",
+          "end": "\"\\1",
           "patterns": [
             {
-              "name": "constant.character.escape.rustsplus",
-              "match": "\\\\."
+              "comment": "Format placeholder in raw string",
+              "name": "constant.other.placeholder.rustsplus",
+              "match": "\\{[^\"\\}]*\\}"
+            }
+          ]
+        },
+        {
+          "comment": "Byte string literal b\"...\"",
+          "name": "string.quoted.byte.rustsplus",
+          "begin": "b\"",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.rustsplus" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.rustsplus" }
+          },
+          "patterns": [
+            { "include": "#escapeSequences" }
+          ]
+        },
+        {
+          "comment": "Double-quoted string literal",
+          "name": "string.quoted.double.rustsplus",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.rustsplus" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.rustsplus" }
+          },
+          "patterns": [
+            { "include": "#escapeSequences" },
+            {
+              "comment": "Format placeholder {} {name} {:fmt}",
+              "name": "constant.other.placeholder.rustsplus",
+              "match": "\\{[^\"\\}]*\\}"
             }
           ]
         }
       ]
     },
 
-    "effectsClause": {
+    "escapeSequences": {
       "patterns": [
         {
-          "name": "meta.effects.rustsplus",
-          "begin": "\\beffects\\s*\\(",
+          "comment": "Unicode escape \\u{XXXX}",
+          "name": "constant.character.escape.unicode.rustsplus",
+          "match": "\\\\u\\{[0-9a-fA-F]{1,6}\\}"
+        },
+        {
+          "comment": "Hex escape \\xNN",
+          "name": "constant.character.escape.hex.rustsplus",
+          "match": "\\\\x[0-9a-fA-F]{2}"
+        },
+        {
+          "comment": "Standard escape sequences",
+          "name": "constant.character.escape.rustsplus",
+          "match": "\\\\[\\\\\"'nrt0]"
+        }
+      ]
+    },
+
+    "characters": {
+      "patterns": [
+        {
+          "comment": "Character literal with escape",
+          "name": "string.quoted.single.rustsplus",
+          "match": "'(?:\\\\(?:[\\\\nrt0'\"\\{\\}]|x[0-9a-fA-F]{2}|u\\{[0-9a-fA-F]{1,6}\\})|[^'\\\\])'"
+        }
+      ]
+    },
+
+    "effectStatement": {
+      "comment": "Standalone effect statement: effect write(x)",
+      "patterns": [
+        {
+          "match": "^\\s*(effect)\\s+(read|write)\\s*\\(\\s*([a-zA-Z_][a-zA-Z0-9_]*)\\s*\\)",
+          "captures": {
+            "1": { "name": "keyword.other.effect.rustsplus" },
+            "2": { "name": "support.type.effect.rustsplus" },
+            "3": { "name": "variable.parameter.effect-target.rustsplus" }
+          }
+        }
+      ]
+    },
+
+    "effectsClause": {
+      "comment": "Effects clause: effects(io, alloc, panic, read x, write x)",
+      "patterns": [
+        {
+          "name": "meta.effects-clause.rustsplus",
+          "begin": "\\b(effects)\\s*(\\()",
           "beginCaptures": {
-            "0": { "name": "keyword.modifier.rustsplus" }
+            "1": { "name": "keyword.other.effects.rustsplus" },
+            "2": { "name": "punctuation.definition.effects.begin.rustsplus" }
           },
           "end": "\\)",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.effects.end.rustsplus" }
+          },
           "patterns": [
             {
+              "comment": "Simple effects: io, alloc, panic",
               "name": "support.type.effect.rustsplus",
-              "match": "\\b(io|alloc|panic|read|write)\\b"
+              "match": "\\b(io|alloc|panic)\\b"
             },
             {
-              "name": "variable.parameter.effect.rustsplus",
+              "comment": "Parameterized effects: read x, write x",
+              "match": "\\b(read|write)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+              "captures": {
+                "1": { "name": "support.type.effect.rustsplus" },
+                "2": { "name": "variable.parameter.effect-target.rustsplus" }
+              }
+            },
+            {
+              "comment": "Bare read/write (without target)",
+              "name": "support.type.effect.rustsplus",
+              "match": "\\b(read|write)\\b"
+            },
+            {
+              "comment": "Custom/user-defined effects",
+              "name": "variable.other.effect.rustsplus",
               "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b"
             },
             {
-              "name": "punctuation.separator.rustsplus",
+              "name": "punctuation.separator.comma.rustsplus",
               "match": ","
             }
           ]
@@ -62,20 +249,232 @@
       ]
     },
 
-    "matchArm": {
+    "functionDef": {
       "patterns": [
         {
-          "name": "meta.match.arm.rustsplus",
-          "begin": "\\b[A-Z][A-Za-z0-9_:]*\\s*\\{",
+          "comment": "Function definition with generic params: fn name[T](...)",
+          "match": "\\b(fn)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\s*(\\[)",
+          "captures": {
+            "1": { "name": "keyword.other.fn.rustsplus" },
+            "2": { "name": "entity.name.function.rustsplus" },
+            "3": { "name": "punctuation.definition.generic.begin.rustsplus" }
+          }
+        },
+        {
+          "comment": "Function definition: fn name(...)",
+          "match": "\\b(fn)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.fn.rustsplus" },
+            "2": { "name": "entity.name.function.rustsplus" }
+          }
+        }
+      ]
+    },
+
+    "structDef": {
+      "patterns": [
+        {
+          "comment": "Struct definition: struct Name { ... }",
+          "name": "meta.struct.definition.rustsplus",
+          "begin": "\\b(struct)\\s+([A-Z][a-zA-Z0-9_]*)\\s*(\\{)",
           "beginCaptures": {
-            "0": { "name": "entity.name.match.arm.rustsplus" }
+            "1": { "name": "storage.type.struct.rustsplus" },
+            "2": { "name": "entity.name.type.struct.rustsplus" },
+            "3": { "name": "punctuation.section.braces.begin.rustsplus" }
           },
           "end": "\\}",
+          "endCaptures": {
+            "0": { "name": "punctuation.section.braces.end.rustsplus" }
+          },
           "patterns": [
-            { "include": "#strings" },
-            { "include": "#keywords" },
-            { "include": "#numbers" }
+            { "include": "#comments" },
+            { "include": "#attributes" },
+            {
+              "comment": "Field with pub: pub name Type",
+              "match": "\\b(pub)\\s+([a-z_][a-zA-Z0-9_]*)\\s+",
+              "captures": {
+                "1": { "name": "storage.modifier.visibility.rustsplus" },
+                "2": { "name": "variable.other.member.rustsplus" }
+              }
+            },
+            {
+              "comment": "Field: name followed by a type (PascalCase, primitive, &, [)",
+              "match": "\\b([a-z_][a-zA-Z0-9_]*)(?=\\s+(?:[A-Z&\\[\\(']|i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|f32|f64|bool|char|str|usize|isize))",
+              "captures": {
+                "1": { "name": "variable.other.member.rustsplus" }
+              }
+            },
+            { "include": "#types" },
+            { "include": "#lifetimes" },
+            {
+              "name": "keyword.operator.borrow.rustsplus",
+              "match": "&"
+            },
+            { "include": "#typeIdentifiers" },
+            { "include": "#punctuation" }
           ]
+        },
+        {
+          "comment": "Struct keyword + name (without body, e.g., tuple struct or unit struct)",
+          "match": "\\b(struct)\\s+([A-Z][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.struct.rustsplus" },
+            "2": { "name": "entity.name.type.struct.rustsplus" }
+          }
+        }
+      ]
+    },
+
+    "enumDef": {
+      "patterns": [
+        {
+          "comment": "Enum definition: enum Name { ... }",
+          "name": "meta.enum.definition.rustsplus",
+          "begin": "\\b(enum)\\s+([A-Z][a-zA-Z0-9_]*)\\s*(\\{)",
+          "beginCaptures": {
+            "1": { "name": "storage.type.enum.rustsplus" },
+            "2": { "name": "entity.name.type.enum.rustsplus" },
+            "3": { "name": "punctuation.section.braces.begin.rustsplus" }
+          },
+          "end": "\\}",
+          "endCaptures": {
+            "0": { "name": "punctuation.section.braces.end.rustsplus" }
+          },
+          "patterns": [
+            { "include": "#comments" },
+            { "include": "#attributes" },
+            {
+              "comment": "Enum variant with struct fields: Variant { field Type }",
+              "name": "meta.enum.variant.struct.rustsplus",
+              "begin": "\\b([A-Z][a-zA-Z0-9_]*)\\s*(\\{)",
+              "beginCaptures": {
+                "1": { "name": "entity.name.type.variant.rustsplus" },
+                "2": { "name": "punctuation.section.braces.begin.rustsplus" }
+              },
+              "end": "\\}",
+              "endCaptures": {
+                "0": { "name": "punctuation.section.braces.end.rustsplus" }
+              },
+              "patterns": [
+                { "include": "#comments" },
+                {
+                  "comment": "Variant field name",
+                  "match": "\\b([a-z_][a-zA-Z0-9_]*)(?=\\s+(?:[A-Z&\\[\\(']|i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|f32|f64|bool|char|str|usize|isize))",
+                  "captures": {
+                    "1": { "name": "variable.other.member.rustsplus" }
+                  }
+                },
+                { "include": "#types" },
+                { "include": "#lifetimes" },
+                { "include": "#typeIdentifiers" },
+                { "include": "#punctuation" }
+              ]
+            },
+            {
+              "comment": "Enum variant with tuple: Variant(Type)",
+              "match": "\\b([A-Z][a-zA-Z0-9_]*)(?=\\s*\\()",
+              "captures": {
+                "1": { "name": "entity.name.type.variant.rustsplus" }
+              }
+            },
+            {
+              "comment": "Simple enum variant",
+              "name": "entity.name.type.variant.rustsplus",
+              "match": "\\b[A-Z][a-zA-Z0-9_]*\\b"
+            },
+            { "include": "#types" },
+            { "include": "#typeIdentifiers" },
+            { "include": "#numbers" },
+            { "include": "#punctuation" }
+          ]
+        },
+        {
+          "comment": "Enum keyword + name (without body)",
+          "match": "\\b(enum)\\s+([A-Z][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.enum.rustsplus" },
+            "2": { "name": "entity.name.type.enum.rustsplus" }
+          }
+        }
+      ]
+    },
+
+    "implBlock": {
+      "patterns": [
+        {
+          "comment": "impl Trait for Type",
+          "match": "\\b(impl)\\s+([A-Z][a-zA-Z0-9_]*)\\s+(for)\\s+([A-Z][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.impl.rustsplus" },
+            "2": { "name": "entity.name.type.trait.rustsplus" },
+            "3": { "name": "keyword.other.for.rustsplus" },
+            "4": { "name": "entity.name.type.rustsplus" }
+          }
+        },
+        {
+          "comment": "impl Type",
+          "match": "\\b(impl)\\s+([A-Z][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.impl.rustsplus" },
+            "2": { "name": "entity.name.type.rustsplus" }
+          }
+        }
+      ]
+    },
+
+    "traitDef": {
+      "patterns": [
+        {
+          "comment": "trait Name",
+          "match": "\\b(trait)\\s+([A-Z][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.trait.rustsplus" },
+            "2": { "name": "entity.name.type.trait.rustsplus" }
+          }
+        }
+      ]
+    },
+
+    "modDecl": {
+      "patterns": [
+        {
+          "comment": "pub mod name or mod name",
+          "match": "\\b(pub\\s+)?(mod)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.modifier.visibility.rustsplus" },
+            "2": { "name": "keyword.other.mod.rustsplus" },
+            "3": { "name": "entity.name.module.rustsplus" }
+          }
+        }
+      ]
+    },
+
+    "useDecl": {
+      "patterns": [
+        {
+          "comment": "use declaration",
+          "match": "\\b(use)\\b",
+          "name": "keyword.other.use.rustsplus"
+        }
+      ]
+    },
+
+    "macros": {
+      "patterns": [
+        {
+          "comment": "RustS+ I/O builtins (no !): println(), print(), eprintln(), eprint()",
+          "match": "\\b(println|print|eprintln|eprint)(?=\\s*\\()",
+          "captures": {
+            "1": { "name": "support.function.builtin.rustsplus" }
+          }
+        },
+        {
+          "comment": "Rust-style macros with !: vec!, format!, assert!, panic!, etc.",
+          "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)(!)",
+          "captures": {
+            "1": { "name": "support.function.macro.rustsplus" },
+            "2": { "name": "keyword.operator.macro.rustsplus" }
+          }
         }
       ]
     },
@@ -83,16 +482,81 @@
     "keywords": {
       "patterns": [
         {
+          "comment": "Control flow keywords",
           "name": "keyword.control.rustsplus",
-          "match": "\\b(fn|struct|enum|match|if|else|while|for|return)\\b"
+          "match": "\\b(if|else|match|while|for|loop|return|break|continue|in|where|as|yield)\\b"
         },
         {
-          "name": "keyword.modifier.rustsplus",
-          "match": "\\b(mut|outer|effects)\\b"
+          "comment": "fn keyword (standalone, not caught by functionDef)",
+          "name": "keyword.other.fn.rustsplus",
+          "match": "\\bfn\\b"
         },
         {
-          "name": "constant.language.rustsplus",
+          "comment": "Storage/declaration keywords",
+          "name": "storage.type.rustsplus",
+          "match": "\\b(struct|enum|type|trait|impl|union)\\b"
+        },
+        {
+          "comment": "Module system keywords",
+          "name": "keyword.other.rustsplus",
+          "match": "\\b(mod|use|extern|crate|super)\\b"
+        },
+        {
+          "comment": "RustS+ specific modifier: outer",
+          "name": "storage.modifier.outer.rustsplus",
+          "match": "\\bouter\\b"
+        },
+        {
+          "comment": "Mutability modifier: mut",
+          "name": "storage.modifier.mut.rustsplus",
+          "match": "\\bmut\\b"
+        },
+        {
+          "comment": "Visibility and storage modifiers",
+          "name": "storage.modifier.rustsplus",
+          "match": "\\b(pub|ref|move|unsafe|async|await|dyn|static|const|let)\\b"
+        },
+        {
+          "comment": "Self value",
+          "name": "variable.language.self.rustsplus",
+          "match": "\\bself\\b"
+        },
+        {
+          "comment": "Self type",
+          "name": "entity.name.type.self.rustsplus",
+          "match": "\\bSelf\\b"
+        },
+        {
+          "comment": "Effects keyword (standalone, not caught by effectsClause)",
+          "name": "keyword.other.effects.rustsplus",
+          "match": "\\beffects\\b"
+        }
+      ]
+    },
+
+    "constants": {
+      "patterns": [
+        {
+          "comment": "Boolean literals",
+          "name": "constant.language.boolean.rustsplus",
           "match": "\\b(true|false)\\b"
+        },
+        {
+          "comment": "None literal",
+          "name": "constant.language.option.none.rustsplus",
+          "match": "\\bNone\\b"
+        },
+        {
+          "comment": "Some/Ok/Err constructors",
+          "match": "\\b(Some|Ok|Err)(?=\\s*[\\(\\{])",
+          "captures": {
+            "1": { "name": "support.type.constructor.rustsplus" }
+          }
+        },
+        {
+          "comment": "SCREAMING_SNAKE_CASE constants",
+          "name": "constant.other.caps.rustsplus",
+          "match": "\\b[A-Z][A-Z0-9_]{2,}\\b"
         }
       ]
     },
@@ -100,8 +564,39 @@
     "types": {
       "patterns": [
         {
-          "name": "storage.type.rustsplus",
-          "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|bool|String)\\b"
+          "comment": "Numeric types (integers)",
+          "name": "entity.name.type.primitive.numeric.rustsplus",
+          "match": "\\b(i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|isize|usize)\\b"
+        },
+        {
+          "comment": "Floating point types",
+          "name": "entity.name.type.primitive.float.rustsplus",
+          "match": "\\b(f32|f64)\\b"
+        },
+        {
+          "comment": "Other primitive types",
+          "name": "entity.name.type.primitive.rustsplus",
+          "match": "\\b(bool|char|str)\\b"
+        },
+        {
+          "comment": "Standard library types",
+          "name": "entity.name.type.standard.rustsplus",
+          "match": "\\b(String|Vec|Box|Rc|Arc|HashMap|HashSet|BTreeMap|BTreeSet|LinkedList|VecDeque|Option|Result|Cell|RefCell|Mutex|RwLock|Pin|Cow|PhantomData)\\b"
+        },
+        {
+          "comment": "Standard library traits",
+          "name": "entity.name.type.trait.standard.rustsplus",
+          "match": "\\b(Iterator|IntoIterator|Display|Debug|Clone|Copy|Send|Sync|Sized|Unpin|Drop|Fn|FnMut|FnOnce|From|Into|TryFrom|TryInto|AsRef|AsMut|Default|PartialEq|Eq|PartialOrd|Ord|Hash|Add|Sub|Mul|Div|Rem|Neg|Not|Deref|DerefMut|Index|IndexMut|Read|Write|Seek|Future|Stream)\\b"
+        }
+      ]
+    },
+
+    "lifetimes": {
+      "patterns": [
+        {
+          "comment": "Named lifetime: 'a, 'static, 'lifetime",
+          "name": "storage.modifier.lifetime.rustsplus",
+          "match": "'[a-zA-Z_][a-zA-Z0-9_]*\\b"
         }
       ]
     },
@@ -109,8 +604,164 @@
     "numbers": {
       "patterns": [
         {
-          "name": "constant.numeric.rustsplus",
-          "match": "\\b\\d+\\b"
+          "comment": "Hexadecimal literal: 0xFF",
+          "name": "constant.numeric.hex.rustsplus",
+          "match": "\\b0x[0-9a-fA-F_]+(?:i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|isize|usize)?\\b"
+        },
+        {
+          "comment": "Binary literal: 0b1010",
+          "name": "constant.numeric.binary.rustsplus",
+          "match": "\\b0b[01_]+(?:i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|isize|usize)?\\b"
+        },
+        {
+          "comment": "Octal literal: 0o77",
+          "name": "constant.numeric.octal.rustsplus",
+          "match": "\\b0o[0-7_]+(?:i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|isize|usize)?\\b"
+        },
+        {
+          "comment": "Float literal: 1.0, 1.0e10, 1.0f64",
+          "name": "constant.numeric.float.rustsplus",
+          "match": "\\b\\d[\\d_]*\\.\\d[\\d_]*(?:[eE][+-]?\\d[\\d_]*)?(?:f32|f64)?\\b"
+        },
+        {
+          "comment": "Float literal with exponent only: 1e10",
+          "name": "constant.numeric.float.rustsplus",
+          "match": "\\b\\d[\\d_]*[eE][+-]?\\d[\\d_]*(?:f32|f64)?\\b"
+        },
+        {
+          "comment": "Float type suffix: 1f32, 2f64",
+          "name": "constant.numeric.float.rustsplus",
+          "match": "\\b\\d[\\d_]*(?:f32|f64)\\b"
+        },
+        {
+          "comment": "Integer literal: 42, 1_000, 10i32, 255u8",
+          "name": "constant.numeric.integer.rustsplus",
+          "match": "\\b\\d[\\d_]*(?:i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|isize|usize)?\\b"
+        }
+      ]
+    },
+
+    "operators": {
+      "patterns": [
+        {
+          "comment": "Range inclusive: ..=",
+          "name": "keyword.operator.range.inclusive.rustsplus",
+          "match": "\\.\\.="
+        },
+        {
+          "comment": "Range exclusive: ..",
+          "name": "keyword.operator.range.rustsplus",
+          "match": "\\.\\."
+        },
+        {
+          "comment": "Fat arrow: =>",
+          "name": "keyword.operator.fat-arrow.rustsplus",
+          "match": "=>"
+        },
+        {
+          "comment": "Thin arrow: ->",
+          "name": "keyword.operator.arrow.rustsplus",
+          "match": "->"
+        },
+        {
+          "comment": "Path separator: ::",
+          "name": "keyword.operator.namespace.rustsplus",
+          "match": "::"
+        },
+        {
+          "comment": "Comparison operators",
+          "name": "keyword.operator.comparison.rustsplus",
+          "match": "==|!=|<=|>="
+        },
+        {
+          "comment": "Logical operators",
+          "name": "keyword.operator.logical.rustsplus",
+          "match": "&&|\\|\\|"
+        },
+        {
+          "comment": "Compound assignment operators",
+          "name": "keyword.operator.assignment.compound.rustsplus",
+          "match": "\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<=|>>="
+        },
+        {
+          "comment": "Shift operators",
+          "name": "keyword.operator.bitwise.shift.rustsplus",
+          "match": "<<|>>"
+        },
+        {
+          "comment": "Question mark (try operator)",
+          "name": "keyword.operator.question.rustsplus",
+          "match": "\\?"
+        },
+        {
+          "comment": "Negation operator",
+          "name": "keyword.operator.logical.not.rustsplus",
+          "match": "!(?!=)"
+        }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.comma.rustsplus",
+          "match": ","
+        },
+        {
+          "name": "punctuation.terminator.semicolon.rustsplus",
+          "match": ";"
+        },
+        {
+          "name": "punctuation.separator.colon.rustsplus",
+          "match": ":(?!:)"
+        }
+      ]
+    },
+
+    "functionCalls": {
+      "patterns": [
+        {
+          "comment": "Method call: .method(...)",
+          "match": "(?<=\\.)\\s*([a-z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.method.rustsplus" }
+          }
+        },
+        {
+          "comment": "Function call: func(...)",
+          "match": "\\b([a-z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.call.rustsplus" }
+          }
+        },
+        {
+          "comment": "Static method call: Type::method(...)",
+          "match": "(?<=::)\\s*([a-z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.function.call.static.rustsplus" }
+          }
+        }
+      ]
+    },
+
+    "typeIdentifiers": {
+      "patterns": [
+        {
+          "comment": "Wildcard pattern: _",
+          "name": "variable.language.wildcard.rustsplus",
+          "match": "\\b_\\b"
+        },
+        {
+          "comment": "Type/variant before :: (path root)",
+          "match": "\\b([A-Z][a-zA-Z0-9_]*)\\s*(?=::)",
+          "captures": {
+            "1": { "name": "entity.name.type.rustsplus" }
+          }
+        },
+        {
+          "comment": "PascalCase identifier (types, variants, constructors)",
+          "name": "entity.name.type.rustsplus",
+          "match": "\\b[A-Z][a-zA-Z0-9_]*\\b"
         }
       ]
     }
