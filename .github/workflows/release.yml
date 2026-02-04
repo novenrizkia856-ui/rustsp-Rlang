@@ -1,0 +1,112 @@
+name: Release RustS+
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build binaries
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare Windows release
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          mkdir -p release/windows/files -ErrorAction SilentlyContinue
+          copy target/${{ matrix.target }}/release/rustsp.exe release/windows/files/rustsp.exe
+          copy target/${{ matrix.target }}/release/cargo-rustsp.exe release/windows/files/cargo-rustsp.exe
+
+      - name: Prepare Linux release
+        if: matrix.platform == 'linux'
+        run: |
+          mkdir -p release/linux/files
+          cp target/${{ matrix.target }}/release/rustsp release/linux/files/rustsp
+          cp target/${{ matrix.target }}/release/cargo-rustsp release/linux/files/cargo-rustsp
+          chmod +x release/linux/files/rustsp
+          chmod +x release/linux/files/cargo-rustsp
+
+      - name: Build Windows installer
+        if: matrix.platform == 'windows'
+        run: |
+          choco install innosetup -y
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" release/windows/rustsp-setup.iss
+
+      - name: Create Linux tarball
+        if: matrix.platform == 'linux'
+        run: |
+          cd release/linux
+          tar -czf rustsp-linux-x86_64.tar.gz files/
+          mv rustsp-linux-x86_64.tar.gz ../../
+
+      - name: Move artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            find release/windows -name "*.exe" -type f | xargs -I {} cp {} artifacts/ 2>/dev/null || true
+          else
+            cp rustsp-linux-x86_64.tar.gz artifacts/ 2>/dev/null || true
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}-artifacts
+          path: artifacts/
+
+  create-release:
+    needs: build-and-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Read changelog
+        id: changelog
+        run: |
+          if [ -f docs/changelog ]; then
+            CHANGELOG=$(cat docs/changelog)
+            CHANGELOG="${CHANGELOG//'%'/'%25'}"
+            CHANGELOG="${CHANGELOG//$'\n'/'%0A'}"
+            CHANGELOG="${CHANGELOG//$'\r'/'%0D'}"
+            echo "content=$CHANGELOG" >> $GITHUB_OUTPUT
+          else
+            echo "content=Release v${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release-artifacts/**/*
+          body: ${{ steps.changelog.outputs.content }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
