@@ -841,8 +841,81 @@ pub fn should_be_tail_return(
     {
         return false;
     }
+
+    // CRITICAL: Assignments (including array/field assignments) must NOT be treated
+    // as tail returns. Otherwise `arr[i] = x` becomes a tail expression and can
+    // silently change control flow or trigger type errors for non-() return types.
+    if has_standalone_assignment_eq(trimmed) {
+        return false;
+    }
     
     true
+}
+
+/// Detect a standalone assignment `=` at top level (not comparison or compound op).
+fn has_standalone_assignment_eq(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
+    let mut in_string = false;
+    let mut prev_char = ' ';
+
+    for i in 0..len {
+        let c = chars[i];
+
+        if c == '"' && prev_char != '\\' {
+            in_string = !in_string;
+            prev_char = c;
+            continue;
+        }
+
+        if in_string {
+            prev_char = c;
+            continue;
+        }
+
+        match c {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ => {}
+        }
+
+        if c == '=' && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 {
+            let prev = if i > 0 { chars[i - 1] } else { ' ' };
+            let next = if i + 1 < len { chars[i + 1] } else { ' ' };
+
+            if next == '=' || next == '>' {
+                prev_char = c;
+                continue;
+            }
+            if prev == '!' || prev == '<' || prev == '>'
+                || prev == '+' || prev == '-' || prev == '*' || prev == '/' || prev == '%'
+                || prev == '&' || prev == '|' || prev == '^'
+            {
+                prev_char = c;
+                continue;
+            }
+            if i >= 2 {
+                let prev_prev = chars[i - 2];
+                if (prev == '<' && prev_prev == '<') || (prev == '>' && prev_prev == '>') {
+                    prev_char = c;
+                    continue;
+                }
+            }
+
+            return true;
+        }
+
+        prev_char = c;
+    }
+
+    false
 }
 
 // ============================================================================
@@ -1612,6 +1685,8 @@ mod tests {
         assert!(should_be_tail_return("a + b", &ctx, true));
         assert!(!should_be_tail_return("println!(\"hi\")", &ctx, true));
         assert!(!should_be_tail_return("a + b;", &ctx, true));
+        assert!(!should_be_tail_return("arr[i] = 1", &ctx, true));
+        assert!(!should_be_tail_return("self.field = value", &ctx, true));
     }
     
     //=========================================================================
