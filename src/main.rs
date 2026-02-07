@@ -181,7 +181,8 @@ fn detect_io_pattern(line: &str) -> bool {
     let patterns = [
         "println!", "print!", "eprintln!", "eprint!",
         "std::io", "File::", "stdin()", "stdout()", "stderr()",
-        ".read(", ".write(", ".flush(",
+        ".read_exact(", ".read_to_string(", ".read_to_end(",
+        ".write_all(", ".flush(",
         "fs::read", "fs::write", "fs::create", "fs::open",
     ];
     patterns.iter().any(|p| line.contains(p))
