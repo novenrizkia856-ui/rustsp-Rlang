@@ -894,7 +894,7 @@ fn has_standalone_assignment_eq(s: &str) -> bool {
                 prev_char = c;
                 continue;
             }
-            if prev == '!' || prev == '<' || prev == '>'
+            if prev == '=' || prev == '!' || prev == '<' || prev == '>'
                 || prev == '+' || prev == '-' || prev == '*' || prev == '/' || prev == '%'
                 || prev == '&' || prev == '|' || prev == '^'
             {
@@ -1683,6 +1683,7 @@ mod tests {
         ctx.return_type = Some("String".to_string());
         
         assert!(should_be_tail_return("a + b", &ctx, true));
+        assert!(should_be_tail_return("a == b", &ctx, true));
         assert!(!should_be_tail_return("println!(\"hi\")", &ctx, true));
         assert!(!should_be_tail_return("a + b;", &ctx, true));
         assert!(!should_be_tail_return("arr[i] = 1", &ctx, true));
