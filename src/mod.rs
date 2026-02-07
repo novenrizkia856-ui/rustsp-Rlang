@@ -367,8 +367,8 @@ fn detect_io_pattern(line: &str) -> bool {
         
         // File I/O
         "std::io", "File::", "OpenOptions::",
-        ".read(", ".read_exact(", ".read_to_string(", ".read_to_end(",
-        ".write(", ".write_all(", ".flush(",
+        ".read_exact(", ".read_to_string(", ".read_to_end(",
+        ".write_all(", ".flush(",
         "fs::read", "fs::write", "fs::create", "fs::open",
         "fs::remove", "fs::rename", "fs::copy",
         "fs::create_dir", "fs::remove_dir", "fs::read_dir",
