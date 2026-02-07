@@ -109,12 +109,24 @@ pub fn parse_var_type_annotation(var_part: &str) -> (&str, String) {
         
         let vtype_valid = !vtype.is_empty() && (
             vtype.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+            || vtype.contains("::")
             || vtype.starts_with("Vec[") || vtype.starts_with("Vec<")
             || vtype.starts_with("Option[") || vtype.starts_with("Option<")
             || vtype.starts_with("Result[") || vtype.starts_with("Result<")
             || vtype.starts_with("HashMap[") || vtype.starts_with("HashMap<")
             || vtype.starts_with("HashSet[") || vtype.starts_with("HashSet<")
+            || vtype.starts_with("BTreeMap[") || vtype.starts_with("BTreeMap<")
+            || vtype.starts_with("BTreeSet[") || vtype.starts_with("BTreeSet<")
+            || vtype.starts_with("Box[") || vtype.starts_with("Box<")
+            || vtype.starts_with("Arc[") || vtype.starts_with("Arc<")
+            || vtype.starts_with("Rc[") || vtype.starts_with("Rc<")
             || vtype.starts_with('&')
+            || vtype.starts_with('(')
+            || vtype.starts_with('[')
+            || vtype == "i8" || vtype == "i16" || vtype == "i32" || vtype == "i64" || vtype == "i128"
+            || vtype == "u8" || vtype == "u16" || vtype == "u32" || vtype == "u64" || vtype == "u128"
+            || vtype == "f32" || vtype == "f64"
+            || vtype == "bool" || vtype == "char" || vtype == "usize" || vtype == "isize"
         );
         
         if vname_valid && vtype_valid {
@@ -192,5 +204,12 @@ mod tests {
         let (name, ann) = parse_var_type_annotation("x");
         assert_eq!(name, "x");
         assert_eq!(ann, "");
+    }
+
+    #[test]
+    fn test_parse_var_type_annotation_with_primitive() {
+        let (name, ann) = parse_var_type_annotation("count i32");
+        assert_eq!(name, "count");
+        assert_eq!(ann, ": i32");
     }
 }
