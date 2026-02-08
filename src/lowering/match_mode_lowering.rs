@@ -140,15 +140,19 @@ fn process_match_close(
     brace_depth: usize,
     match_mode: &mut MatchModeStack,
 ) -> Option<String> {
-    // Check if exiting arm body
-    if match_mode.should_exit_arm(brace_depth) {
+    // CRITICAL FIX: Check exit conditions BEFORE modifying state
+    let should_exit_arm = match_mode.should_exit_arm(brace_depth);
+    let should_exit_match = match_mode.should_exit_match(brace_depth);
+    
+    // Priority 1: Exit arm body (depth < arm_body_depth)
+    if should_exit_arm {
         let uses_parens = match_mode.arm_uses_parens();
         match_mode.exit_arm_body();
         return Some(transform_arm_close_with_parens(clean_line, uses_parens));
     }
     
-    // Check if exiting match entirely
-    if match_mode.should_exit_match(brace_depth) {
+    // Priority 2: Exit match entirely (!in_arm_body && depth <= match_depth)
+    if should_exit_match {
         let needs_semi = match_mode.current_is_assignment();
         match_mode.exit_match();
         let suffix = if needs_semi { ";" } else { "" };
