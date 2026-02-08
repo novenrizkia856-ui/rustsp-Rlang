@@ -29,6 +29,12 @@ pub fn transform_literal_field_with_ctx(line: &str, ctx: Option<&CurrentFunction
         return line.to_string();
     }
     
+    // CRITICAL FIX: Handle array closing bracket inside struct literal
+    // `]` or `],` inside a struct literal needs trailing comma for valid Rust
+    if trimmed == "]" || trimmed == "]," {
+        return format!("{}],", leading_ws);
+    }
+    
     // CRITICAL FIX: Check for `field: value` syntax PROPERLY
     // The old code used `trimmed.contains(':')` which matched `:` inside URLs like "http://..."
     // New logic: Check if there's a `:` BEFORE any `=` and OUTSIDE string literals
@@ -92,7 +98,13 @@ pub fn transform_literal_field_with_ctx(line: &str, ctx: Option<&CurrentFunction
                 transformed_value = format!("{}.clone()", transformed_value);
             }
             
-            return format!("{}{}: {},", leading_ws, field, transformed_value);
+            // CRITICAL FIX: Don't add trailing comma when value ends with `[`
+            // This means it's a multi-line array start: `public_key = [`
+            // The comma would produce invalid `public_key: [,`
+            let tv = transformed_value.trim_end();
+            let is_multiline_start = tv.ends_with('[') || tv.ends_with("vec![") || tv.ends_with("Vec::from([");
+            let suffix = if is_multiline_start { "" } else { "," };
+            return format!("{}{}: {}{}", leading_ws, field, transformed_value, suffix);
         }
     }
     
@@ -540,6 +552,35 @@ mod tests {
         assert_eq!(
             transform_literal_field("    endpoint: \"http://localhost:8080\""),
             "    endpoint: \"http://localhost:8080\","
+        );
+    }
+    
+    // =========================================================================
+    // CRITICAL BUG FIX: Array literal inside struct literal
+    // =========================================================================
+    
+    /// CRITICAL: When a struct field value is `[` (multi-line array start),
+    /// the trailing comma must NOT be added, otherwise we get `field: [,`
+    /// which is invalid Rust syntax.
+    #[test]
+    fn test_array_literal_start_in_struct_field() {
+        // Multi-line array start - NO comma after [
+        assert_eq!(
+            transform_literal_field("    public_key = ["),
+            "    public_key: ["
+        );
+    }
+    
+    /// CRITICAL: `]` inside struct literal should get trailing comma
+    #[test]
+    fn test_array_literal_close_in_struct_field() {
+        assert_eq!(
+            transform_literal_field("    ]"),
+            "    ],"
+        );
+        assert_eq!(
+            transform_literal_field("    ],"),
+            "    ],"
         );
     }
 }

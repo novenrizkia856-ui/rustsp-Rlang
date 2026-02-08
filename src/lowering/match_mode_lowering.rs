@@ -28,6 +28,111 @@ pub enum MatchModeResult {
     NotHandled,
 }
 
+/// Look-ahead: Check if a match arm starts a multi-line struct destructuring pattern.
+///
+/// Detects patterns like:
+/// ```text
+/// DAEvent::NodeRegistered {
+///     version,
+///     timestamp_ms,
+///     node_id,
+/// } {
+///     // arm body
+/// }
+/// ```
+///
+/// Returns true if the `{` on the current line opens a destructuring pattern
+/// (not the arm body), and a later `} {` line closes it and opens the body.
+fn is_multiline_destructure_start(lines: &[&str], current_line: usize) -> bool {
+    let first_trimmed = lines[current_line].trim();
+    
+    // Must end with `{`
+    if !first_trimmed.ends_with('{') {
+        return false;
+    }
+    
+    // Count braces on this line - must be exactly 1 unmatched `{`
+    let mut depth: i32 = 0;
+    for c in first_trimmed.chars() {
+        if c == '{' { depth += 1; }
+        if c == '}' { depth -= 1; }
+    }
+    if depth != 1 {
+        return false;
+    }
+    
+    // Look ahead for `} {` pattern that closes destructuring and opens body.
+    // We track running brace depth starting from 1 (the unmatched `{` above).
+    let mut running_depth = depth;
+    let limit = lines.len().min(current_line + 50);
+    
+    for i in (current_line + 1)..limit {
+        let t = lines[i].trim();
+        
+        // Count braces on this line
+        let mut line_opens = 0i32;
+        let mut line_closes = 0i32;
+        for c in t.chars() {
+            if c == '{' { line_opens += 1; }
+            if c == '}' { line_closes += 1; }
+        }
+        
+        running_depth = running_depth - line_closes + line_opens;
+        
+        // `} {` pattern: the line has both `}` and ends with `{`,
+        // and after processing, depth is back to 1 (one new `{` opened).
+        // The `}` must come before the `{` on the line.
+        if running_depth == 1 && line_closes > 0 && t.ends_with('{') {
+            if let (Some(close_pos), Some(open_pos)) = (t.find('}'), t.rfind('{')) {
+                if close_pos < open_pos {
+                    return true; // Found `} {` → multi-line destructuring confirmed
+                }
+            }
+        }
+        
+        // If depth dropped to 0 or below without finding `} {`, not a destructuring
+        if running_depth <= 0 {
+            return false;
+        }
+    }
+    
+    false
+}
+
+/// Process a line while inside multi-line destructuring pattern.
+///
+/// In destructuring mode, field lines are passed through as-is.
+/// When `} {` is encountered, it's transformed to `} => {` and arm body begins.
+fn process_destructuring_line(
+    trimmed: &str,
+    leading_ws: &str,
+    brace_depth: usize,
+    match_mode: &mut MatchModeStack,
+) -> Option<MatchModeResult> {
+    if !match_mode.in_destructuring() {
+        return None;
+    }
+    
+    // Check if this line is `} {` (close destructure, open body)
+    if trimmed.ends_with('{') && trimmed.contains('}') {
+        if let (Some(close_pos), Some(open_pos)) = (trimmed.find('}'), trimmed.rfind('{')) {
+            if close_pos < open_pos {
+                // Extract the pattern part before `{` (the closing `}` and anything before it)
+                let pattern_part = trimmed[..open_pos].trim();
+                match_mode.exit_destructuring();
+                match_mode.enter_arm_body(brace_depth, false);
+                return Some(MatchModeResult::Handled(
+                    format!("{}{} => {{", leading_ws, pattern_part)
+                ));
+            }
+        }
+    }
+    
+    // Regular destructuring field line - pass through as-is
+    // These are lines like `version,`, `timestamp_ms,`, etc.
+    Some(MatchModeResult::Handled(format!("{}{}", leading_ws, trimmed)))
+}
+
 /// Process match closing brace
 fn process_match_close(
     clean_line: &str,
@@ -120,7 +225,16 @@ fn process_regular_arm_pattern(
         return Some(transform_single_line_arm(clean_line, ret_type));
     }
     
-    // Multi-line arm pattern
+    // CRITICAL FIX: Detect multi-line struct destructuring pattern
+    // e.g., `DAEvent::NodeRegistered {` where `{` opens destructuring, not body
+    // Look ahead to see if a `} {` line closes destructuring and opens body
+    if is_multiline_destructure_start(lines, line_num) {
+        match_mode.enter_destructuring();
+        // Pass through the line as-is (the `{` is part of the pattern, not body)
+        return Some(format!("{}{}", leading_ws, trimmed));
+    }
+    
+    // Multi-line arm pattern (regular - `{` opens body)
     let arm_has_if_expr = detect_arm_has_if_expr(lines, line_num, prev_depth + opens);
     
     let output = if arm_has_if_expr {
@@ -155,6 +269,12 @@ pub fn process_match_mode_line(
         if let Some(result) = process_match_close(clean_line, leading_ws, brace_depth, match_mode) {
             return MatchModeResult::Handled(result);
         }
+    }
+    
+    // CRITICAL FIX: Handle multi-line struct destructuring pattern
+    // When inside destructuring, process field lines and detect `} {` to enter body
+    if let Some(result) = process_destructuring_line(trimmed, leading_ws, brace_depth, match_mode) {
+        return result;
     }
     
     // Handle multi-pattern continuation lines (starting with |)
@@ -192,5 +312,69 @@ mod tests {
         assert!(is_multi_pattern_continuation("| Pattern2 { x }"));
         assert!(is_multi_pattern_continuation("| Pattern3 { x } { body }"));
         assert!(!is_multi_pattern_continuation("Pattern1 { x }"));
+    }
+    
+    #[test]
+    fn test_multiline_destructure_detection() {
+        // Multi-line destructuring: `Pattern {\n field,\n } {`
+        let lines = vec![
+            "    match da_event {",
+            "    DAEvent::NodeRegistered {",
+            "        version,",
+            "        timestamp_ms,",
+            "        node_id,",
+            "    } {",
+            "        assert_eq!(version, 1);",
+            "    }",
+            "    }",
+        ];
+        
+        // Line 1 is `DAEvent::NodeRegistered {` → should detect as destructuring start
+        assert!(is_multiline_destructure_start(&lines, 1));
+        
+        // Line 0 is `match da_event {` → NOT a destructuring start
+        assert!(!is_multiline_destructure_start(&lines, 0));
+    }
+    
+    #[test]
+    fn test_non_destructure_arm() {
+        // Regular arm: `Pattern {` where `{` opens body (no `} {` later)
+        let lines = vec![
+            "    match x {",
+            "    Some(v) {",
+            "        do_something(v);",
+            "    }",
+            "    }",
+        ];
+        
+        // Line 1 is `Some(v) {` → NOT a destructuring (body lines don't have `} {`)
+        assert!(!is_multiline_destructure_start(&lines, 1));
+    }
+    
+    #[test]
+    fn test_destructuring_processing() {
+        let mut match_mode = MatchModeStack::new();
+        match_mode.enter_match(1, false);
+        match_mode.enter_destructuring();
+        
+        // Regular field line → pass through
+        let result = process_destructuring_line("version,", "        ", 2, &mut match_mode);
+        assert!(result.is_some());
+        match result.unwrap() {
+            MatchModeResult::Handled(s) => assert!(s.contains("version,")),
+            _ => panic!("Expected Handled"),
+        }
+        
+        // `} {` line → transform to `} => {` and enter arm body
+        let result = process_destructuring_line("} {", "    ", 2, &mut match_mode);
+        assert!(result.is_some());
+        match result.unwrap() {
+            MatchModeResult::Handled(s) => {
+                assert!(s.contains("} => {"), "Expected '}} => {{' but got: {}", s);
+            }
+            _ => panic!("Expected Handled"),
+        }
+        assert!(match_mode.in_arm_body());
+        assert!(!match_mode.in_destructuring());
     }
 }

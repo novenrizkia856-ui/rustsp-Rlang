@@ -83,6 +83,9 @@ struct MatchModeEntry {
     arm_uses_parens: bool,
     /// Are we in a multi-pattern sequence (after seeing first pattern, before body)?
     in_multi_pattern: bool,
+    /// Are we inside a multi-line struct destructuring pattern?
+    /// e.g., `DAEvent::NodeRegistered {\n  version,\n  ...\n} {`
+    in_destructuring: bool,
 }
 
 impl MatchModeStack {
@@ -99,6 +102,7 @@ impl MatchModeStack {
             is_assignment,
             arm_uses_parens: false,
             in_multi_pattern: false,
+            in_destructuring: false,
         });
     }
     
@@ -146,6 +150,38 @@ impl MatchModeStack {
     pub fn exit_multi_pattern(&mut self) {
         if let Some(entry) = self.stack.last_mut() {
             entry.in_multi_pattern = false;
+        }
+    }
+    
+    /// Enter multi-line destructuring mode
+    /// This is when an arm pattern has multi-line struct destructuring:
+    /// ```text
+    /// DAEvent::NodeRegistered {
+    ///     version,
+    ///     timestamp_ms,
+    /// } {
+    ///     // body
+    /// }
+    /// ```
+    pub fn enter_destructuring(&mut self) {
+        if let Some(entry) = self.stack.last_mut() {
+            entry.in_destructuring = true;
+        }
+    }
+    
+    /// Check if we're inside a multi-line destructuring pattern
+    pub fn in_destructuring(&self) -> bool {
+        if let Some(entry) = self.stack.last() {
+            entry.in_destructuring
+        } else {
+            false
+        }
+    }
+    
+    /// Exit multi-line destructuring mode
+    pub fn exit_destructuring(&mut self) {
+        if let Some(entry) = self.stack.last_mut() {
+            entry.in_destructuring = false;
         }
     }
     
@@ -556,6 +592,12 @@ pub fn is_match_arm_pattern(line: &str) -> bool {
     
     // Must have something before `{`
     if before_brace.is_empty() {
+        return false;
+    }
+    
+    // CRITICAL FIX: `} {` is NOT an arm pattern - it's a destructuring close + body open
+    // This can happen when multi-line destructuring falls through without proper handling
+    if before_brace == "}" || (before_brace.ends_with('}') && !before_brace.contains('{')) {
         return false;
     }
     
@@ -1305,6 +1347,10 @@ mod tests {
         // Invalid - bare brace
         assert!(!is_match_arm_pattern("    {"));
         assert!(!is_match_arm_pattern("{"));
+        
+        // Invalid - destructuring close + body open
+        assert!(!is_match_arm_pattern("    } {"));
+        assert!(!is_match_arm_pattern("} {"));
     }
     
     #[test]
