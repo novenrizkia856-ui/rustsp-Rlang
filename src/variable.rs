@@ -114,6 +114,15 @@ impl VariableTracker {
     }
 
     pub fn track_assignment(&mut self, line_num: usize, var_name: &str, var_type: Option<String>, value: &str, is_rust_native: bool) {
+        // CRITICAL FIX: '_' is a wildcard/discard pattern in Rust.
+        // It must NEVER be tracked as a variable because:
+        // 1. It should never trigger shadowing detection (RSPL081)
+        // 2. It should always generate `let _ = expr;` (discard)
+        // 3. Multiple `_ = expr` in different scopes are independent
+        if var_name == "_" {
+            return;
+        }
+
         let (is_borrow, is_borrow_mut, _clean_value) = Self::detect_borrow(value);
         
         let assignment = Assignment {
@@ -175,6 +184,11 @@ impl VariableTracker {
     }
 
     pub fn needs_mut(&self, var_name: &str, line_num: usize) -> bool {
+        // CRITICAL FIX: '_' is a discard pattern, never needs mut
+        if var_name == "_" {
+            return false;
+        }
+
         // Check if variable is borrowed as &mut anywhere
         if self.mut_borrowed_vars.contains(var_name) {
             return true;
@@ -305,6 +319,12 @@ impl VariableTracker {
     }
 
     pub fn is_first_assignment(&self, var_name: &str, line_num: usize) -> bool {
+        // CRITICAL FIX: '_' is always a "first assignment" (discard pattern)
+        // Every `_ = expr` should generate `let _ = expr;`
+        if var_name == "_" {
+            return true;
+        }
+
         for assignment in &self.assignments {
             if assignment.var_name == var_name {
                 return assignment.line_num == line_num;
@@ -316,6 +336,11 @@ impl VariableTracker {
     }
 
     pub fn is_shadowing(&self, var_name: &str, line_num: usize) -> bool {
+        // CRITICAL FIX: '_' is a discard pattern, never shadowing
+        if var_name == "_" {
+            return false;
+        }
+
         // Get the FIRST known type for this variable (from first assignment)
         let mut first_known_type: Option<String> = None;
         let mut current_type: Option<String> = None;

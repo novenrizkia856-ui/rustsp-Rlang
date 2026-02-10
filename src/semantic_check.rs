@@ -148,8 +148,12 @@ impl SemanticChecker {
         }
         
         // Track brace depth changes
-        let opens = trimmed.matches('{').count();
-        let closes = trimmed.matches('}').count();
+        // CRITICAL FIX: Count braces OUTSIDE strings and comments only!
+        // The old code used trimmed.matches('{').count() which included braces
+        // inside string literals like format!("Error: {}", e) and inline
+        // comments like // storage/{contract_id}, causing scope depth
+        // misalignment and false RSPL081 shadowing errors.
+        let (opens, closes) = count_braces_outside_strings(trimmed);
         
         // Check for function definition
         if self.is_function_start(trimmed) {
@@ -413,6 +417,14 @@ impl SemanticChecker {
                 return;
             }
             
+            // CRITICAL FIX: Never flag `_` as shadowing.
+            // `_` is a wildcard/discard pattern in Rust, not a real variable.
+            // Multiple `_ = expr` in different scopes are independent.
+            // Tracking `_` caused false RSPL081 errors.
+            if var_name == "_" {
+                return;
+            }
+            
             // Check for shadowing without outer (RULE 3)
             if !is_outer && self.is_defined_in_outer_scope(var_name) && self.in_function {
                 // Check if we're in a deeper scope
@@ -640,6 +652,73 @@ impl SemanticChecker {
     pub fn errors(&self) -> &[RsplError] {
         &self.errors
     }
+}
+
+//=============================================================================
+// BRACE COUNTING (outside strings/comments)
+//=============================================================================
+
+/// Count braces outside of string literals and comments.
+/// Returns (opens, closes) - the count of `{` and `}` respectively.
+///
+/// CRITICAL: The old code used `trimmed.matches('{').count()` which counted
+/// braces inside format strings like `format!("{}", x)` and comments like
+/// `// storage/{id}`. This caused scope depth misalignment, leading to
+/// false RSPL081 shadowing errors across function boundaries.
+fn count_braces_outside_strings(line: &str) -> (usize, usize) {
+    let mut opens = 0usize;
+    let mut closes = 0usize;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut prev = ' ';
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len();
+
+    let mut i = 0;
+    while i < len {
+        let c = chars[i];
+
+        // Detect inline comment `//` outside of strings
+        if !in_string && !in_char && c == '/' && i + 1 < len && chars[i + 1] == '/' {
+            break; // Rest of line is comment, stop counting
+        }
+
+        // Handle string literals
+        if c == '"' && prev != '\\' && !in_char {
+            in_string = !in_string;
+            prev = c;
+            i += 1;
+            continue;
+        }
+
+        // Handle char literals
+        if c == '\'' && !in_string {
+            // Simple heuristic: skip 'x' or '\x' patterns
+            if i + 2 < len && chars[i + 2] == '\'' {
+                prev = '\'';
+                i += 3; // Skip entire char literal
+                continue;
+            } else if i + 3 < len && chars[i + 1] == '\\' && chars[i + 3] == '\'' {
+                prev = '\'';
+                i += 4; // Skip escaped char literal like '\n'
+                continue;
+            }
+            // Not a char literal, just an apostrophe (lifetime, etc.)
+        }
+
+        if !in_string && !in_char {
+            match c {
+                '{' => opens += 1,
+                '}' => closes += 1,
+                _ => {}
+            }
+        }
+
+        prev = c;
+        i += 1;
+    }
+
+    (opens, closes)
 }
 
 //=============================================================================

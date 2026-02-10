@@ -630,8 +630,12 @@ impl ScopeAnalyzer {
                 && !trimmed.starts_with("pub enum ");
             
             // Count braces (moved up for function scope handling)
-            let opens = trimmed.matches('{').count();
-            let closes = trimmed.matches('}').count();
+            // CRITICAL FIX: Count braces OUTSIDE strings only!
+            // The old code used trimmed.matches('{').count() which counted braces
+            // inside string literals like format!("{}", e), causing scope depth
+            // misalignment across functions. Note: comments are already stripped
+            // by strip_comment() above, so we only need to handle strings here.
+            let (opens, closes) = count_braces_outside_strings(trimmed);
             
             // NEW: Extract function parameters
             // CRITICAL FIX: Push function scope BEFORE declaring parameters
@@ -719,6 +723,13 @@ impl ScopeAnalyzer {
             // Parse assignment AFTER handling leading closes
             if should_parse_assignment {
                 if let Some((var_name, var_type, value, is_outer)) = parse_assignment(trimmed) {
+                    // CRITICAL FIX: Skip `_` (wildcard/discard pattern).
+                    // `_` is not a real variable - tracking it causes false
+                    // shadowing detection and incorrect mut marking.
+                    if var_name == "_" {
+                        // Still mark as declaration so transpiler emits `let _ = expr;`
+                        self.decl_lines.insert(line_num, (var_name, false));
+                    } else {
                     let inferred = var_type.clone().or_else(|| infer_type(&value));
                     
                     // Use different analysis for outer vs regular assignment
@@ -752,6 +763,7 @@ impl ScopeAnalyzer {
                             eprintln!("// COMPILE ERROR at line {}: {}", line_num + 1, msg);
                         }
                     }
+                    } // end else (non-underscore)
                 }
             }
             
@@ -855,6 +867,40 @@ impl Default for ScopeAnalyzer {
 //=============================================================================
 // HELPER FUNCTIONS
 //=============================================================================
+
+/// Count braces outside of string literals.
+/// Returns (opens, closes) - the count of `{` and `}` respectively.
+///
+/// CRITICAL: `trimmed.matches('{').count()` counts braces inside format strings
+/// like `format!("{}", e)`, causing scope depth misalignment. Comments are
+/// already stripped by `strip_comment()` before this is called.
+fn count_braces_outside_strings(line: &str) -> (usize, usize) {
+    let mut opens = 0usize;
+    let mut closes = 0usize;
+    let mut in_string = false;
+    let mut prev = ' ';
+
+    for c in line.chars() {
+        // Handle string literals
+        if c == '"' && prev != '\\' {
+            in_string = !in_string;
+            prev = c;
+            continue;
+        }
+
+        if !in_string {
+            match c {
+                '{' => opens += 1,
+                '}' => closes += 1,
+                _ => {}
+            }
+        }
+
+        prev = c;
+    }
+
+    (opens, closes)
+}
 
 /// Strip inline comments
 fn strip_comment(line: &str) -> String {
