@@ -1,0 +1,7 @@
+fn get_tuple() -> Result<(u8, u8), String> {
+    Ok((1,2))
+}
+
+fn main() {
+    let (a, b) = get_tuple().expect("fail");
+}

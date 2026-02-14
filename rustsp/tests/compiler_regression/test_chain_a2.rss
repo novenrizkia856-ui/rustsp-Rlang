@@ -1,0 +1,12 @@
+fn foo() -> A { A{} }
+
+struct A {}
+
+impl A {
+    fn bar(self) -> Self { self }
+    fn baz(self) -> Self { self }
+}
+
+fn main() {
+    let x = foo().bar().baz();
+}

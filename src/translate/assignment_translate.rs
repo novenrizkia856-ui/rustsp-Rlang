@@ -21,11 +21,33 @@ use crate::scope::ScopeAnalyzer;
 use crate::variable::VariableTracker;
 use crate::function::{
     CurrentFunctionContext, FunctionRegistry,
-    transform_string_concat, transform_call_args,
+    transform_string_concat, transform_call_args_with_ctx,
 };
 use crate::control_flow::transform_enum_struct_init;
 use crate::clone_helpers::transform_array_access_clone;
 use crate::helpers::ends_with_continuation_operator;
+
+fn transform_slice_to_array_if_needed(value: &str, var_type: Option<&str>) -> String {
+    let Some(target_ty) = var_type.map(|t| t.trim()) else {
+        return value.to_string();
+    };
+
+    let expects_array = target_ty.starts_with("&[") || target_ty.starts_with('[');
+    if !expects_array {
+        return value.to_string();
+    }
+
+    let v = value.trim();
+    if !(v.contains('[') && v.contains(']') && v.contains("..")) {
+        return value.to_string();
+    }
+
+    if v.contains(".try_into()") {
+        return value.to_string();
+    }
+
+    format!("({}).try_into().expect(\"RustS+: slice length mismatch during array conversion\")", v)
+}
 
 /// Process a RustS+ assignment line
 pub fn process_assignment(
@@ -54,12 +76,13 @@ pub fn process_assignment(
     
     // Expand and transform value
     let mut expanded_value = expand_value(value, var_type);
+    expanded_value = transform_slice_to_array_if_needed(&expanded_value, var_type);
     expanded_value = transform_array_access_clone(&expanded_value);
     
     if current_fn_ctx.is_inside() {
         expanded_value = transform_string_concat(&expanded_value, current_fn_ctx);
     }
-    expanded_value = transform_call_args(&expanded_value, fn_registry);
+    expanded_value = transform_call_args_with_ctx(&expanded_value, fn_registry, Some(current_fn_ctx));
     expanded_value = transform_enum_struct_init(&expanded_value);
     
     let is_param = current_fn_ctx.params.contains_key(var_name);
@@ -176,7 +199,7 @@ pub fn handle_bare_mut_in_match(
     if current_fn_ctx.is_inside() {
         expanded_value = transform_string_concat(&expanded_value, current_fn_ctx);
     }
-    expanded_value = transform_call_args(&expanded_value, fn_registry);
+    expanded_value = transform_call_args_with_ctx(&expanded_value, fn_registry, Some(current_fn_ctx));
     
     Some(format!("{}let mut {}{} = {};", leading_ws, var_name, type_annotation, expanded_value))
 }

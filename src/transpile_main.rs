@@ -16,6 +16,7 @@ use crate::helpers::{strip_inline_comment, transform_generic_brackets};
 use crate::first_pass::run_first_pass;
 use crate::postprocess_output::apply_postprocessing;
 use crate::rust_sanity;
+use crate::type_resolution::TypeResolutionPass;
 
 // Import lowering modules
 use crate::lowering::depth_tracking_lowering::{
@@ -60,6 +61,11 @@ use crate::translate::assignment_translate::parse_var_type_annotation;
 
 /// Main entry point for RustS+ to Rust transpilation
 pub fn parse_rusts(source: &str) -> String {
+    // Pipeline order (enforced):
+    // 1) Parsing, 2) AST/HIR construction (in analysis modules),
+    // 3) Symbol table + function signature registration (first pass),
+    // 4) Type resolution pass (minimal call return resolver),
+    // 5) Semantic validation, 6) Lowering, 7) Emission/post-processing.
     // CRITICAL: Normalize custom hex literals FIRST
     let normalized_source = normalize_hex_literals(source);
     
@@ -75,6 +81,7 @@ pub fn parse_rusts(source: &str) -> String {
     let fn_registry = first_pass_result.fn_registry;
     let struct_registry = first_pass_result.struct_registry;
     let _enum_registry = first_pass_result.enum_registry;
+    let type_resolution = TypeResolutionPass::new(fn_registry.clone());
     
     // Scan all lines for mutating method calls
     for line in &lines {
@@ -385,6 +392,14 @@ pub fn parse_rusts(source: &str) -> String {
             continue;
         }
         
+        // Tuple destructuring (must run before native passthrough for `let (a, b) = ...`)
+        if let Some(output) = process_tuple_destructuring(
+            trimmed, &leading_ws, &current_fn_ctx, &fn_registry, &type_resolution,
+        ) {
+            output_lines.push(output);
+            continue;
+        }
+
         // Rust native passthrough
         if is_rust_native_line(trimmed) {
             let output = process_native_line(
@@ -401,14 +416,6 @@ pub fn parse_rusts(source: &str) -> String {
         ) {
             ArrayLiteralResult::Started(s) => { output_lines.push(s); continue; }
             ArrayLiteralResult::NotArrayLiteral => {}
-        }
-        
-        // Tuple destructuring
-        if let Some(output) = process_tuple_destructuring(
-            trimmed, &leading_ws, &current_fn_ctx, &fn_registry,
-        ) {
-            output_lines.push(output);
-            continue;
         }
         
         // RustS+ assignment

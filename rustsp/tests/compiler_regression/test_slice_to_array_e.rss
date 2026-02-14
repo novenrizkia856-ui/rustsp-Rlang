@@ -1,0 +1,4 @@
+fn main() {
+    let arr = [0u8; 64];
+    let secret: &[u8; 32] = arr[0..32];
+}

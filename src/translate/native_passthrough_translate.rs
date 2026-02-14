@@ -16,7 +16,7 @@
 //! - `where` clauses and trait bounds
 
 use crate::function::{
-    CurrentFunctionContext, transform_string_concat, transform_call_args, 
+    CurrentFunctionContext, transform_string_concat, transform_call_args_with_ctx, 
     should_be_tail_return, FunctionRegistry,
 };
 use crate::control_flow::transform_enum_struct_init;
@@ -76,6 +76,27 @@ pub fn is_rust_native_line(trimmed: &str) -> bool {
         || trimmed.starts_with("pub ")
 }
 
+
+fn transform_native_slice_to_array(line: &str) -> String {
+    let Some(eq_pos) = line.find('=') else { return line.to_string(); };
+    let left = line[..eq_pos].trim();
+    let right = line[eq_pos + 1..].trim().trim_end_matches(';');
+
+    if !(left.contains(':') && (left.contains("&[") || left.contains("[u8;"))) {
+        return line.to_string();
+    }
+
+    if !(right.contains('[') && right.contains("]") && right.contains("..")) {
+        return line.to_string();
+    }
+
+    if right.contains(".try_into()") {
+        return line.to_string();
+    }
+
+    format!("{} = ({}).try_into().expect(\"RustS+: slice length mismatch during array conversion\")", left, right)
+}
+
 /// Process a native Rust line with minimal transformation
 pub fn process_native_line(
     trimmed: &str,
@@ -89,9 +110,11 @@ pub fn process_native_line(
     // Apply function context transformations if inside function
     if current_fn_ctx.is_inside() {
         transformed = transform_string_concat(&transformed, current_fn_ctx);
-        transformed = transform_call_args(&transformed, fn_registry);
+        transformed = transform_call_args_with_ctx(&transformed, fn_registry, Some(current_fn_ctx));
     }
     
+    transformed = transform_native_slice_to_array(&transformed);
+
     // Transform enum struct init patterns
     transformed = transform_enum_struct_init(&transformed);
     

@@ -395,6 +395,14 @@ fn split_by_plus(expr: &str) -> Vec<String> {
 // ============================================================================
 
 pub fn transform_call_args(line: &str, registry: &FunctionRegistry) -> String {
+    transform_call_args_with_ctx(line, registry, None)
+}
+
+pub fn transform_call_args_with_ctx(
+    line: &str,
+    registry: &FunctionRegistry,
+    current_fn_ctx: Option<&CurrentFunctionContext>,
+) -> String {
     let line = line.trim();
     if !line.contains('(') {
         return line.to_string();
@@ -415,7 +423,7 @@ pub fn transform_call_args(line: &str, registry: &FunctionRegistry) -> String {
                 for (i, arg) in args.iter().enumerate() {
                     let arg = arg.trim();
                     if let Some(param) = sig.parameters.get(i) {
-                        new_args.push(coerce_argument(arg, &param.param_type));
+                        new_args.push(coerce_argument(arg, &param.param_type, current_fn_ctx));
                     } else {
                         new_args.push(arg.to_string());
                     }
@@ -515,7 +523,7 @@ fn split_call_args(s: &str) -> Vec<String> {
     result
 }
 
-fn coerce_argument(arg: &str, param_type: &str) -> String {
+fn coerce_argument(arg: &str, param_type: &str, current_fn_ctx: Option<&CurrentFunctionContext>) -> String {
     let arg = arg.trim();
     
     // CRITICAL FIX: Transform param_type first (e.g., [T] → &[T])
@@ -526,6 +534,17 @@ fn coerce_argument(arg: &str, param_type: &str) -> String {
     // L-10: Handle &[T] parameters - add & to array arguments
     // When param is &[T] and arg is a plain identifier (array variable), add &
     if param_type.starts_with("&[") {
+        // Borrow hygiene: if argument is already known as a reference type, pass directly.
+        if let Some(ctx) = current_fn_ctx {
+            if is_simple_identifier(arg) {
+                if let Some(arg_ty) = ctx.params.get(arg) {
+                    if arg_ty.trim_start().starts_with('&') {
+                        return arg.to_string();
+                    }
+                }
+            }
+        }
+
         // Check if arg is an array literal like [x, y, z]
         if arg.starts_with('[') && arg.ends_with(']') && !arg.starts_with("&[") {
             // Array literal needs & to convert to slice reference
@@ -1673,8 +1692,8 @@ mod tests {
     
     #[test]
     fn test_argument_coercion() {
-        assert_eq!(coerce_argument(r#""hello""#, "&String"), r#"&String::from("hello")"#);
-        assert_eq!(coerce_argument(r#"&"hello""#, "&String"), r#"&String::from("hello")"#);
+        assert_eq!(coerce_argument(r#""hello""#, "&String", None), r#"&String::from("hello")"#);
+        assert_eq!(coerce_argument(r#"&"hello""#, "&String", None), r#"&String::from("hello")"#);
     }
     
     #[test]

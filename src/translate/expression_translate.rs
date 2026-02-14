@@ -11,13 +11,14 @@
 use crate::variable::expand_value;
 use crate::function::{
     CurrentFunctionContext, FunctionRegistry,
-    transform_string_concat, transform_call_args, should_be_tail_return,
+    transform_string_concat, transform_call_args_with_ctx, should_be_tail_return,
 };
 use crate::control_flow::transform_enum_struct_init;
 use crate::clone_helpers::transform_array_access_clone;
 use crate::helpers::{ends_with_continuation_operator, needs_semicolon};
 use crate::transform_literal::is_string_literal;
 use crate::translate::assignment_translate::parse_var_type_annotation;
+use crate::type_resolution::{TypeResolutionPass, has_explicit_result_handling};
 
 /// Process a non-assignment expression
 pub fn process_non_assignment(
@@ -48,7 +49,7 @@ pub fn process_non_assignment(
             if current_fn_ctx.is_inside() {
                 expanded_value = transform_string_concat(&expanded_value, current_fn_ctx);
             }
-            expanded_value = transform_call_args(&expanded_value, fn_registry);
+            expanded_value = transform_call_args_with_ctx(&expanded_value, fn_registry, Some(current_fn_ctx));
             
             return format!("{}let mut {}{} = {};", leading_ws, var_name, type_annotation, expanded_value);
         }
@@ -58,7 +59,7 @@ pub fn process_non_assignment(
     if current_fn_ctx.is_inside() {
         transformed = transform_string_concat(&transformed, current_fn_ctx);
     }
-    transformed = transform_call_args(&transformed, fn_registry);
+    transformed = transform_call_args_with_ctx(&transformed, fn_registry, Some(current_fn_ctx));
     transformed = transform_enum_struct_init(&transformed);
     
     // Check if this is a return expression
@@ -104,25 +105,40 @@ pub fn process_tuple_destructuring(
     leading_ws: &str,
     current_fn_ctx: &CurrentFunctionContext,
     fn_registry: &FunctionRegistry,
+    type_resolution: &TypeResolutionPass,
 ) -> Option<String> {
-    if !trimmed.starts_with('(') || !trimmed.contains(')') || !trimmed.contains('=') {
+    let (expr, had_let_prefix) = if let Some(rest) = trimmed.strip_prefix("let ") {
+        (rest.trim_start(), true)
+    } else {
+        (trimmed, false)
+    };
+
+    if !expr.starts_with('(') || !expr.contains(')') || !expr.contains('=') {
         return None;
     }
     
     // Find the closing paren and check if = follows
-    let paren_close = trimmed.find(')')?;
-    let after_paren = trimmed[paren_close + 1..].trim();
+    let paren_close = expr.find(')')?;
+    let after_paren = expr[paren_close + 1..].trim();
     
     if !after_paren.starts_with('=') || after_paren.starts_with("==") || after_paren.starts_with("=>") {
         return None;
     }
     
-    let tuple_part = &trimmed[..=paren_close];
+    let tuple_part = &expr[..=paren_close];
     let value_part = after_paren[1..].trim().trim_end_matches(';');
     
     // Verify it's a valid tuple pattern
     if !crate::helpers::is_tuple_pattern(tuple_part) {
         return None;
+    }
+
+    // Type-aware Result tuple destructuring check
+    if type_resolution.return_type_is_result(value_part) && !has_explicit_result_handling(value_part) {
+        return Some(format!(
+            "{}compile_error!(\"RustS+ semantic error: tuple destructuring from Result requires .expect(...), .unwrap(...), or ?\");",
+            leading_ws
+        ));
     }
     
     // Transform value
@@ -131,9 +147,13 @@ pub fn process_tuple_destructuring(
     if current_fn_ctx.is_inside() {
         expanded_value = transform_string_concat(&expanded_value, current_fn_ctx);
     }
-    expanded_value = transform_call_args(&expanded_value, fn_registry);
+    expanded_value = transform_call_args_with_ctx(&expanded_value, fn_registry, Some(current_fn_ctx));
     
-    Some(format!("{}let {} = {};", leading_ws, tuple_part, expanded_value))
+    if had_let_prefix {
+        Some(format!("{}let {} = {};", leading_ws, tuple_part, expanded_value))
+    } else {
+        Some(format!("{}let {} = {};", leading_ws, tuple_part, expanded_value))
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +170,7 @@ mod tests {
             "    ",
             &fn_ctx,
             &fn_registry,
+            &TypeResolutionPass::new(fn_registry.clone()),
         );
         
         assert!(result.is_some());
@@ -169,6 +190,7 @@ mod tests {
             "",
             &fn_ctx,
             &fn_registry,
+            &TypeResolutionPass::new(fn_registry.clone()),
         ).is_none());
         
         // Arrow, not assignment
@@ -177,6 +199,7 @@ mod tests {
             "",
             &fn_ctx,
             &fn_registry,
+            &TypeResolutionPass::new(fn_registry.clone()),
         ).is_none());
     }
 }

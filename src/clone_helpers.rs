@@ -38,6 +38,11 @@ pub fn transform_array_access_clone(value: &str) -> String {
     if trimmed.contains(" as ") {
         return value.to_string();
     }
+
+    // Never clone slice-range expressions like arr[0..32]
+    if trimmed.contains("..") {
+        return value.to_string();
+    }
     
     // Skip complex expressions
     if trimmed.contains(" + ") || trimmed.contains(" - ") || 

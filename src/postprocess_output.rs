@@ -7,6 +7,20 @@ use crate::helpers::transform_generic_brackets;
 use crate::helpers::transform_macro_calls;
 use crate::postprocess::{fix_bare_mut_declaration, strip_effects_from_line, strip_outer_keyword};
 
+fn assert_lowering_guards(lines: &[String]) {
+    for line in lines {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(".expect(") {
+            panic!("Invalid method chain lowering");
+        }
+
+        if line.contains(".clone()") && line.contains("[") && line.contains("]") && line.contains("..") {
+            panic!("Invalid slice lowering: clone() emitted for slice expression");
+        }
+    }
+}
+
+
 /// Apply all post-processing transformations to the output lines
 pub fn apply_postprocessing(output_lines: Vec<String>) -> String {
     // L-08: Transform macro calls (println -> println!, etc.)
@@ -55,5 +69,7 @@ pub fn apply_postprocessing(output_lines: Vec<String>) -> String {
         .map(|line| transform_generic_brackets(&line))
         .collect();
     
+    assert_lowering_guards(&generic_transformed);
+
     generic_transformed.join("\n")
 }

@@ -29,6 +29,7 @@ pub mod hir;
 pub mod eir;
 pub mod parser;
 pub mod type_env;
+pub mod type_resolution;
 pub mod source_map;
 
 // ============================================================================
