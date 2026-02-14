@@ -106,6 +106,7 @@ pub fn process_tuple_destructuring(
     current_fn_ctx: &CurrentFunctionContext,
     fn_registry: &FunctionRegistry,
     type_resolution: &TypeResolutionPass,
+    next_line_is_method_chain: bool,
 ) -> Option<String> {
     let (expr, had_let_prefix) = if let Some(rest) = trimmed.strip_prefix("let ") {
         (rest.trim_start(), true)
@@ -134,7 +135,7 @@ pub fn process_tuple_destructuring(
     }
 
     // Type-aware Result tuple destructuring check
-    if type_resolution.return_type_is_result(value_part) && !has_explicit_result_handling(value_part) {
+    if type_resolution.return_type_is_result(value_part) && !has_explicit_result_handling(value_part) && !next_line_is_method_chain {
         return Some(format!(
             "{}compile_error!(\"RustS+ semantic error: tuple destructuring from Result requires .expect(...), .unwrap(...), or ?\");",
             leading_ws
@@ -149,10 +150,11 @@ pub fn process_tuple_destructuring(
     }
     expanded_value = transform_call_args_with_ctx(&expanded_value, fn_registry, Some(current_fn_ctx));
     
+    let semi = if next_line_is_method_chain { "" } else { ";" };
     if had_let_prefix {
-        Some(format!("{}let {} = {};", leading_ws, tuple_part, expanded_value))
+        Some(format!("{}let {} = {}{}", leading_ws, tuple_part, expanded_value, semi))
     } else {
-        Some(format!("{}let {} = {};", leading_ws, tuple_part, expanded_value))
+        Some(format!("{}let {} = {}{}", leading_ws, tuple_part, expanded_value, semi))
     }
 }
 
@@ -171,6 +173,7 @@ mod tests {
             &fn_ctx,
             &fn_registry,
             &TypeResolutionPass::new(fn_registry.clone()),
+            false,
         );
         
         assert!(result.is_some());
@@ -191,6 +194,7 @@ mod tests {
             &fn_ctx,
             &fn_registry,
             &TypeResolutionPass::new(fn_registry.clone()),
+            false,
         ).is_none());
         
         // Arrow, not assignment
@@ -200,6 +204,7 @@ mod tests {
             &fn_ctx,
             &fn_registry,
             &TypeResolutionPass::new(fn_registry.clone()),
+            false,
         ).is_none());
     }
 }

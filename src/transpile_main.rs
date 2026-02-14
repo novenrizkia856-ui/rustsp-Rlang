@@ -150,7 +150,7 @@ pub fn parse_rusts(source: &str) -> String {
                 MultilineFnResult::Continue => continue,
                 MultilineFnResult::Complete { output, has_body } => {
                     multiline_fn_acc = None;
-                    output_lines.push(output);
+                    emit_output_line(&mut output_lines, output);
                     if has_body {
                         in_function_body = true;
                         function_start_brace = brace_depth + 1;
@@ -184,7 +184,7 @@ pub fn parse_rusts(source: &str) -> String {
                     next_line_is_method_chain, next_line_closes_expr,
                     &mut prev_line_was_continuation,
                 );
-                output_lines.push(result);
+                emit_output_line(&mut output_lines, result);
                 continue;
             } else {
                 continue;
@@ -229,13 +229,13 @@ pub fn parse_rusts(source: &str) -> String {
         // Empty line
         if trimmed.is_empty() {
             prev_line_was_continuation = false;
-            output_lines.push(String::new());
+            emit_output_line(&mut output_lines, String::new());
             continue;
         }
         
         // Use import mode
         match process_use_import_line(trimmed, &clean_line, &leading_ws, brace_depth, &mut use_import_mode) {
-            UseImportResult::Handled(s) => { output_lines.push(s); continue; }
+            UseImportResult::Handled(s) => { emit_output_line(&mut output_lines, s); continue; }
             UseImportResult::NotHandled => {}
         }
         
@@ -244,7 +244,7 @@ pub fn parse_rusts(source: &str) -> String {
             trimmed, &clean_line, &leading_ws, bracket_depth, opens, closes, prev_depth,
             &mut array_mode, &mut literal_mode, &struct_registry,
         ) {
-            ArrayModeResult::Handled(s) => { output_lines.push(s); continue; }
+            ArrayModeResult::Handled(s) => { emit_output_line(&mut output_lines, s); continue; }
             ArrayModeResult::FallThroughToLiteral => {} // Continue to literal mode
             ArrayModeResult::NotHandled => {}
         }
@@ -254,7 +254,7 @@ pub fn parse_rusts(source: &str) -> String {
             trimmed, &clean_line, &leading_ws, brace_depth, opens, closes, prev_depth,
             &mut literal_mode, &array_mode, Some(&current_fn_ctx),
         ) {
-            LiteralModeResult::Handled(s) => { output_lines.push(s); continue; }
+            LiteralModeResult::Handled(s) => { emit_output_line(&mut output_lines, s); continue; }
             LiteralModeResult::NotHandled => {}
         }
         
@@ -264,7 +264,7 @@ pub fn parse_rusts(source: &str) -> String {
             brace_depth, prev_depth, opens, next_line_starts_with_pipe,
             &current_fn_ctx, &mut match_mode,
         ) {
-            MatchModeResult::Handled(s) => { output_lines.push(s); continue; }
+            MatchModeResult::Handled(s) => { emit_output_line(&mut output_lines, s); continue; }
             MatchModeResult::ProcessAsArmBody => {
                 // Process as match arm body (handled below in assignment/expression)
             }
@@ -277,7 +277,7 @@ pub fn parse_rusts(source: &str) -> String {
                 trimmed, &leading_ws, &lines, line_num,
                 &scope_analyzer, &tracker, &current_fn_ctx, &mut match_mode, prev_depth,
             );
-            output_lines.push(output);
+            emit_output_line(&mut output_lines, output);
             continue;
         }
         
@@ -288,7 +288,7 @@ pub fn parse_rusts(source: &str) -> String {
                 &scope_analyzer, &tracker, &current_fn_ctx, prev_depth,
                 &mut if_expr_assignment_depth,
             ) {
-                output_lines.push(output);
+                emit_output_line(&mut output_lines, output);
                 continue;
             }
         }
@@ -299,7 +299,7 @@ pub fn parse_rusts(source: &str) -> String {
             let next_is_else = crate::lowering::lookahead_lowering::check_next_is_else(&lines, line_num);
             if brace_depth <= start_depth && !next_is_else {
                 if_expr_assignment_depth = None;
-                output_lines.push(format!("{}}}); ", leading_ws));
+                emit_output_line(&mut output_lines, format!("{}}}); ", leading_ws));
                 continue;
             }
         }
@@ -310,7 +310,7 @@ pub fn parse_rusts(source: &str) -> String {
             &mut in_struct_def, &mut struct_def_depth,
         ) {
             StructDefResult::Started(s) | StructDefResult::Closed(s) | StructDefResult::Field(s) => {
-                output_lines.push(s);
+                emit_output_line(&mut output_lines, s);
                 continue;
             }
             StructDefResult::NotStructDef => {}
@@ -322,7 +322,7 @@ pub fn parse_rusts(source: &str) -> String {
         ) {
             EnumDefResult::Started(s) | EnumDefResult::ClosedStructVariant(s) 
             | EnumDefResult::ClosedEnum(s) | EnumDefResult::Variant(s) => {
-                output_lines.push(s);
+                emit_output_line(&mut output_lines, s);
                 continue;
             }
             EnumDefResult::NotEnumDef => {}
@@ -333,7 +333,7 @@ pub fn parse_rusts(source: &str) -> String {
             trimmed, &leading_ws, line_num, opens, prev_depth,
             &scope_analyzer, &tracker, &struct_registry, &mut literal_mode,
         ) {
-            LiteralStartResult::Handled(s) => { output_lines.push(s); continue; }
+            LiteralStartResult::Handled(s) => { emit_output_line(&mut output_lines, s); continue; }
             LiteralStartResult::NotLiteralStart => {}
         }
         
@@ -342,7 +342,7 @@ pub fn parse_rusts(source: &str) -> String {
             trimmed, &leading_ws, line_num, opens, prev_depth,
             &scope_analyzer, &tracker, &mut literal_mode,
         ) {
-            LiteralStartResult::Handled(s) => { output_lines.push(s); continue; }
+            LiteralStartResult::Handled(s) => { emit_output_line(&mut output_lines, s); continue; }
             LiteralStartResult::NotLiteralStart => {}
         }
         
@@ -351,7 +351,7 @@ pub fn parse_rusts(source: &str) -> String {
             trimmed, &leading_ws, opens, closes, prev_depth,
             &struct_registry, &mut literal_mode,
         ) {
-            LiteralStartResult::Handled(s) => { output_lines.push(s); continue; }
+            LiteralStartResult::Handled(s) => { emit_output_line(&mut output_lines, s); continue; }
             LiteralStartResult::NotLiteralStart => {}
         }
         
@@ -360,7 +360,7 @@ pub fn parse_rusts(source: &str) -> String {
             trimmed, &leading_ws, opens, closes, prev_depth,
             &struct_registry, &mut literal_mode,
         ) {
-            LiteralStartResult::Handled(s) => { output_lines.push(s); continue; }
+            LiteralStartResult::Handled(s) => { emit_output_line(&mut output_lines, s); continue; }
             LiteralStartResult::NotLiteralStart => {}
         }
         
@@ -368,7 +368,7 @@ pub fn parse_rusts(source: &str) -> String {
         match process_bare_enum_literal(
             trimmed, &leading_ws, opens, closes, prev_depth, &mut literal_mode,
         ) {
-            LiteralStartResult::Handled(s) => { output_lines.push(s); continue; }
+            LiteralStartResult::Handled(s) => { emit_output_line(&mut output_lines, s); continue; }
             LiteralStartResult::NotLiteralStart => {}
         }
         
@@ -377,13 +377,13 @@ pub fn parse_rusts(source: &str) -> String {
             trimmed, &clean_line, &leading_ws, &lines, line_num,
             &mut current_fn_ctx, function_start_brace,
         ) {
-            FunctionDefResult::Handled(s) => { output_lines.push(s); continue; }
+            FunctionDefResult::Handled(s) => { emit_output_line(&mut output_lines, s); continue; }
             FunctionDefResult::NotFunctionDef => {}
         }
         
         // Const/static declaration
         if let Some(transformed) = transform_const_or_static(trimmed) {
-            output_lines.push(format!("{}{}", leading_ws, transformed));
+            emit_output_line(&mut output_lines, format!("{}{}", leading_ws, transformed));
             continue;
         }
         
@@ -394,9 +394,9 @@ pub fn parse_rusts(source: &str) -> String {
         
         // Tuple destructuring (must run before native passthrough for `let (a, b) = ...`)
         if let Some(output) = process_tuple_destructuring(
-            trimmed, &leading_ws, &current_fn_ctx, &fn_registry, &type_resolution,
+            trimmed, &leading_ws, &current_fn_ctx, &fn_registry, &type_resolution, next_line_is_method_chain,
         ) {
-            output_lines.push(output);
+            emit_output_line(&mut output_lines, output);
             continue;
         }
 
@@ -405,7 +405,7 @@ pub fn parse_rusts(source: &str) -> String {
             let output = process_native_line(
                 trimmed, &leading_ws, &current_fn_ctx, &fn_registry, is_before_closing_brace,
             );
-            output_lines.push(output);
+            emit_output_line(&mut output_lines, output);
             continue;
         }
         
@@ -414,7 +414,7 @@ pub fn parse_rusts(source: &str) -> String {
             trimmed, &leading_ws, line_num, prev_bracket_depth, bracket_opens,
             &scope_analyzer, &tracker, &current_fn_ctx, &mut array_mode,
         ) {
-            ArrayLiteralResult::Started(s) => { output_lines.push(s); continue; }
+            ArrayLiteralResult::Started(s) => { emit_output_line(&mut output_lines, s); continue; }
             ArrayLiteralResult::NotArrayLiteral => {}
         }
         
@@ -427,7 +427,7 @@ pub fn parse_rusts(source: &str) -> String {
                 inside_multiline_expr, next_line_is_method_chain, next_line_closes_expr,
                 &mut prev_line_was_continuation,
             );
-            output_lines.push(result);
+            emit_output_line(&mut output_lines, result);
         } else {
             // Non-assignment
             let result = process_non_assignment(
@@ -435,7 +435,7 @@ pub fn parse_rusts(source: &str) -> String {
                 is_before_closing_brace, inside_multiline_expr, next_line_is_method_chain,
                 next_line_closes_expr, &mut prev_line_was_continuation,
             );
-            output_lines.push(result);
+            emit_output_line(&mut output_lines, result);
         }
     }
     
@@ -453,6 +453,27 @@ pub fn parse_rusts(source: &str) -> String {
     }
     
     result
+}
+
+
+fn emit_output_line(output_lines: &mut Vec<String>, line: String) {
+    if std::env::var("RUSTSP_EMIT_DEBUG").ok().as_deref() == Some("1") {
+        println!("EMIT: {}", line);
+    }
+
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('.') {
+        if let Some(prev) = output_lines.iter_mut().rev().find(|l| !l.trim().is_empty()) {
+            prev.push_str(trimmed);
+            if std::env::var("RUSTSP_EMIT_DEBUG").ok().as_deref() == Some("1") {
+                println!("EMIT: [merged chain] {}", prev);
+            }
+            return;
+        }
+        panic!("Emitter produced orphan method chain");
+    }
+
+    output_lines.push(line);
 }
 
 // Helper function for match start processing

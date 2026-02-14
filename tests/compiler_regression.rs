@@ -47,3 +47,12 @@ fn case_e_slice_to_array_uses_try_into_without_clone() {
     assert!(out.contains("try_into().expect(\"RustS+: slice length mismatch during array conversion\")"));
     assert!(!out.contains("[0..32].clone()"));
 }
+
+#[test]
+fn case_a_method_chain_multiline_merges() {
+    let src = "fn foo() -> Result<(u8, u8), String> {\n    Ok((1,2))\n}\n\nfn main() {\n    let (a, b) = foo()\n        .expect(\"fail\");\n}";
+    let out = parse_rusts(src);
+    assert!(out.contains("let (a, b) = foo().expect(\"fail\");"));
+    assert!(!out.contains("
+.expect("));
+}
