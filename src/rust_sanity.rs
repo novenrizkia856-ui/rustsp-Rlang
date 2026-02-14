@@ -363,8 +363,9 @@ fn check_unclosed_strings(code: &str) -> Vec<SanityError> {
 /// Check for patterns that indicate specific lowering bugs
 fn check_lowering_patterns(code: &str) -> Vec<SanityError> {
     let mut errors = Vec::new();
+    let lines: Vec<&str> = code.lines().collect();
     
-    for (line_num, line) in code.lines().enumerate() {
+    for (line_num, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         
         // Pattern: `=> {}` without proper arm body (L-02 violation)
@@ -393,6 +394,33 @@ fn check_lowering_patterns(code: &str) -> Vec<SanityError> {
                 message: "Malformed expression close: '}); }'".to_string(),
                 kind: SanityErrorKind::InternalLoweringError,
             });
+        }
+
+        // Hard safety assertion: method-chain fragment cannot start with `.expect(`
+        // unless previous significant line is an expression continuation.
+        if trimmed.starts_with(".expect(") {
+            let prev_significant = lines[..line_num]
+                .iter()
+                .rev()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty() && !l.starts_with("//"));
+
+            let has_valid_receiver = prev_significant
+                .map(|prev| {
+                    !prev.ends_with(';')
+                        && !prev.ends_with('{')
+                        && !prev.ends_with('}')
+                })
+                .unwrap_or(false);
+
+            if !has_valid_receiver {
+                errors.push(SanityError {
+                    line: line_num + 1,
+                    column: 1,
+                    message: "Invalid method chain lowering".to_string(),
+                    kind: SanityErrorKind::InternalLoweringError,
+                });
+            }
         }
     }
     

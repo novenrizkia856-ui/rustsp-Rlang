@@ -531,14 +531,9 @@ fn coerce_argument(arg: &str, param_type: &str) -> String {
             // Array literal needs & to convert to slice reference
             return format!("&{}", arg);
         }
-        // Check if arg is already a reference
-        if !arg.starts_with('&') {
-            // Check if it's a simple identifier (array variable)
-            // Not a complex expression like function call or method
-            if is_simple_identifier(arg) {
-                return format!("&{}", arg);
-            }
-        }
+        // Conservative rule: do NOT auto-borrow identifiers for &[T] params.
+        // Without full type resolution this can create double borrow (&&x).
+        // Keep source expression as-is unless it's a literal array.
         return arg.to_string();
     }
     
@@ -745,6 +740,11 @@ fn is_slice_index_access(s: &str) -> bool {
         if is_simple_identifier(var_part) || is_valid_index_base(var_part) {
             // Check that brackets are balanced and at the end
             let bracket_part = &trimmed[bracket_pos..];
+            let inner = &trimmed[bracket_pos + 1..trimmed.len().saturating_sub(1)];
+            // Conservative lowering: ranges are slices, not index access.
+            if inner.contains("..") {
+                return false;
+            }
             let open_count = bracket_part.chars().filter(|&c| c == '[').count();
             let close_count = bracket_part.chars().filter(|&c| c == ']').count();
             return open_count == close_count;

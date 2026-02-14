@@ -279,6 +279,41 @@ fn apply_tx(w Wallet, tx Transaction) Wallet {
         assert!(!second_line.contains("let"), 
             "L-01: Reassignment must not have 'let': {}", second_line);
     }
+
+    #[test]
+    fn test_method_chain_atomic_for_tuple_destructuring() {
+        let input = r#"(phrase, secret) = mnemonic::generate_mnemonic()
+    .expect(\"must succeed\")"#;
+        let output = parse_rusts(input);
+        assert!(output.contains("let (phrase, secret) = mnemonic::generate_mnemonic()"));
+        assert!(output.contains(".expect"), "missing expect chain: {}", output);
+        assert!(!output.contains("generate_mnemonic();\n    .expect"), "method chain was split: {}", output);
+    }
+
+    #[test]
+    fn test_tuple_destructure_requires_result_handler() {
+        let input = "(phrase, secret) = mnemonic::generate_mnemonic()";
+        let output = parse_rusts(input);
+        assert!(output.contains("compile_error!(\"RustS+ error: tuple destructuring from call requires explicit Result handling"));
+    }
+
+    #[test]
+    fn test_slice_range_not_auto_cloned() {
+        let input = "secret = self.keypair_bytes[0..32].try_into()";
+        let output = parse_rusts(input);
+        assert!(!output.contains("[0..32].clone()"), "slice range must not be cloned: {}", output);
+    }
+
+    #[test]
+    fn test_no_double_borrow_for_slice_param() {
+        let input = r#"fn verify(msg [u8]) {
+    consume(msg)
+}
+
+fn consume(data &[u8]) {}"#;
+        let output = parse_rusts(input);
+        assert!(!output.contains("consume(&msg)"), "must not auto-add borrow for slice param: {}", output);
+    }
     
     /// L-02: Expression in match arm MUST be parenthesized
     #[test]

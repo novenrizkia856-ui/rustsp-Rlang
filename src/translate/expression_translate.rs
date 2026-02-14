@@ -104,6 +104,7 @@ pub fn process_tuple_destructuring(
     leading_ws: &str,
     current_fn_ctx: &CurrentFunctionContext,
     fn_registry: &FunctionRegistry,
+    next_line_is_method_chain: bool,
 ) -> Option<String> {
     if !trimmed.starts_with('(') || !trimmed.contains(')') || !trimmed.contains('=') {
         return None;
@@ -133,7 +134,22 @@ pub fn process_tuple_destructuring(
     }
     expanded_value = transform_call_args(&expanded_value, fn_registry);
     
-    Some(format!("{}let {} = {};", leading_ws, tuple_part, expanded_value))
+    let has_result_handler = expanded_value.contains(".expect(")
+        || expanded_value.contains(".unwrap(")
+        || expanded_value.ends_with('?');
+
+    // Conservative lowering rule:
+    // tuple destructuring from call-like expression must explicitly handle Result.
+    let looks_like_call = expanded_value.contains('(') && expanded_value.contains(')');
+    if looks_like_call && !has_result_handler && !next_line_is_method_chain {
+        return Some(format!(
+            "{}compile_error!(\"RustS+ error: tuple destructuring from call requires explicit Result handling (.expect(...) or ?)\");",
+            leading_ws
+        ));
+    }
+
+    let semi = if next_line_is_method_chain { "" } else { ";" };
+    Some(format!("{}let {} = {}{}", leading_ws, tuple_part, expanded_value, semi))
 }
 
 #[cfg(test)]
@@ -146,10 +162,11 @@ mod tests {
         let fn_registry = FunctionRegistry::new();
         
         let result = process_tuple_destructuring(
-            "(a, b) = foo()",
+            "(a, b) = foo().expect(\"ok\")",
             "    ",
             &fn_ctx,
             &fn_registry,
+            false,
         );
         
         assert!(result.is_some());
@@ -169,6 +186,7 @@ mod tests {
             "",
             &fn_ctx,
             &fn_registry,
+            false,
         ).is_none());
         
         // Arrow, not assignment
@@ -177,6 +195,7 @@ mod tests {
             "",
             &fn_ctx,
             &fn_registry,
+            false,
         ).is_none());
     }
 }

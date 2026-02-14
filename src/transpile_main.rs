@@ -405,7 +405,7 @@ pub fn parse_rusts(source: &str) -> String {
         
         // Tuple destructuring
         if let Some(output) = process_tuple_destructuring(
-            trimmed, &leading_ws, &current_fn_ctx, &fn_registry,
+            trimmed, &leading_ws, &current_fn_ctx, &fn_registry, next_line_is_method_chain,
         ) {
             output_lines.push(output);
             continue;

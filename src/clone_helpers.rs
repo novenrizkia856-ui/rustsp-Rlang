@@ -83,6 +83,12 @@ pub fn transform_array_access_clone(value: &str) -> String {
     }
     
     if let (Some(start), Some(_end)) = (bracket_start, bracket_end) {
+        let bracket_content = &trimmed[start + 1..trimmed.rfind(']').unwrap_or(trimmed.len())];
+        // Conservative lowering: never clone range slices (arr[a..b], arr[..], arr[..b], arr[a..]).
+        if bracket_content.contains("..") {
+            return value.to_string();
+        }
+
         let before_bracket = &trimmed[..start];
         if is_valid_array_base(before_bracket) {
             return format!("{}.clone()", trimmed);

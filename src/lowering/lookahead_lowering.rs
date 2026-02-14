@@ -74,9 +74,15 @@ pub fn check_next_line_starts_with_pipe(lines: &[&str], line_num: usize) -> bool
 
 /// Check if next line is a method chain continuation (starts with `.`)
 pub fn check_next_line_is_method_chain(lines: &[&str], line_num: usize) -> bool {
-    lines.get(line_num + 1)
-        .map(|next| strip_inline_comment(next).trim().starts_with('.'))
-        .unwrap_or(false)
+    for next in lines.iter().skip(line_num + 1) {
+        let binding = strip_inline_comment(next);
+        let trimmed = binding.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return trimmed.starts_with('.');
+    }
+    false
 }
 
 /// Check if next line closes an expression (starts with ), ], etc.)
