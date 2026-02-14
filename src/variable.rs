@@ -317,6 +317,20 @@ impl VariableTracker {
     pub fn is_mutated_via_method(&self, var_name: &str) -> bool {
         self.mutated_via_method.contains(var_name)
     }
+    
+    /// Clear function-local mutation tracking sets.
+    /// 
+    /// CRITICAL FIX (Bug #2): `mutated_via_method` and `mut_borrowed_vars` were
+    /// populated by scanning ALL source lines globally, causing cross-function
+    /// contamination (e.g., `encrypted` marked as mutated in EVERY function
+    /// because ONE function has `encrypted.ciphertext[0] ^= 0xFF`).
+    /// 
+    /// Now called when entering each function body, then only that function's
+    /// lines are re-scanned for accurate per-function mutation detection.
+    pub fn clear_function_local_mutations(&mut self) {
+        self.mutated_via_method.clear();
+        self.mut_borrowed_vars.clear();
+    }
 
     pub fn is_first_assignment(&self, var_name: &str, line_num: usize) -> bool {
         // CRITICAL FIX: '_' is always a "first assignment" (discard pattern)

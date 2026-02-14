@@ -34,6 +34,23 @@ pub fn transform_array_access_clone(value: &str) -> String {
         return value.to_string();
     }
     
+    // CRITICAL FIX (Bug #3): Skip RANGE access patterns
+    // Patterns like arr[0..32], data[start..end], buf[..N], buf[32..], data[0..=31]
+    // These return &[T] (slice reference), NOT an individual element T.
+    // Adding .clone() to a slice range is semantically wrong and can cause
+    // type mismatches (e.g., self.keypair_bytes[0..32].clone() clones the
+    // entire Vec/array, not extracting a 32-byte slice).
+    if let Some(bracket_start) = trimmed.find('[') {
+        if let Some(bracket_end) = trimmed.rfind(']') {
+            if bracket_start < bracket_end {
+                let inside_brackets = &trimmed[bracket_start + 1..bracket_end];
+                if inside_brackets.contains("..") {
+                    return value.to_string();
+                }
+            }
+        }
+    }
+    
     // Skip if there's an `as` cast
     if trimmed.contains(" as ") {
         return value.to_string();
@@ -220,6 +237,18 @@ pub fn is_cloneable_array_access(expr: &str) -> bool {
         return false;
     }
     
+    // CRITICAL FIX: Skip range access (returns slice, not element)
+    if let Some(bracket_start) = trimmed.find('[') {
+        if let Some(bracket_end) = trimmed.rfind(']') {
+            if bracket_start < bracket_end {
+                let inside = &trimmed[bracket_start + 1..bracket_end];
+                if inside.contains("..") {
+                    return false;
+                }
+            }
+        }
+    }
+    
     // Skip if has method call after ]
     if let Some(bracket_end) = trimmed.rfind(']') {
         let after = &trimmed[bracket_end + 1..];
@@ -242,6 +271,37 @@ mod tests {
         assert_eq!(transform_array_access_clone("arr[i].clone()"), "arr[i].clone()"); // no double
         assert_eq!(transform_array_access_clone("arr[i].len()"), "arr[i].len()"); // method call
         assert_eq!(transform_array_access_clone("arr[i] as u64"), "arr[i] as u64"); // cast
+    }
+    
+    #[test]
+    fn test_transform_array_access_clone_range_skip() {
+        // CRITICAL (Bug #3): Range access returns &[T], NOT element T
+        // Must NOT add .clone() to range slices
+        assert_eq!(
+            transform_array_access_clone("self.keypair_bytes[0..32]"), 
+            "self.keypair_bytes[0..32]",
+            "Range access must NOT get .clone()"
+        );
+        assert_eq!(
+            transform_array_access_clone("data[start..end]"), 
+            "data[start..end]",
+            "Variable range must NOT get .clone()"
+        );
+        assert_eq!(
+            transform_array_access_clone("buf[..16]"), 
+            "buf[..16]",
+            "Range-to must NOT get .clone()"
+        );
+        assert_eq!(
+            transform_array_access_clone("buf[32..]"), 
+            "buf[32..]",
+            "Range-from must NOT get .clone()"
+        );
+        assert_eq!(
+            transform_array_access_clone("data[0..=31]"), 
+            "data[0..=31]",
+            "Inclusive range must NOT get .clone()"
+        );
     }
     
     #[test]

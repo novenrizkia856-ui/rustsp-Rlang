@@ -99,11 +99,23 @@ pub fn process_non_assignment(
 
 /// Process tuple destructuring assignment
 /// Pattern: `(a, b) = value` → `let (a, b) = value;`
+///
+/// CRITICAL FIX (Bug #1): Must respect method chain continuation!
+/// When the next line is `.method(...)`, we must NOT add semicolon.
+/// Example:
+///   `(phrase, secret) = mnemonic::generate_mnemonic()`
+///       `.expect("...")`
+/// Must become:
+///   `let (phrase, secret) = mnemonic::generate_mnemonic()`  ← NO semicolon
+///       `.expect("...");`                                    ← semicolon here
 pub fn process_tuple_destructuring(
     trimmed: &str,
     leading_ws: &str,
     current_fn_ctx: &CurrentFunctionContext,
     fn_registry: &FunctionRegistry,
+    next_line_is_method_chain: bool,
+    inside_multiline_expr: bool,
+    next_line_closes_expr: bool,
 ) -> Option<String> {
     if !trimmed.starts_with('(') || !trimmed.contains(')') || !trimmed.contains('=') {
         return None;
@@ -133,7 +145,15 @@ pub fn process_tuple_destructuring(
     }
     expanded_value = transform_call_args(&expanded_value, fn_registry);
     
-    Some(format!("{}let {} = {};", leading_ws, tuple_part, expanded_value))
+    // CRITICAL FIX (Bug #1): Semicolon suppression for method chain continuation
+    // If the next line starts with `.expect(...)`, `.map(...)`, etc., the expression
+    // continues on the next line and we must NOT insert a semicolon here.
+    let suppress_semi = next_line_is_method_chain
+        || ends_with_continuation_operator(&expanded_value)
+        || (inside_multiline_expr && next_line_closes_expr);
+    let semi = if suppress_semi { "" } else { ";" };
+    
+    Some(format!("{}let {} = {}{}", leading_ws, tuple_part, expanded_value, semi))
 }
 
 #[cfg(test)]
@@ -150,12 +170,41 @@ mod tests {
             "    ",
             &fn_ctx,
             &fn_registry,
+            false, // next_line_is_method_chain
+            false, // inside_multiline_expr
+            false, // next_line_closes_expr
         );
         
         assert!(result.is_some());
         let output = result.unwrap();
         assert!(output.contains("let (a, b)"));
         assert!(output.contains("foo()"));
+        assert!(output.ends_with(";"), "Should have semicolon when no chain: {}", output);
+    }
+    
+    #[test]
+    fn test_tuple_destructuring_method_chain() {
+        // Bug #1 regression test:
+        // (phrase, secret) = mnemonic::generate_mnemonic()
+        //     .expect("BIP39 mnemonic generation should not fail")
+        // When next line is .expect(...), must NOT add semicolon!
+        let fn_ctx = CurrentFunctionContext::new();
+        let fn_registry = FunctionRegistry::new();
+        
+        let result = process_tuple_destructuring(
+            "(phrase, secret) = mnemonic::generate_mnemonic()",
+            "        ",
+            &fn_ctx,
+            &fn_registry,
+            true,  // next_line_is_method_chain = .expect(...)
+            false,
+            false,
+        );
+        
+        assert!(result.is_some());
+        let output = result.unwrap();
+        assert!(output.contains("let (phrase, secret) = mnemonic::generate_mnemonic()"));
+        assert!(!output.ends_with(";"), "Must NOT have semicolon when chain continues: {}", output);
     }
     
     #[test]
@@ -165,18 +214,14 @@ mod tests {
         
         // Not a tuple pattern
         assert!(process_tuple_destructuring(
-            "x = 1",
-            "",
-            &fn_ctx,
-            &fn_registry,
+            "x = 1", "", &fn_ctx, &fn_registry,
+            false, false, false,
         ).is_none());
         
         // Arrow, not assignment
         assert!(process_tuple_destructuring(
-            "(x) => y",
-            "",
-            &fn_ctx,
-            &fn_registry,
+            "(x) => y", "", &fn_ctx, &fn_registry,
+            false, false, false,
         ).is_none());
     }
 }

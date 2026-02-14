@@ -64,6 +64,149 @@ pub fn parse_rusts(source: &str) -> String {
     let normalized_source = normalize_hex_literals(source);
     
     let lines: Vec<&str> = normalized_source.lines().collect();
+    
+    // =========================================================================
+    // SOURCE BRACE BALANCE PRE-CHECK
+    // =========================================================================
+    // Validate that source braces are balanced BEFORE lowering.
+    // If unbalanced, report a clear SOURCE error and RETURN EARLY with
+    // a valid compile_error! output. This prevents:
+    //   1. Garbage lowering output from unbalanced source
+    //   2. Misleading "COMPILER BUG" from rust_sanity
+    //   3. The CLI/build system wrapping the error in another error box
+    //
+    // Uses a STACK to track opening brace positions, so we can pinpoint
+    // exactly WHICH brace is unclosed (not just "somewhere near EOF").
+    {
+        let mut brace_stack: Vec<(usize, String)> = Vec::new(); // (line_num, context)
+        let mut depth: i64 = 0;
+        let mut negative_at: Option<usize> = None;
+        
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") { continue; }
+            
+            let (opens, closes) = count_braces_outside_strings(trimmed);
+            
+            for _ in 0..opens {
+                depth += 1;
+                // Store context: use the line content for block starters,
+                // or a breadcrumb for nested braces
+                let ctx = trimmed.chars().take(80).collect::<String>();
+                brace_stack.push((i + 1, ctx));
+            }
+            
+            for _ in 0..closes {
+                depth -= 1;
+                if depth < 0 {
+                    negative_at = Some(i + 1);
+                    break;
+                }
+                brace_stack.pop();
+            }
+            
+            if negative_at.is_some() { break; }
+        }
+        
+        if let Some(line) = negative_at {
+            // Too many closing braces
+            eprintln!();
+            eprintln!("╔══════════════════════════════════════════════════════════════╗");
+            eprintln!("║  error[RSPL_SOURCE]: unbalanced braces in source code       ║");
+            eprintln!("╚══════════════════════════════════════════════════════════════╝");
+            eprintln!("  --> line {}", line);
+            eprintln!("      Extra closing '}}' — no matching opening brace found.");
+            eprintln!("  note: This is a SOURCE error, not a compiler bug.");
+            eprintln!("        Check your brace matching around line {}.", line);
+            eprintln!();
+            
+            // EARLY RETURN: valid Rust that won't trigger rust_sanity
+            return format!(
+                "// RustS+ source error: extra closing brace at line {}\ncompile_error!(\"RustS+ source error: unbalanced braces. Extra '}}' at line {}\");\n",
+                line, line
+            );
+        }
+        
+        if depth > 0 {
+            // Unclosed braces — the stack still has unmatched entries.
+            // The BOTTOM entries are the real culprits (earliest unclosed).
+            // Report the first unclosed brace that's at a block-start level.
+            let unclosed_count = brace_stack.len();
+            
+            // Find the most useful unclosed brace to report.
+            // Priority: the FIRST unclosed impl/fn/mod/struct (the root cause),
+            // not the last fn deep inside it.
+            let mut report_line: usize = 0;
+            let mut report_ctx = String::new();
+            
+            for (line_num, ctx) in &brace_stack {
+                let t = ctx.trim();
+                let is_block_start = t.starts_with("impl ")
+                    || t.starts_with("pub fn ")
+                    || t.starts_with("fn ")
+                    || t.starts_with("mod ")
+                    || t.starts_with("pub struct ")
+                    || t.starts_with("struct ")
+                    || t.starts_with("pub enum ")
+                    || t.starts_with("enum ");
+                
+                if is_block_start {
+                    // Take the FIRST block-start that's still unclosed
+                    // This is the root cause — all subsequent blocks are 
+                    // nested inside it due to the missing close
+                    report_line = *line_num;
+                    report_ctx = ctx.clone();
+                    break;
+                }
+            }
+            
+            // Fallback: if no block-start found, use the first unclosed brace
+            if report_line == 0 {
+                if let Some((line_num, ctx)) = brace_stack.first() {
+                    report_line = *line_num;
+                    report_ctx = ctx.clone();
+                }
+            }
+            
+            eprintln!();
+            eprintln!("╔══════════════════════════════════════════════════════════════╗");
+            eprintln!("║  error[RSPL_SOURCE]: unbalanced braces in source code       ║");
+            eprintln!("╚══════════════════════════════════════════════════════════════╝");
+            eprintln!("  note: {} unclosed '{{' brace(s) at end of file.", depth);
+            eprintln!("  --> likely unclosed at line {}", report_line);
+            if !report_ctx.is_empty() {
+                eprintln!("      {}", report_ctx.trim());
+            }
+            eprintln!();
+            eprintln!("  note: This is a SOURCE error, not a compiler bug.");
+            eprintln!("        A function or impl block is missing its closing '}}'.");
+            
+            // Extra help: show ALL unclosed block-starts
+            let unclosed_blocks: Vec<_> = brace_stack.iter()
+                .filter(|(_, ctx)| {
+                    let t = ctx.trim();
+                    t.starts_with("impl ") || t.starts_with("pub fn ") || t.starts_with("fn ")
+                    || t.starts_with("mod ") || t.starts_with("struct ") || t.starts_with("enum ")
+                    || t.starts_with("pub struct ") || t.starts_with("pub enum ")
+                })
+                .collect();
+            
+            if unclosed_blocks.len() > 1 {
+                eprintln!("  help: {} block(s) still open at end of file:", unclosed_blocks.len());
+                for (ln, ctx) in &unclosed_blocks {
+                    eprintln!("         line {}: {}", ln, ctx.trim().chars().take(60).collect::<String>());
+                }
+            }
+            eprintln!();
+            
+            // EARLY RETURN: valid Rust that won't trigger rust_sanity
+            return format!(
+                "// RustS+ source error: {} unclosed brace(s), first at line {}\ncompile_error!(\"RustS+ source error: unbalanced braces. Missing '}}' — check line {}\");\n",
+                depth, report_line, report_line
+            );
+        }
+    }
+    
     let mut tracker = VariableTracker::new();
     
     // Run scope analysis
@@ -76,10 +219,11 @@ pub fn parse_rusts(source: &str) -> String {
     let struct_registry = first_pass_result.struct_registry;
     let _enum_registry = first_pass_result.enum_registry;
     
-    // Scan all lines for mutating method calls
-    for line in &lines {
-        tracker.scan_for_mutating_methods(line);
-    }
+    // CRITICAL FIX (Bug #2): Do NOT scan all lines globally for mutating methods!
+    // Global scanning causes cross-function contamination:
+    //   `encrypted.ciphertext[0] ^= 0xFF` in one test marks `encrypted` as
+    //   needing mut in EVERY function across the entire file.
+    // Instead, we scan per-function when entering each function body below.
     
     let mut output_lines: Vec<String> = Vec::new();
     
@@ -197,6 +341,27 @@ pub fn parse_rusts(source: &str) -> String {
             function_start_brace = brace_depth + 1;
             if let FunctionParseResult::RustSPlusSignature(ref sig) = parse_function_line(trimmed) {
                 current_fn_ctx.enter(sig, function_start_brace);
+            }
+            
+            // CRITICAL FIX (Bug #2): Per-function mutation scanning
+            // Clear global mutation state and re-scan ONLY this function's lines.
+            // This prevents cross-function contamination where e.g.
+            // `encrypted.field ^= 0xFF` in one test marks ALL `encrypted`
+            // variables as mut across every function.
+            tracker.clear_function_local_mutations();
+            let mut fn_brace_depth: usize = 0;
+            let mut fn_started = false;
+            for future_line in lines.iter().skip(line_num) {
+                let ft = future_line.trim();
+                for c in ft.chars() {
+                    if c == '{' { fn_brace_depth += 1; fn_started = true; }
+                    if c == '}' { fn_brace_depth = fn_brace_depth.saturating_sub(1); }
+                }
+                if fn_started {
+                    tracker.scan_for_mutating_methods(ft);
+                    tracker.scan_for_mut_borrows(ft);
+                    if fn_brace_depth == 0 { break; }
+                }
             }
         }
         
@@ -406,6 +571,7 @@ pub fn parse_rusts(source: &str) -> String {
         // Tuple destructuring
         if let Some(output) = process_tuple_destructuring(
             trimmed, &leading_ws, &current_fn_ctx, &fn_registry,
+            next_line_is_method_chain, inside_multiline_expr, next_line_closes_expr,
         ) {
             output_lines.push(output);
             continue;
